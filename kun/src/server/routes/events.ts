@@ -21,9 +21,11 @@ export function buildEventStreamResponse(input: {
   allocateSeq: (threadId: string) => number
 }): Response {
   const url = new URL(input.request.url)
-  const sinceSeqFromQuery = Number(url.searchParams.get('since_seq') ?? '0') || 0
+  const sinceSeqParam = url.searchParams.get('since_seq')
+  const sinceSeqFromQuery =
+    sinceSeqParam != null ? Number(sinceSeqParam) || 0 : null
   const sinceSeqFromHeader = Number(input.request.headers.get('Last-Event-ID') ?? '0') || 0
-  const sinceSeq = sinceSeqFromQuery || sinceSeqFromHeader
+  const sinceSeq = sinceSeqFromQuery != null ? sinceSeqFromQuery : sinceSeqFromHeader
   const encoder = new TextEncoder()
   let unsubscribe: (() => void) | undefined
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined

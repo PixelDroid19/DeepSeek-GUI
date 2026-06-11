@@ -2,194 +2,80 @@ import type { ReactElement } from 'react'
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useShallow } from 'zustand/react/shallow'
-import { parseClawCommand } from '@shared/claw-commands'
-import { DEFAULT_COMPOSER_MODEL_IDS } from '@shared/default-composer-models'
-import { buildGuiPlanId, buildPlanRelativePath } from '@shared/gui-plan'
-import type { SkillListItem } from '@shared/ds-gui-api'
-import type { ClipboardImageReadResult } from '@shared/workspace-file'
-import type { AttachmentReference, ChatBlock } from '../agent/types'
+import type { AttachmentReference } from '../agent/types'
 import type { CoreRuntimeInfoJson, CoreRuntimeSkillJson } from '../agent/kun-contract'
 import { getProvider } from '../agent/registry'
 import { useChatStore } from '../store/chat-store'
-import { isClawThread } from '../store/chat-store-helpers'
-import {
-  extractLatestTurnAutoOpenDevPreviewUrls,
-  extractLatestTurnDevPreviewUrls
-} from '../lib/dev-preview-detection'
-import { Sidebar } from './chat/Sidebar'
-import { WorkbenchTopBar, type RightPanelMode } from './chat/WorkbenchTopBar'
-import { MessageTimeline } from './chat/MessageTimeline'
-import { FloatingComposer, type ComposerFileReference } from './chat/FloatingComposer'
 import {
   composerReasoningEffortRequestValue,
   type ComposerReasoningEffort
 } from './chat/FloatingComposerModelPicker'
 import { SideConversationPanel } from './chat/SideConversationPanel'
-import { SessionHeader } from './SessionHeader'
 import { WriteWorkspaceView } from './write/WriteWorkspaceView'
-import { WriteAssistantPanel } from './write/WriteAssistantPanel'
-import { WriteSidebar } from './write/WriteSidebar'
-import { SddAssistantPanel } from './sdd/SddAssistantPanel'
 import { SddDraftEditorView } from './sdd/SddDraftEditorView'
 import { SidebarTitlebarToggleButton } from './sidebar/SidebarPrimitives'
 import { composeWritePrompt } from '../write/quoted-selection'
 import { useWriteWorkspaceStore } from '../write/write-workspace-store'
-import { isWriteThreadId } from '../write/write-thread-registry'
 import { createSddDraft, useSddDraftStore } from '../sdd/sdd-draft-store'
 import type { SddDraft } from '../sdd/sdd-draft-store'
 import { saveActiveSddDraftToDisk } from '../sdd/sdd-draft-actions'
 import { composeSddAssistantPrompt } from '../sdd/sdd-assistant-prompt'
-import { collectSddDraftImages, withAttachmentIds, type SddDraftImageReference } from '../sdd/sdd-draft-images'
-import { buildSddDraftToPlanPrompt } from '../sdd/sdd-plan-prompt'
+import { collectSddDraftImages } from '../sdd/sdd-draft-images'
 import {
-  isSddAssistantThread,
   markSddAssistantThread,
   releaseSddAssistantThread,
   sddAssistantThreadIdForDraft
 } from '../sdd/sdd-thread-registry'
-import { parseGuiPlanCommand } from '../plan/plan-command'
-import { DevPreviewLaunchCard } from './DevPreviewLaunchCard'
 import { RuntimeBanner } from './RuntimeBanner'
 import { useWorkbenchLayout } from './workbench-layout'
 import { useWorkbenchPlanController } from './workbench-plan-controller'
-import { prepareImageAttachmentUpload } from '../lib/image-attachment-upload'
+import {
+  WorkbenchRightPanel,
+  resolveWorkbenchRightPanelContent
+} from './workbench-right-panel'
+import {
+  resolveWorkbenchSidebarView,
+  resolveWriteRuntimeBannerMessage
+} from './workbench-route-view'
 import { isChatAttachmentUploadEnabled } from '../lib/attachment-upload-availability'
 import { normalizeWorkspaceRoot } from '../lib/workspace-path'
 import {
-  buildComposerFileContextPrompt,
   mergeComposerFileReferences,
-  type ComposerFileContextEntry
+  type ComposerFileReference
 } from '../lib/composer-file-references'
+import {
+  buildSddDraftPlanTurn,
+  clipboardImageToFile,
+  sddPlanMatchesPendingTarget,
+  type PendingSddPlanTarget
+} from './workbench-sdd-helpers'
+import {
+  prepareWorkbenchChatComposerMessage
+} from './workbench-composer-message'
+import { handleWorkbenchClawComposer } from './workbench-claw-composer'
+import {
+  mergeWorkbenchComposerAttachments,
+  prepareWorkbenchSddPlanImages,
+  uploadWorkbenchComposerImages
+} from './workbench-attachment-upload'
+import {
+  buildWorkbenchSendMessageOptions,
+  resolveWorkbenchSendRoute
+} from './workbench-send-routing'
+import { WorkbenchLeftSidebar } from './workbench-left-sidebar'
+import { buildWorkbenchWriteAssistantPickList } from './workbench-write-assistant-models'
+import { WorkbenchChatStage } from './workbench-chat-stage'
+import { prepareWorkbenchChatNavigation } from './workbench-navigation-actions'
+import { buildWorkbenchDevPreviewState } from './workbench-dev-preview'
+import { loadWorkbenchRuntimeMetadata } from './workbench-runtime-metadata'
+import { buildWorkbenchThreadContext } from './workbench-thread-context'
 
-const ChangeInspector = lazy(() =>
-  import('./ChangeInspector').then((module) => ({ default: module.ChangeInspector }))
-)
-const DevBrowserPanel = lazy(() =>
-  import('./DevBrowserPanel').then((module) => ({ default: module.DevBrowserPanel }))
-)
 const PluginMarketplaceView = lazy(() =>
   import('./PluginMarketplaceView').then((module) => ({ default: module.PluginMarketplaceView }))
-)
-const WorkspaceFilePreviewPanel = lazy(() =>
-  import('./WorkspaceFilePreviewPanel').then((module) => ({
-    default: module.WorkspaceFilePreviewPanel
-  }))
-)
-const PlanPanel = lazy(() =>
-  import('./plan/PlanPanel').then((module) => ({ default: module.PlanPanel }))
-)
-const TodoPanel = lazy(() =>
-  import('./todo/TodoPanel').then((module) => ({ default: module.TodoPanel }))
 )
 const ScheduleTasksView = lazy(() =>
   import('./schedule/ScheduleTasksView').then((module) => ({ default: module.ScheduleTasksView }))
 )
-
-type PendingSddPlanTarget = {
-  planId: string
-  relativePath: string
-  workspaceRoot: string
-}
-
-const COMPOSER_FILE_CONTEXT_MAX_CHARS_PER_FILE = 60_000
-const COMPOSER_FILE_CONTEXT_MAX_TOTAL_CHARS = 180_000
-
-function fileNameFromPath(path: string): string {
-  return path.replaceAll('\\', '/').split('/').filter(Boolean).pop() || 'image'
-}
-
-function clipComposerFileContext(
-  content: string,
-  remainingChars: number,
-  sourceTruncated: boolean
-): { content: string; truncated: boolean; consumed: number } {
-  const limit = Math.max(0, Math.min(COMPOSER_FILE_CONTEXT_MAX_CHARS_PER_FILE, remainingChars))
-  const clipped = content.slice(0, limit)
-  return {
-    content: clipped,
-    truncated: sourceTruncated || clipped.length < content.length,
-    consumed: clipped.length
-  }
-}
-
-function sddDraftPlanRelativePath(draft: SddDraft): string {
-  const parts = draft.relativePath.replaceAll('\\', '/').split('/').filter(Boolean)
-  const draftFolder = parts.at(-2)?.trim() || draft.id.split(':').pop()?.trim() || `draft-${Date.now()}`
-  return buildPlanRelativePath(`sdd-${draftFolder}`)
-}
-
-function sddDraftSourceRequest(markdown: string, fallbackPath: string): string {
-  const firstMeaningfulLine = markdown
-    .split('\n')
-    .map((line) => line.replace(/^#+\s*/, '').trim())
-    .find(Boolean)
-  return (firstMeaningfulLine || fallbackPath).slice(0, 160)
-}
-
-function sddPlanMatchesPendingTarget(
-  plan: { id: string; workspaceRoot: string; relativePath: string } | null,
-  target: PendingSddPlanTarget | null
-): boolean {
-  if (!plan || !target) return false
-  if (plan.id === target.planId) return true
-  return buildGuiPlanId(plan.workspaceRoot, plan.relativePath) === target.planId
-}
-
-function mergeSkillCommands(
-  runtimeSkills: CoreRuntimeSkillJson[],
-  localSkills: SkillListItem[]
-): CoreRuntimeSkillJson[] {
-  const merged = new Map<string, CoreRuntimeSkillJson>()
-  for (const skill of localSkills) {
-    merged.set(skill.id, {
-      id: skill.id,
-      name: skill.name,
-      description: skill.description,
-      root: skill.root,
-      legacy: skill.legacy,
-      scope: skill.scope
-    })
-  }
-  for (const skill of runtimeSkills) {
-    const existing = merged.get(skill.id)
-    merged.set(skill.id, existing ? {
-      ...skill,
-      ...existing,
-      triggers: skill.triggers ?? existing.triggers,
-      allowedTools: skill.allowedTools ?? existing.allowedTools
-    } : skill)
-  }
-  return [...merged.values()]
-}
-
-function sddAssistantContextFromBlocks(blocks: ChatBlock[], maxMessages = 10): string {
-  const messages: string[] = []
-  for (const block of blocks) {
-    if (block.kind !== 'user' && block.kind !== 'assistant') continue
-    if (block.kind === 'user' && block.meta?.displayText) continue
-    const text = block.text.trim()
-    if (!text) continue
-    messages.push(`${block.kind === 'user' ? 'User' : 'Requirement AI'}:\n${text}`)
-  }
-  return messages.slice(-maxMessages).join('\n\n').slice(0, 12_000)
-}
-
-function base64ImageToFile(image: SddDraftImageReference): File {
-  return base64ToFile(image.dataBase64, fileNameFromPath(image.relativePath), image.mimeType)
-}
-
-function clipboardImageToFile(image: Extract<ClipboardImageReadResult, { ok: true }>): File {
-  return base64ToFile(image.dataBase64, image.name, image.mimeType)
-}
-
-function base64ToFile(dataBase64: string, name: string, mimeType: string): File {
-  const binary = atob(dataBase64)
-  const bytes = new Uint8Array(binary.length)
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index)
-  }
-  return new File([bytes], name || 'image', { type: mimeType })
-}
 
 export function Workbench(): ReactElement {
   const { t } = useTranslation('common')
@@ -311,20 +197,10 @@ export function Workbench(): ReactElement {
   const setWriteAssistantModel = useWriteWorkspaceStore((s) => s.setAssistantModel)
   const activeSddDraft = useSddDraftStore((s) => s.activeDraft)
   const sddDraftOperationStatus = useSddDraftStore((s) => s.operationStatus)
-  const writeAssistantPickList = useMemo(() => {
-    const ordered = new Set<string>()
-    for (const id of DEFAULT_COMPOSER_MODEL_IDS) {
-      const normalized = id.trim()
-      if (normalized) ordered.add(normalized)
-    }
-    for (const id of composerPickList) {
-      const normalized = id.trim()
-      if (normalized) ordered.add(normalized)
-    }
-    const current = writeAssistantModel.trim()
-    if (current) ordered.add(current)
-    return [...ordered]
-  }, [composerPickList, writeAssistantModel])
+  const writeAssistantPickList = useMemo(
+    () => buildWorkbenchWriteAssistantPickList({ composerPickList, writeAssistantModel }),
+    [composerPickList, writeAssistantModel]
+  )
   const stageInsetClass = 'ds-stage-inset'
 
   const draftByThread = useRef<Record<string, string>>({})
@@ -335,36 +211,33 @@ export function Workbench(): ReactElement {
   const timelineBlocks = blocks
   const timelineLiveReasoning = liveReasoning
   const timelineLiveAssistant = liveAssistant
-  const devPreviewBlocks = useMemo<ChatBlock[]>(() => {
-    const liveText = timelineLiveAssistant.trim()
-    if (!liveText) return timelineBlocks
-    return [
-      ...timelineBlocks,
-      {
-        kind: 'assistant',
-        id: '__live-assistant-dev-preview',
-        text: timelineLiveAssistant
-      }
-    ]
-  }, [timelineBlocks, timelineLiveAssistant])
-  const detectedDevPreviewUrls = useMemo(
-    () => extractLatestTurnDevPreviewUrls(devPreviewBlocks),
-    [devPreviewBlocks]
+  const {
+    devPreviewBlocks,
+    latestAutoOpenDevPreviewUrl,
+    latestDevPreviewUrl,
+    showDevPreviewCard
+  } = useMemo(
+    () => buildWorkbenchDevPreviewState({
+      blocks: timelineBlocks,
+      liveAssistant: timelineLiveAssistant,
+      route
+    }),
+    [route, timelineBlocks, timelineLiveAssistant]
   )
-  const autoOpenDevPreviewUrls = useMemo(
-    () => extractLatestTurnAutoOpenDevPreviewUrls(devPreviewBlocks),
-    [devPreviewBlocks]
+  const {
+    activeClawChannel,
+    activeSkillWorkspace,
+    codeThreads
+  } = useMemo(
+    () => buildWorkbenchThreadContext({
+      activeClawChannelId,
+      activeThreadId,
+      clawChannels,
+      threads,
+      workspaceRoot
+    }),
+    [activeClawChannelId, activeThreadId, clawChannels, threads, workspaceRoot]
   )
-  const activeClawChannel = useMemo(
-    () => clawChannels.find((channel) => channel.id === activeClawChannelId) ?? null,
-    [activeClawChannelId, clawChannels]
-  )
-  const activeSkillWorkspace = useMemo(
-    () => threads.find((thread) => thread.id === activeThreadId)?.workspace || workspaceRoot || '',
-    [activeThreadId, threads, workspaceRoot]
-  )
-  const latestDevPreviewUrl = detectedDevPreviewUrls[0] ?? null
-  const latestAutoOpenDevPreviewUrl = autoOpenDevPreviewUrls[0] ?? null
   const {
     beginLeftResize,
     beginRightResize,
@@ -373,7 +246,6 @@ export function Workbench(): ReactElement {
     leftSidebarWidth,
     openDevPreview,
     rightPanelMode,
-    rightPanelVisible,
     rightSidebarWidth,
     setFilePreviewTarget,
     setRightPanelMode,
@@ -413,18 +285,6 @@ export function Workbench(): ReactElement {
       await useChatStore.getState().refreshThreads()
     }
   })
-  const showDevPreviewCard =
-    route === 'chat' &&
-    latestDevPreviewUrl !== null
-  const codeThreads = useMemo(
-    () => threads.filter((thread) =>
-      !isWriteThreadId(thread.id) &&
-      !isClawThread(thread, clawChannels) &&
-      !isSddAssistantThread(thread)
-    ),
-    [clawChannels, threads]
-  )
-
   const mirrorClawCommand = async (userText: string, replyText: string): Promise<void> => {
     if (!activeThreadId || typeof window.dsGui?.mirrorClawChannelMessage !== 'function') return
     const userResult = await window.dsGui.mirrorClawChannelMessage(
@@ -439,18 +299,6 @@ export function Workbench(): ReactElement {
       'assistant'
     )
   }
-
-  const clawHelpText = (): string =>
-    [
-      t('clawHelpTitle'),
-      '',
-      `- \`/help\`: ${t('clawHelpCommandHelp')}`,
-      `- \`/new\`: ${t('clawHelpCommandNew')}`,
-      `- \`/model auto\`: ${t('clawHelpCommandModelAuto')}`,
-      `- \`/model pro\`: ${t('clawHelpCommandModelPro')}`,
-      `- \`/model flash\`: ${t('clawHelpCommandModelFlash')}`,
-      `- \`/model\`: ${t('clawHelpCommandModelShow')}`
-    ].join('\n')
 
   useEffect(() => {
     inputRef.current = input
@@ -500,23 +348,18 @@ export function Workbench(): ReactElement {
     const runtimeReady = runtimeConnection === 'ready'
     if (!runtimeReady) setRuntimeInfo(null)
     const provider = getProvider()
-    const localSkillsTask = typeof window !== 'undefined' && typeof window.dsGui?.listSkills === 'function'
-      ? window.dsGui.listSkills(activeSkillWorkspace || undefined)
-      : Promise.resolve({ ok: true as const, skills: [], validationErrors: [] })
-    void Promise.allSettled([
-      runtimeReady && provider.getRuntimeInfo ? provider.getRuntimeInfo() : Promise.resolve(null),
-      runtimeReady && provider.listSkills ? provider.listSkills() : Promise.resolve([]),
-      localSkillsTask
-    ])
-      .then(([runtimeResult, skillsResult, localSkillsResult]) => {
+    void loadWorkbenchRuntimeMetadata({
+      runtimeReady,
+      getRuntimeInfo: provider.getRuntimeInfo ? () => provider.getRuntimeInfo!() : undefined,
+      listRuntimeSkills: provider.listSkills ? () => provider.listSkills!() : undefined,
+      listLocalSkills: typeof window !== 'undefined' && typeof window.dsGui?.listSkills === 'function'
+        ? () => window.dsGui!.listSkills!(activeSkillWorkspace || undefined)
+        : undefined
+    })
+      .then((metadata) => {
         if (cancelled) return
-        setRuntimeInfo(runtimeResult.status === 'fulfilled' ? runtimeResult.value : null)
-        const runtimeSkillList = skillsResult.status === 'fulfilled' ? skillsResult.value : []
-        const localSkillList =
-          localSkillsResult.status === 'fulfilled' && localSkillsResult.value.ok
-            ? localSkillsResult.value.skills
-            : []
-        setRuntimeSkills(mergeSkillCommands(runtimeSkillList, localSkillList))
+        setRuntimeInfo(metadata.runtimeInfo)
+        setRuntimeSkills(metadata.runtimeSkills)
       })
       .catch(() => {
         if (!cancelled) {
@@ -567,48 +410,27 @@ export function Workbench(): ReactElement {
   const handlePickAttachments = async (files: File[]): Promise<void> => {
     if (!files.length || !attachmentUploadEnabled) return
     const provider = getProvider()
-    if (typeof provider.uploadAttachment !== 'function') {
-      setAttachmentUploadError(t('composerAttachmentUnavailable'))
-      return
-    }
     setAttachmentUploadBusy(true)
     setAttachmentUploadError(null)
     try {
       const workspace = threads.find((thread) => thread.id === activeThreadId)?.workspace || workspaceRoot || undefined
-      const attachmentCapabilities = runtimeInfo?.capabilities.attachments
-      if (!attachmentCapabilities) {
-        setAttachmentUploadError(t('composerAttachmentUnavailable'))
+      const result = await uploadWorkbenchComposerImages({
+        files,
+        attachmentUploadEnabled,
+        uploadAttachment: provider.uploadAttachment,
+        attachmentCapabilities: runtimeInfo?.capabilities.attachments,
+        ...(activeThreadId ? { threadId: activeThreadId } : {}),
+        ...(workspace ? { workspace } : {}),
+        unavailableMessage: t('composerAttachmentUnavailable')
+      })
+      if (result.status === 'error') {
+        setAttachmentUploadError(result.message)
         return
       }
-      const uploaded: AttachmentReference[] = []
-      for (const file of files) {
-        if (!file.type.startsWith('image/')) continue
-        const prepared = await prepareImageAttachmentUpload(file, attachmentCapabilities)
-        const attachment = await provider.uploadAttachment({
-          name: file.name || 'image',
-          mimeType: prepared.mimeType,
-          dataBase64: prepared.dataBase64,
-          textFallback: prepared.textFallback,
-          ...(activeThreadId ? { threadId: activeThreadId } : {}),
-          ...(workspace ? { workspace } : {})
-        })
-        uploaded.push({
-          id: attachment.id,
-          name: attachment.name,
-          mimeType: attachment.mimeType,
-          width: attachment.width,
-          height: attachment.height,
-          previewUrl: `data:${prepared.mimeType};base64,${prepared.dataBase64}`
-        })
-      }
-      if (uploaded.length > 0) {
-        setComposerAttachments((current) => {
-          const byId = new Map(current.map((attachment) => [attachment.id, attachment]))
-          for (const attachment of uploaded) {
-            byId.set(attachment.id, attachment)
-          }
-          return [...byId.values()]
-        })
+      if (result.status === 'uploaded' && result.attachments.length > 0) {
+        setComposerAttachments((current) =>
+          mergeWorkbenchComposerAttachments(current, result.attachments)
+        )
       }
     } catch (error) {
       setAttachmentUploadError(error instanceof Error ? error.message : String(error))
@@ -786,33 +608,6 @@ export function Workbench(): ReactElement {
     if (!sent) setInput(v)
   }
 
-  const uploadSddImagesAsAttachments = async (
-    images: SddDraftImageReference[],
-    threadId: string,
-    workspace: string
-  ): Promise<{ images: SddDraftImageReference[]; attachmentIds: string[] }> => {
-    const provider = getProvider()
-    const attachmentCapabilities = runtimeInfo?.capabilities.attachments
-    if (!attachmentCapabilities || typeof provider.uploadAttachment !== 'function') {
-      throw new Error(t('composerAttachmentUnavailable'))
-    }
-    const attachmentIds: string[] = []
-    for (const image of images) {
-      const file = base64ImageToFile(image)
-      const prepared = await prepareImageAttachmentUpload(file, attachmentCapabilities)
-      const attachment = await provider.uploadAttachment({
-        name: fileNameFromPath(image.relativePath),
-        mimeType: prepared.mimeType,
-        dataBase64: prepared.dataBase64,
-        textFallback: prepared.textFallback,
-        threadId,
-        workspace
-      })
-      attachmentIds.push(attachment.id)
-    }
-    return { images: withAttachmentIds(images, attachmentIds), attachmentIds }
-  }
-
   const handleSddNextStep = async (): Promise<void> => {
     const snapshot = useSddDraftStore.getState()
     const draft = snapshot.activeDraft
@@ -852,99 +647,41 @@ export function Workbench(): ReactElement {
       return
     }
 
-    const supportsImageAttachments =
-      collected.images.length > 0 &&
-      runtimeInfo?.capabilities.model.inputModalities.includes('image') === true &&
-      runtimeInfo.capabilities.attachments.available === true &&
-      typeof getProvider().uploadAttachment === 'function'
-
-    let imagesForPrompt = collected.images
-    let attachmentIds: string[] = []
-    let imageMode: 'attachments' | 'base64' | 'none' =
-      collected.images.length === 0 ? 'none' : 'base64'
-
-    if (supportsImageAttachments) {
-      try {
-        const uploaded = await uploadSddImagesAsAttachments(collected.images, threadId, draft.workspaceRoot)
-        imagesForPrompt = uploaded.images
-        attachmentIds = uploaded.attachmentIds
-        imageMode = 'attachments'
-      } catch (error) {
-        useSddDraftStore.getState().setOperationStatus(
-          'error',
-          error instanceof Error ? error.message : String(error)
-        )
-        return
-      }
+    const provider = getProvider()
+    const planImages = await prepareWorkbenchSddPlanImages({
+      images: collected.images,
+      modelSupportsImages: runtimeInfo?.capabilities.model.inputModalities.includes('image') === true,
+      attachmentCapabilities: runtimeInfo?.capabilities.attachments,
+      uploadAttachment: provider.uploadAttachment,
+      threadId,
+      workspace: draft.workspaceRoot
+    })
+    if (planImages.status === 'error') {
+      useSddDraftStore.getState().setOperationStatus('error', planImages.message)
+      return
     }
 
-    const latestDraftContent = useSddDraftStore.getState().content
-    const planRelativePath = sddDraftPlanRelativePath(draft)
-    const planId = buildGuiPlanId(draft.workspaceRoot, planRelativePath)
-    const sourceRequest = sddDraftSourceRequest(latestDraftContent, draft.relativePath)
-    const assistantContext = sddAssistantContextFromBlocks(blocks)
-    const prompt = buildSddDraftToPlanPrompt({
-      draftMarkdown: latestDraftContent,
-      draftRelativePath: draft.relativePath,
-      planRelativePath,
-      assistantContext,
-      workspaceRoot: draft.workspaceRoot,
-      images: imagesForPrompt,
-      imageMode
+    const planTurn = buildSddDraftPlanTurn({
+      assistantBlocks: blocks,
+      draft,
+      imageMode: planImages.imageMode,
+      images: planImages.images,
+      latestDraftContent: useSddDraftStore.getState().content
     })
     sddUpgradeInFlightRef.current = true
-    sddUpgradeTargetRef.current = {
-      planId,
-      relativePath: planRelativePath,
-      workspaceRoot: draft.workspaceRoot
-    }
+    sddUpgradeTargetRef.current = planTurn.pendingTarget
     setMode('plan')
-    const sent = await sendPlanTurn(prompt, {
+    const sent = await sendPlanTurn(planTurn.prompt, {
       displayText: t('sddGeneratePlanAction'),
       workspaceRoot: draft.workspaceRoot,
-      guiPlan: {
-        operation: 'draft',
-        workspaceRoot: draft.workspaceRoot,
-        relativePath: planRelativePath,
-        planId,
-        sourceRequest
-      },
-      ...(attachmentIds.length ? { attachmentIds } : {})
+      guiPlan: planTurn.guiPlan,
+      ...(planImages.attachmentIds.length ? { attachmentIds: planImages.attachmentIds } : {})
     })
     if (!sent) {
       sddUpgradeInFlightRef.current = false
       sddUpgradeTargetRef.current = null
       useSddDraftStore.getState().setOperationStatus('idle')
     }
-  }
-
-  const readComposerFileContextEntries = async (
-    references: ComposerFileReference[],
-    workspace: string
-  ): Promise<ComposerFileContextEntry[]> => {
-    const entries: ComposerFileContextEntry[] = []
-    let remainingChars = COMPOSER_FILE_CONTEXT_MAX_TOTAL_CHARS
-    for (const reference of references) {
-      if (remainingChars <= 0) break
-      const result = await window.dsGui.readWorkspaceFile({
-        workspaceRoot: workspace,
-        path: reference.relativePath || reference.path
-      })
-      if (!result.ok) {
-        throw new Error(t('composerFileReadFailed', {
-          path: reference.relativePath,
-          message: result.message
-        }))
-      }
-      const clipped = clipComposerFileContext(result.content, remainingChars, result.truncated)
-      remainingChars -= clipped.consumed
-      entries.push({
-        relativePath: reference.relativePath,
-        content: clipped.content,
-        ...(clipped.truncated ? { truncated: true } : {})
-      })
-    }
-    return entries
   }
 
   const handleSend = (): void => {
@@ -957,162 +694,100 @@ export function Workbench(): ReactElement {
     const attachmentIds = attachments.map((attachment) => attachment.id)
     const fileReferences = route === 'chat' ? composerFileReferences : []
     const reasoningEffort = composerReasoningEffortRequestValue(composerReasoningEffort)
-    if (!v && attachmentIds.length === 0 && fileReferences.length === 0) return
-    const emptyPrompt =
-      fileReferences.length > 0 && attachmentIds.length > 0
-        ? t('composerFileAndImageOnlyPrompt')
-        : fileReferences.length > 0
-          ? t('composerFileOnlyPrompt')
-          : t('composerImageOnlyPrompt')
-    const emptyDisplayText = v
-      ? undefined
-      : fileReferences.length > 0 && attachmentIds.length > 0
-        ? t('composerFileAndImageOnlyDisplay', { count: fileReferences.length })
-        : fileReferences.length > 0
-          ? t('composerFileOnlyDisplay', { count: fileReferences.length })
-          : t('composerImageOnlyDisplay')
-    const messageText = v || emptyPrompt
+    const sendRoute = resolveWorkbenchSendRoute({
+      activeSddDraft: Boolean(activeSddDraft),
+      attachmentCount: attachmentIds.length,
+      fileReferenceCount: fileReferences.length,
+      input: v,
+      mode,
+      rightPanelMode,
+      route
+    })
+    if (sendRoute.kind === 'ignore') return
     const prepareChatMessage = async (): Promise<{ text: string; displayText?: string } | null> => {
-      if (fileReferences.length === 0) {
-        return {
-          text: messageText,
-          ...(emptyDisplayText ? { displayText: emptyDisplayText } : {})
-        }
-      }
-      const workspace = normalizeWorkspaceRoot(
-        threads.find((thread) => thread.id === activeThreadId)?.workspace || workspaceRoot
-      )
-      if (!workspace) {
-        setError(t('workspaceRequiredToCreateThread'))
+      const result = await prepareWorkbenchChatComposerMessage({
+        activeThreadWorkspace: threads.find((thread) => thread.id === activeThreadId)?.workspace,
+        attachmentIds,
+        fileReferences,
+        readWorkspaceFile: window.dsGui.readWorkspaceFile,
+        t,
+        userText: v,
+        workspaceRoot
+      })
+      if (!result.ok) {
+        if (result.error) setError(result.error)
         return null
       }
-      try {
-        const fileContext = await readComposerFileContextEntries(fileReferences, workspace)
-        const displayText = v || emptyDisplayText
-        return {
-          text: buildComposerFileContextPrompt(messageText, fileContext),
-          ...(displayText ? { displayText } : {})
-        }
-      } catch (error) {
-        setError(error instanceof Error ? error.message : String(error))
-        return null
-      }
+      return result.message
     }
 
-    if (activeSddDraft && rightPanelMode === 'sdd-ai') {
+    if (sendRoute.kind === 'sdd-assistant') {
       void sendSddAssistantPrompt(v)
       return
     }
-    const planCommand = parseGuiPlanCommand(v)
-    if (planCommand) {
+    if (sendRoute.kind === 'gui-plan-command') {
       setInput('')
-      void handleGuiPlanCommand(planCommand.kind === 'create' ? planCommand.request : undefined)
+      void handleGuiPlanCommand(sendRoute.request)
       return
     }
-    if (route === 'chat' && mode === 'plan') {
+    if (sendRoute.kind === 'chat-plan') {
       const prepared = await prepareChatMessage()
       if (!prepared) return
       setInput('')
       clearComposerAttachments()
       clearComposerFileReferences()
-      void sendPlanTurn(prepared.text, {
-        ...(prepared.displayText ? { displayText: prepared.displayText } : {}),
-        ...(reasoningEffort ? { reasoningEffort } : {}),
-        ...(attachmentIds.length ? { attachmentIds, attachments } : {})
-      })
+      void sendPlanTurn(prepared.text, buildWorkbenchSendMessageOptions({
+        attachmentIds,
+        attachments,
+        displayText: prepared.displayText,
+        reasoningEffort
+      }))
       return
     }
-    if (route === 'write') {
+    if (sendRoute.kind === 'write') {
       sendWritePrompt(v)
       return
     }
-    if (route === 'claw') {
-      const command = parseClawCommand(v)
-      if (command?.kind === 'clear') {
-        if (!activeClawChannelId) {
-          setError(t('clawNoActiveIm'))
-          return
+    if (sendRoute.kind === 'claw') {
+      void handleWorkbenchClawComposer({
+        value: v,
+        mode: mode === 'plan' ? 'plan' : 'agent',
+        activeClawChannelId,
+        activeClawChannelModel: activeClawChannel?.model,
+        activeThreadId,
+        reasoningEffort,
+        labels: {
+          helpTitle: t('clawHelpTitle'),
+          helpCommandHelp: t('clawHelpCommandHelp'),
+          helpCommandNew: t('clawHelpCommandNew'),
+          helpCommandModelAuto: t('clawHelpCommandModelAuto'),
+          helpCommandModelPro: t('clawHelpCommandModelPro'),
+          helpCommandModelFlash: t('clawHelpCommandModelFlash'),
+          helpCommandModelShow: t('clawHelpCommandModelShow'),
+          noActiveChannel: t('clawNoActiveIm'),
+          newSessionStarted: t('clawNewSessionStarted'),
+          modelChanged: (model) => t('clawModelChanged', { model }),
+          modelCurrent: (model) => t('clawModelCurrent', { model }),
+          modelCommandHint: t('clawModelCommandHint'),
+          taskCreateFailed: (message) => `Failed to create scheduled task: ${message}`
+        },
+        clearInput: () => setInput(''),
+        setError,
+        appendLocalClawTurn,
+        mirrorClawCommand,
+        resetClawChannelSession,
+        setClawChannelModel,
+        createClawTaskFromText: typeof window.dsGui?.createClawTaskFromText === 'function'
+          ? window.dsGui.createClawTaskFromText
+          : undefined,
+        selectClawChannel,
+        sendMessage: async (text, sendMode, options) => {
+          if (!activeThreadId) {
+            return useChatStore.getState().sendMessage(text, sendMode, options)
+          }
+          return sendMessage(text, sendMode, options)
         }
-        setInput('')
-        void (async () => {
-          await resetClawChannelSession(activeClawChannelId)
-          const replyText = t('clawNewSessionStarted')
-          appendLocalClawTurn(v, replyText)
-          await mirrorClawCommand(v, replyText)
-        })()
-        return
-      }
-      if (command?.kind === 'help') {
-        setInput('')
-        const replyText = clawHelpText()
-        appendLocalClawTurn(v, replyText)
-        void mirrorClawCommand(v, replyText)
-        return
-      }
-      if (command?.kind === 'model') {
-        if (!activeClawChannelId) {
-          setError(t('clawNoActiveIm'))
-          return
-        }
-        setInput('')
-        void (async () => {
-          await setClawChannelModel(activeClawChannelId, command.model)
-          const replyText = t('clawModelChanged', { model: command.model })
-          appendLocalClawTurn(v, replyText)
-          await mirrorClawCommand(v, replyText)
-        })()
-        return
-      }
-      if (command?.kind === 'showModel') {
-        if (!activeClawChannelId) {
-          setError(t('clawNoActiveIm'))
-          return
-        }
-        setInput('')
-        const replyText = t('clawModelCurrent', {
-          model: activeClawChannel?.model ?? 'auto'
-        })
-        appendLocalClawTurn(v, replyText)
-        void mirrorClawCommand(v, replyText)
-        return
-      }
-      if (command?.kind === 'invalidModel') {
-        setError(t('clawModelCommandHint'))
-        return
-      }
-      if (!activeClawChannelId) {
-        setError(t('clawNoActiveIm'))
-        return
-      }
-      setInput('')
-      void (async () => {
-        const taskResult = typeof window.dsGui?.createClawTaskFromText === 'function'
-          ? await window.dsGui.createClawTaskFromText(v, {
-              channelId: activeClawChannelId,
-              modelHint: activeClawChannel?.model,
-              mode
-            })
-          : { kind: 'noop' as const }
-        if (taskResult.kind === 'created') {
-          appendLocalClawTurn(v, taskResult.confirmationText)
-          await mirrorClawCommand(v, taskResult.confirmationText)
-          return
-        }
-        if (taskResult.kind === 'error') {
-          appendLocalClawTurn(v, `Failed to create scheduled task: ${taskResult.message}`)
-          return
-        }
-        if (!activeThreadId) {
-          await selectClawChannel(activeClawChannelId)
-          await useChatStore.getState().sendMessage(v, mode === 'plan' ? 'plan' : 'agent', {
-            ...(reasoningEffort ? { reasoningEffort } : {})
-          })
-          return
-        }
-        await sendMessage(v, mode === 'plan' ? 'plan' : 'agent', {
-          ...(reasoningEffort ? { reasoningEffort } : {})
-        })
-      })()
+      })
       return
     }
     const prepared = await prepareChatMessage()
@@ -1120,40 +795,36 @@ export function Workbench(): ReactElement {
     setInput('')
     clearComposerAttachments()
     clearComposerFileReferences()
-    void sendMessage(prepared.text, mode === 'plan' ? 'plan' : 'agent', {
-      ...(prepared.displayText ? { displayText: prepared.displayText } : {}),
-      ...(reasoningEffort ? { reasoningEffort } : {}),
-      ...(attachmentIds.length ? { attachmentIds, attachments } : {})
+    void sendMessage(prepared.text, mode === 'plan' ? 'plan' : 'agent', buildWorkbenchSendMessageOptions({
+      attachmentIds,
+      attachments,
+      displayText: prepared.displayText,
+      reasoningEffort
+    }))
+  }
+
+  const prepareChatNavigation = (): void => {
+    prepareWorkbenchChatNavigation({
+      hasActiveSddDraft: Boolean(activeSddDraft),
+      saveActiveSddDraft: saveActiveSddDraftToDisk,
+      clearActiveSddDraft: () => useSddDraftStore.getState().clearActiveDraft(),
+      closeConnectPhoneSidebar: () => setConnectPhoneSidebarOpen(false),
+      setRouteToChat: () => setRoute('chat')
     })
   }
 
   const openThread = (id: string): void => {
-    if (activeSddDraft) {
-      void saveActiveSddDraftToDisk()
-      useSddDraftStore.getState().clearActiveDraft()
-    }
-    setConnectPhoneSidebarOpen(false)
-    setRoute('chat')
+    prepareChatNavigation()
     void selectThread(id)
   }
 
   const startNewChat = (): void => {
-    if (activeSddDraft) {
-      void saveActiveSddDraftToDisk()
-      useSddDraftStore.getState().clearActiveDraft()
-    }
-    setConnectPhoneSidebarOpen(false)
-    setRoute('chat')
+    prepareChatNavigation()
     void createThread()
   }
 
   const startNewChatInWorkspace = (workspaceRoot: string): void => {
-    if (activeSddDraft) {
-      void saveActiveSddDraftToDisk()
-      useSddDraftStore.getState().clearActiveDraft()
-    }
-    setConnectPhoneSidebarOpen(false)
-    setRoute('chat')
+    prepareChatNavigation()
     void createThread({ workspaceRoot })
   }
 
@@ -1187,14 +858,7 @@ export function Workbench(): ReactElement {
     setConnectPhoneSidebarOpen((open) => !open)
   }
 
-  const sidebarView: 'chat' | 'write' | 'claw' | 'schedule' =
-    route === 'claw' || (route === 'plugins' && pluginHostRoute === 'claw')
-      ? 'claw'
-      : route === 'schedule'
-        ? 'schedule'
-      : route === 'write'
-        ? 'write'
-        : 'chat'
+  const sidebarView = resolveWorkbenchSidebarView({ pluginHostRoute, route })
 
   const closeRightPanel = (): void => {
     if (route === 'write') {
@@ -1224,122 +888,61 @@ export function Workbench(): ReactElement {
     />
   )
 
-  const writeRuntimeBannerMessage = runtimeConnection !== 'ready'
-    ? (error?.trim() || t('writeRuntimeUnavailable'))
-    : null
+  const writeRuntimeBannerMessage = resolveWriteRuntimeBannerMessage({
+    error,
+    runtimeConnection,
+    unavailableLabel: t('writeRuntimeUnavailable')
+  })
+  const rightPanelContent = resolveWorkbenchRightPanelContent({
+    hasActiveSddDraft: Boolean(activeSddDraft),
+    rightPanelMode,
+    route,
+    writeAssistantOpen
+  })
 
   const renderRightPanel = (): ReactElement | null => {
-    if (!rightPanelVisible) return null
     return (
-      <>
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          className="ds-workbench-divider ds-no-drag relative z-20 shrink-0 cursor-col-resize"
-          onPointerDown={beginRightResize}
-        />
-        <div className="h-full min-h-0 shrink-0" style={{ width: rightSidebarWidth }}>
-          <Suspense fallback={<div className="h-full w-full bg-ds-sidebar" />}>
-            {route === 'write' && writeAssistantOpen ? (
-              <WriteAssistantPanel
-                input={input}
-                setInput={setInput}
-                mode={mode}
-                setMode={setMode}
-                busy={busy}
-                runtimeConnection={runtimeConnection}
-                activeThreadId={activeThreadId}
-                blocks={blocks}
-                liveReasoning={liveReasoning}
-                liveAssistant={liveAssistant}
-                composerModel={writeAssistantModel}
-                composerPickList={writeAssistantPickList}
-                composerModelGroups={composerModelGroups}
-                composerReasoningEffort={composerReasoningEffort}
-                setComposerModel={setWriteAssistantModel}
-                setComposerReasoningEffort={setComposerReasoningEffort}
-                queuedMessages={queuedMessages}
-                removeQueuedMessage={removeQueuedMessage}
-                onSend={handleSend}
-                onInterrupt={(options) => void interrupt(options)}
-                onRetryConnection={() => void probeRuntime('user')}
-                onOpenSettings={() => openSettings('agents')}
-                onNewConversation={startNewWriteAssistantConversation}
-                onCollapse={closeRightPanel}
-                className="h-full max-h-full w-full"
-              />
-            ) : rightPanelMode === 'sdd-ai' && activeSddDraft ? (
-              <SddAssistantPanel
-                draft={activeSddDraft}
-                input={input}
-                setInput={setInput}
-                mode={mode}
-                setMode={setMode}
-                busy={busy}
-                runtimeConnection={runtimeConnection}
-                activeThreadId={activeThreadId}
-                blocks={blocks}
-                liveReasoning={liveReasoning}
-                liveAssistant={liveAssistant}
-                composerModel={writeAssistantModel}
-                composerPickList={writeAssistantPickList}
-                composerModelGroups={composerModelGroups}
-                composerReasoningEffort={composerReasoningEffort}
-                setComposerModel={setWriteAssistantModel}
-                setComposerReasoningEffort={setComposerReasoningEffort}
-                queuedMessages={queuedMessages}
-                removeQueuedMessage={removeQueuedMessage}
-                onSend={handleSend}
-                onInterrupt={(options) => void interrupt(options)}
-                onRetryConnection={() => void probeRuntime('user')}
-                onOpenSettings={() => openSettings('agents')}
-                onNewConversation={() => {
-                  setInput('')
-                  void createSddAssistantThreadForDraft(activeSddDraft)
-                }}
-                onCollapse={closeRightPanel}
-                className="h-full max-h-full w-full"
-              />
-            ) : rightPanelMode === 'changes' ? (
-              <ChangeInspector
-                blocks={blocks}
-                className="h-full max-h-full w-full flex-col"
-                onCollapse={closeRightPanel}
-              />
-            ) : rightPanelMode === 'todo' ? (
-              <TodoPanel
-                className="h-full max-h-full w-full"
-                onCollapse={closeRightPanel}
-                onOpenPlan={openGuiPlanPanel}
-              />
-            ) : rightPanelMode === 'browser' ? (
-              <DevBrowserPanel
-                blocks={devPreviewBlocks}
-                preferredUrl={latestDevPreviewUrl}
-                className="h-full max-h-full w-full flex-col"
-                onCollapse={closeRightPanel}
-              />
-            ) : rightPanelMode === 'plan' ? (
-              <PlanPanel
-                workspaceRoot={workspaceRoot}
-                activeThreadId={activeThreadId}
-                runtimeReady={runtimeConnection === 'ready'}
-                busy={busy}
-                className="h-full max-h-full w-full"
-                onCollapse={closeRightPanel}
-                onBuildPlan={() => void buildGuiPlan()}
-              />
-            ) : (
-              <WorkspaceFilePreviewPanel
-                target={filePreviewTarget}
-                workspaceRoot={workspaceRoot}
-                className="h-full max-h-full w-full"
-                onClose={closeRightPanel}
-              />
-            )}
-          </Suspense>
-        </div>
-      </>
+      <WorkbenchRightPanel
+        activeSddDraft={activeSddDraft}
+        activeThreadId={activeThreadId}
+        blocks={blocks}
+        busy={busy}
+        composerModel={writeAssistantModel}
+        composerPickList={writeAssistantPickList}
+        composerModelGroups={composerModelGroups}
+        composerReasoningEffort={composerReasoningEffort}
+        content={rightPanelContent}
+        devPreviewBlocks={devPreviewBlocks}
+        filePreviewTarget={filePreviewTarget}
+        input={input}
+        latestDevPreviewUrl={latestDevPreviewUrl}
+        liveAssistant={liveAssistant}
+        liveReasoning={liveReasoning}
+        mode={mode}
+        onBeginResize={beginRightResize}
+        onBuildPlan={() => void buildGuiPlan()}
+        onCollapse={closeRightPanel}
+        onInterrupt={(options) => void interrupt(options)}
+        onNewSddConversation={() => {
+          if (!activeSddDraft) return
+          setInput('')
+          void createSddAssistantThreadForDraft(activeSddDraft)
+        }}
+        onNewWriteConversation={startNewWriteAssistantConversation}
+        onOpenPlan={openGuiPlanPanel}
+        onOpenSettings={() => openSettings('agents')}
+        onRetryConnection={() => void probeRuntime('user')}
+        onSend={handleSend}
+        queuedMessages={queuedMessages}
+        removeQueuedMessage={removeQueuedMessage}
+        runtimeConnection={runtimeConnection}
+        setComposerModel={setWriteAssistantModel}
+        setComposerReasoningEffort={setComposerReasoningEffort}
+        setInput={setInput}
+        setMode={setMode}
+        width={rightSidebarWidth}
+        workspaceRoot={workspaceRoot}
+      />
     )
   }
 
@@ -1348,57 +951,37 @@ export function Workbench(): ReactElement {
       ref={shellRef}
       className="ds-workbench-shell ds-drag flex h-full min-h-0 w-full min-w-0 bg-ds-main"
     >
-      {!leftSidebarCollapsed ? (
-        <>
-          <div className="min-h-0 shrink-0" style={{ width: leftSidebarWidth }}>
-            {route === 'write' ? (
-              <WriteSidebar
-                activeView={sidebarView}
-                connectPhoneSidebarOpen={connectPhoneSidebarOpen}
-                onCodeOpen={openCodeMode}
-                onWriteOpen={openWriteMode}
-                onOpenSettings={(section) => openSettings(section)}
-                onToggleConnectPhone={toggleConnectPhone}
-                onToggleSidebar={toggleLeftSidebar}
-              />
-            ) : (
-            <Sidebar
-              threads={codeThreads}
-              activeThreadId={activeThreadId}
-              activeView={sidebarView}
-              connectPhoneSidebarOpen={connectPhoneSidebarOpen}
-              pluginsActive={route === 'plugins'}
-              runtimeReady={runtimeConnection === 'ready'}
-              threadSearch={threadSearch}
-              showArchivedThreads={showArchivedThreads}
-              onThreadSearchChange={setThreadSearch}
-              onShowArchivedThreadsChange={setShowArchivedThreads}
-              onSelectThread={openThread}
-              onRenameThread={renameThread}
-              onArchiveThread={(id) => archiveThread(id, true)}
-              onDeleteThread={deleteThread}
-              onRestoreThread={(id) => archiveThread(id, false)}
-              onNewChat={startNewChat}
-              onNewChatInWorkspace={startNewChatInWorkspace}
-              onNewRequirement={() => void startNewSddRequirement()}
-              onOpenSettings={(section) => openSettings(section)}
-              onOpenPlugins={openPluginsView}
-              onToggleConnectPhone={toggleConnectPhone}
-              onCodeOpen={openCodeMode}
-              onWriteOpen={openWriteMode}
-              onScheduleOpen={openScheduleView}
-              onToggleSidebar={toggleLeftSidebar}
-            />
-            )}
-          </div>
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            className="ds-workbench-divider ds-no-drag relative z-20 shrink-0 cursor-col-resize"
-            onPointerDown={beginLeftResize}
-          />
-        </>
-      ) : null}
+      <WorkbenchLeftSidebar
+        activeThreadId={activeThreadId}
+        collapsed={leftSidebarCollapsed}
+        connectPhoneSidebarOpen={connectPhoneSidebarOpen}
+        leftSidebarWidth={leftSidebarWidth}
+        onArchiveThread={(id) => archiveThread(id, true)}
+        onBeginResize={beginLeftResize}
+        onCodeOpen={openCodeMode}
+        onDeleteThread={deleteThread}
+        onNewChat={startNewChat}
+        onNewChatInWorkspace={startNewChatInWorkspace}
+        onNewRequirement={() => void startNewSddRequirement()}
+        onOpenPlugins={openPluginsView}
+        onOpenSettings={(section) => openSettings(section)}
+        onRenameThread={renameThread}
+        onRestoreThread={(id) => archiveThread(id, false)}
+        onScheduleOpen={openScheduleView}
+        onSelectThread={openThread}
+        onShowArchivedThreadsChange={setShowArchivedThreads}
+        onThreadSearchChange={setThreadSearch}
+        onToggleConnectPhone={toggleConnectPhone}
+        onToggleSidebar={toggleLeftSidebar}
+        onWriteOpen={openWriteMode}
+        pluginsActive={route === 'plugins'}
+        runtimeReady={runtimeConnection === 'ready'}
+        route={route}
+        showArchivedThreads={showArchivedThreads}
+        sidebarView={sidebarView}
+        threadSearch={threadSearch}
+        threads={codeThreads}
+      />
 
       <main
         className={`ds-drag ds-stage-surface relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden ${
@@ -1459,110 +1042,61 @@ export function Workbench(): ReactElement {
               nextDisabled={busy || runtimeConnection !== 'ready' || sddDraftOperationStatus === 'upgrading'}
             />
           ) : (
-            <section className="ds-chat-stage ds-drag flex min-h-0 min-w-0 flex-1 flex-col">
-            <header className="chat-topbar ds-topbar-surface relative z-10 mt-3 flex min-h-[46px] w-full shrink-0 items-stretch overflow-visible rounded-[24px]">
-              <div className="chat-topbar-grid grid w-full min-w-0 items-center gap-2.5 px-3 py-2 sm:px-4 md:pl-5 md:pr-2">
-                <div
-                  className={`chat-topbar-session flex min-w-0 items-center gap-2.5 ${
-                    leftSidebarCollapsed ? 'ds-window-controls-safe-inset' : ''
-                  }`}
-                >
-                  {leftSidebarCollapsed ? (
-                    <SidebarTitlebarToggleButton
-                      onClick={toggleLeftSidebar}
-                      title={t('sidebarExpand')}
-                      ariaLabel={t('sidebarExpand')}
-                    />
-                  ) : null}
-                  <SessionHeader compact className="min-w-0 flex-1" />
-                </div>
-                <div className="chat-topbar-actions flex min-w-0 flex-wrap items-center justify-end gap-2">
-                  {busy ? (
-                    <span className="inline-flex shrink-0 rounded-full bg-amber-500/16 px-2.5 py-1 text-[11.5px] font-semibold text-amber-950 dark:text-amber-100">
-                      {t('running')}
-                    </span>
-                  ) : null}
-                  <WorkbenchTopBar
-                    rightPanelMode={rightPanelMode}
-                    onToggleRightPanelMode={toggleRightPanelMode}
-                    planPanelEnabled={Boolean(activeGuiPlan)}
-                  />
-                </div>
-              </div>
-            </header>
-            <MessageTimeline
-              blocks={timelineBlocks}
-              liveReasoning={timelineLiveReasoning}
-              live={timelineLiveAssistant}
+            <WorkbenchChatStage
+              activeClawChannelId={activeClawChannelId}
               activeThreadId={activeThreadId}
+              attachmentUploadBusy={attachmentUploadBusy}
+              attachmentUploadEnabled={attachmentUploadEnabled}
+              attachmentUploadError={attachmentUploadError}
+              attachments={composerAttachments}
+              blocks={timelineBlocks}
+              busy={busy}
+              clawChannels={clawChannels}
+              composerFileReferences={composerFileReferences}
+              composerModel={composerModel}
+              composerModelGroups={composerModelGroups}
+              composerPickList={composerPickList}
+              composerReasoningEffort={composerReasoningEffort}
+              hasActiveSddDraft={Boolean(activeSddDraft)}
+              input={input}
+              leftSidebarCollapsed={leftSidebarCollapsed}
+              latestDevPreviewUrl={latestDevPreviewUrl}
+              liveAssistant={timelineLiveAssistant}
+              liveReasoning={timelineLiveReasoning}
+              mode={mode}
+              planPanelEnabled={Boolean(activeGuiPlan)}
+              queuedMessages={queuedMessages}
+              rightPanelMode={rightPanelMode}
+              route={route}
               runtimeConnection={runtimeConnection}
-              onRetryConnection={() => void probeRuntime('user')}
-              onOpenSettings={() => openSettings('agents')}
-              onSelectSuggestion={(text) => setInput(text)}
-              planActionsBusy={busy}
+              runtimeSkills={runtimeSkills}
+              showDevPreviewCard={showDevPreviewCard}
+              webAccessAvailable={webAccessAvailable}
+              onAddFileReference={addComposerFileReference}
               onBuildPlan={() => void buildGuiPlan()}
+              onBtwCommand={(seedText) => void spawnSideConversation(seedText)}
+              onInterrupt={(options) => void interrupt(options)}
+              onOpenDevPreview={openDevPreview}
               onOpenPlan={openGuiPlanPanel}
-              devPreviewCard={
-                showDevPreviewCard ? (
-                  <DevPreviewLaunchCard
-                    url={latestDevPreviewUrl}
-                    onOpen={openDevPreview}
-                  />
-                ) : null
-              }
+              onOpenSettings={() => openSettings('agents')}
+              onPasteClipboardImage={(options) => void handlePasteClipboardImage(options)}
+              onPickAttachments={(files) => void handlePickAttachments(files)}
+              onPlanCommand={() => void handleGuiPlanCommand()}
+              onRemoveAttachment={removeComposerAttachment}
+              onRemoveFileReference={removeComposerFileReference}
+              onRemoveQueuedMessage={removeQueuedMessage}
+              onRetryConnection={() => void probeRuntime('user')}
+              onReviewCommand={(target) => void reviewActiveThread(target)}
+              onSelectSuggestion={(text) => setInput(text)}
+              onSend={handleSend}
+              onSetClawChannelModel={setClawChannelModel}
+              onSetComposerModel={setComposerModel}
+              onSetComposerReasoningEffort={setComposerReasoningEffort}
+              onSetInput={setInput}
+              onSetMode={setMode}
+              onToggleLeftSidebar={toggleLeftSidebar}
+              onToggleRightPanelMode={toggleRightPanelMode}
             />
-            <div className="flex shrink-0 justify-center px-2 pb-3 pt-0 sm:px-4 md:px-6 lg:px-8">
-              <FloatingComposer
-                input={input}
-                setInput={setInput}
-                mode={mode}
-                setMode={setMode}
-                busy={busy}
-                runtimeReady={runtimeConnection === 'ready'}
-                hasActiveThread={Boolean(activeThreadId)}
-                composerModel={
-                  route === 'claw'
-                    ? clawChannels.find((channel) => channel.id === activeClawChannelId)?.model ?? 'auto'
-                    : composerModel
-                }
-                composerPickList={composerPickList}
-                composerModelGroups={composerModelGroups}
-                composerReasoningEffort={
-                  route === 'chat' || route === 'claw' ? composerReasoningEffort : undefined
-                }
-                onComposerModelChange={(modelId) => {
-                  if (route === 'claw' && activeClawChannelId) {
-                    void setClawChannelModel(activeClawChannelId, modelId)
-                    return
-                  }
-                  setComposerModel(modelId)
-                }}
-                onComposerReasoningEffortChange={
-                  route === 'chat' || route === 'claw' ? setComposerReasoningEffort : undefined
-                }
-                onSend={handleSend}
-                attachments={composerAttachments}
-                attachmentUploadEnabled={attachmentUploadEnabled}
-                attachmentUploadBusy={attachmentUploadBusy}
-                attachmentUploadError={attachmentUploadError}
-                fileReferenceEnabled={route === 'chat' && !activeSddDraft}
-                fileReferences={composerFileReferences}
-                webAccessAvailable={webAccessAvailable}
-                skillCommands={runtimeSkills}
-                onPickAttachments={(files) => void handlePickAttachments(files)}
-                onPasteClipboardImage={(options) => void handlePasteClipboardImage(options)}
-                onRemoveAttachment={removeComposerAttachment}
-                onAddFileReference={addComposerFileReference}
-                onRemoveFileReference={removeComposerFileReference}
-                queuedMessages={queuedMessages}
-                onRemoveQueuedMessage={removeQueuedMessage}
-                onInterrupt={(options) => void interrupt(options)}
-                onPlanCommand={() => void handleGuiPlanCommand()}
-                onReviewCommand={(target) => void reviewActiveThread(target)}
-                onBtwCommand={(seedText) => void spawnSideConversation(seedText)}
-              />
-            </div>
-          </section>
           )}
           </div>
 

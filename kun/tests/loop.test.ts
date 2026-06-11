@@ -55,16 +55,45 @@ describe('AgentLoop', () => {
 
   it('records elapsed seconds for active goals after a turn finishes', async () => {
     let nowMs = 1_000
-    const h = makeHarness(
+    let calls = 0
+    let h: ReturnType<typeof makeHarness>
+    const updateGoalTool = LocalToolHost.defineTool({
+      name: UPDATE_GOAL_TOOL_NAME,
+      description: 'Update goal',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['complete'] }
+        },
+        required: ['status'],
+        additionalProperties: false
+      },
+      policy: 'auto',
+      execute: async (_args, context) => ({
+        output: { goal: await h.threads.setGoal(context.threadId, { status: 'complete' }) }
+      })
+    })
+    h = makeHarness(
       {
         provider: 'goal-timer',
         model: 'goal-timer',
         async *stream(): AsyncIterable<ModelStreamChunk> {
+          calls += 1
           nowMs = 4_700
+          if (calls === 1) {
+            yield {
+              kind: 'tool_call_complete',
+              callId: 'call_complete_goal_timer',
+              toolName: UPDATE_GOAL_TOOL_NAME,
+              arguments: { status: 'complete' }
+            }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
           yield { kind: 'completed', stopReason: 'stop' }
         }
       },
-      { nowMs: () => nowMs }
+      { nowMs: () => nowMs, tools: [...buildDefaultLocalTools(), updateGoalTool] }
     )
     await bootstrapThread(h)
     await h.threads.setGoal(h.threadId, { objective: 'ship the feature' })
@@ -866,20 +895,30 @@ describe('AgentLoop', () => {
       inputSchema: { type: 'object', properties: {}, required: [] },
       policy: 'auto',
       execute: async (_args, _context, onUpdate) => {
+        await onUpdate?.({ output: { partial: 'starting' } })
         await onUpdate?.({ output: { partial: 'hello' } })
         return { output: { done: true } }
       }
     })
-    const h = makeHarness(makeFakeModel([
-      {
-        kind: 'tool_call_complete',
-        callId: 'call_streamer',
-        toolName: 'streamer',
-        arguments: {}
-      },
-      { kind: 'completed', stopReason: 'tool_calls' },
-      { kind: 'completed', stopReason: 'stop' }
-    ]), { tools: [streamingTool] })
+    let calls = 0
+    const h = makeHarness({
+      provider: 'streaming-tool-model',
+      model: 'streaming-tool-model',
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        calls += 1
+        if (calls === 1) {
+          yield {
+            kind: 'tool_call_complete',
+            callId: 'call_streamer',
+            toolName: 'streamer',
+            arguments: {}
+          }
+          yield { kind: 'completed', stopReason: 'tool_calls' }
+          return
+        }
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }, { tools: [streamingTool] })
     await bootstrapThread(h)
     const status = await h.loop.runTurn(h.threadId, h.turnId)
     expect(status).toBe('completed')
@@ -1093,6 +1132,8 @@ describe('AgentLoop', () => {
 
   it('injects active goal guidance and goal status tools into model requests', async () => {
     const observedRequests: ModelRequest[] = []
+    let calls = 0
+    let h: ReturnType<typeof makeHarness>
     const goalTools = [GET_GOAL_TOOL_NAME, UPDATE_GOAL_TOOL_NAME].map((name) =>
       LocalToolHost.defineTool({
         name,
@@ -1103,15 +1144,33 @@ describe('AgentLoop', () => {
           additionalProperties: false
         },
         policy: 'auto',
-        execute: async () => ({ output: { ok: true } })
+        execute: async (_args, context) => ({
+          output: {
+            ok: true,
+            ...(name === UPDATE_GOAL_TOOL_NAME
+              ? { goal: await h.threads.setGoal(context.threadId, { status: 'complete' }) }
+              : {})
+          }
+        })
       })
     )
-    const h = makeHarness(
+    h = makeHarness(
       {
         provider: 'capture-goal',
         model: 'capture-goal',
         async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+          calls += 1
           observedRequests.push(request)
+          if (calls === 1) {
+            yield {
+              kind: 'tool_call_complete',
+              callId: 'call_complete_goal_guidance',
+              toolName: UPDATE_GOAL_TOOL_NAME,
+              arguments: { status: 'complete' }
+            }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
           yield { kind: 'completed', stopReason: 'stop' }
         }
       },

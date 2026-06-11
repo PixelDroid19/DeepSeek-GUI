@@ -189,40 +189,50 @@ function buildSideSink(sideId: string, ctx: SideContext): ThreadEventSink {
     },
     onApproval: (req) => {
       ctx.set((s) =>
-        patchSide(s, sideId, (side) => ({
-          ...side,
-          blocks: [
-            ...side.blocks,
-            {
-              kind: 'approval',
-              id: `appr_${Date.now()}`,
-              createdAt: new Date().toISOString(),
-              approvalId: req.approvalId,
-              summary: req.summary,
-              toolName: req.toolName,
-              status: 'pending',
-              ...(req.meta ? { meta: req.meta } : {})
-            }
-          ]
-        }))
+        patchSide(s, sideId, (side) => {
+          if (side.blocks.some((block) => block.kind === 'approval' && block.approvalId === req.approvalId)) {
+            return side
+          }
+          return {
+            ...side,
+            blocks: [
+              ...side.blocks,
+              {
+                kind: 'approval',
+                id: `approval-${req.approvalId}`,
+                createdAt: new Date().toISOString(),
+                approvalId: req.approvalId,
+                summary: req.summary,
+                toolName: req.toolName,
+                status: 'pending',
+                ...(req.meta ? { meta: req.meta } : {})
+              }
+            ]
+          }
+        })
       )
     },
     onUserInput: (req) => {
       ctx.set((s) =>
-        patchSide(s, sideId, (side) => ({
-          ...side,
-          blocks: [
-            ...side.blocks,
-            {
-              kind: 'user_input',
-              id: `ui_${Date.now()}`,
-              createdAt: new Date().toISOString(),
-              requestId: req.requestId,
-              questions: req.questions,
-              status: 'pending'
-            }
-          ]
-        }))
+        patchSide(s, sideId, (side) => {
+          if (side.blocks.some((block) => block.kind === 'user_input' && block.requestId === req.requestId)) {
+            return side
+          }
+          return {
+            ...side,
+            blocks: [
+              ...side.blocks,
+              {
+                kind: 'user_input',
+                id: req.itemId,
+                createdAt: new Date().toISOString(),
+                requestId: req.requestId,
+                questions: req.questions,
+                status: 'pending'
+              }
+            ]
+          }
+        })
       )
     },
     onUserInputStatus: (ev) => {
@@ -230,7 +240,7 @@ function buildSideSink(sideId: string, ctx: SideContext): ThreadEventSink {
         patchSide(s, sideId, (side) => ({
           ...side,
           blocks: side.blocks.map((block) =>
-            block.kind === 'user_input' && block.requestId === ev.itemId
+            block.kind === 'user_input' && block.id === ev.itemId
               ? { ...block, status: ev.status }
               : block
           )

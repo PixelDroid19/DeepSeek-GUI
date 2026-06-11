@@ -468,19 +468,26 @@ export function syncTurnCompletionPoll(
   })
 }
 
+function isStaleThreadSubscription(get: () => ChatState, subscribedThreadId?: string): boolean {
+  return Boolean(subscribedThreadId && get().activeThreadId !== subscribedThreadId)
+}
+
 export function buildThreadEventSink(
   set: (partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void,
-  get: () => ChatState
+  get: () => ChatState,
+  subscribedThreadId?: string
 ): ThreadEventSink {
   return {
     onSeq: (seq) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       resetBusyRecoveryAttempts()
       set((s) => ({
         lastSeq: seq,
         error: clearRuntimeStreamRecoveringError(s.error)
       }))
     },
-    onUserMessage: (ev) =>
+    onUserMessage: (ev) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       set((s) => {
         resetBusyRecoveryAttempts()
         const flushed = flushLiveBlocks(s)
@@ -513,8 +520,10 @@ export function buildThreadEventSink(
           },
           error: clearRuntimeStreamRecoveringError(s.error)
         }
-      }),
-    onDeltas: (deltas) =>
+      })
+    },
+    onDeltas: (deltas) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       set((s) => {
         if (deltas.length === 0) return {}
         resetBusyRecoveryAttempts()
@@ -570,8 +579,10 @@ export function buildThreadEventSink(
             ? { turnReasoningLastAtByUserId: nextReasoningLastAtByUserId }
             : {})
         }
-      }),
+      })
+    },
     onTool: (ev) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       notifyWriteWorkspaceFileRefresh(get, ev)
       set((s) => {
         resetBusyRecoveryAttempts()
@@ -627,6 +638,7 @@ export function buildThreadEventSink(
       })
     },
     onCompaction: (ev) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       set((s) => {
         resetBusyRecoveryAttempts()
         const base: Partial<ChatState> = {}
@@ -678,6 +690,7 @@ export function buildThreadEventSink(
       })
     },
     onReview: (ev: ReviewEventPayload) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       set((s) => {
         resetBusyRecoveryAttempts()
         const base: Partial<ChatState> = {}
@@ -726,7 +739,8 @@ export function buildThreadEventSink(
         }
       })
     },
-    onApproval: (req) =>
+    onApproval: (req) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       set((s) => {
         resetBusyRecoveryAttempts()
         if (s.blocks.some((b) => b.kind === 'approval' && b.approvalId === req.approvalId)) {
@@ -751,8 +765,10 @@ export function buildThreadEventSink(
           ],
           error: clearRuntimeStreamRecoveringError(s.error)
         }
-      }),
+      })
+    },
     onUserInput: (req) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       resetBusyRecoveryAttempts()
       clearBusyWatchdog()
       set((s) => {
@@ -779,6 +795,7 @@ export function buildThreadEventSink(
       })
     },
     onUserInputStatus: (ev) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       resetBusyRecoveryAttempts()
       if (ev.status === 'submitted' && get().busy) {
         armBusyWatchdog(set, get)
@@ -800,6 +817,7 @@ export function buildThreadEventSink(
       }))
     },
     onRuntimeStatus: (ev) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       set((s) => {
         resetBusyRecoveryAttempts()
         const base: Partial<ChatState> = {}
@@ -889,6 +907,7 @@ export function buildThreadEventSink(
       })
     },
     onTurnComplete: () => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       resetBusyRecoveryAttempts()
       clearBusyWatchdog()
       const completedState = get()
@@ -939,6 +958,7 @@ export function buildThreadEventSink(
       void get().drainQueuedMessages()
     },
     onError: (err) => {
+      if (isStaleThreadSubscription(get, subscribedThreadId)) return
       resetBusyRecoveryAttempts()
       clearBusyWatchdog()
       const state = get()

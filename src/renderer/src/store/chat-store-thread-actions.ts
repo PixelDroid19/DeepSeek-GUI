@@ -227,7 +227,7 @@ export function createThreadActions(
 
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get)
+      const sink = buildThreadEventSink(set, get, activeThreadId)
       void p.subscribeThreadEvents(activeThreadId, latestSeq, sink, ac.signal)
       if (busy) {
         armBusyWatchdog(set, get)
@@ -313,7 +313,7 @@ export function createThreadActions(
       syncTurnCompletionPoll(set, get)
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get)
+      const sink = buildThreadEventSink(set, get, id)
       subscribeThreadEventsWithRecovery(p, id, latestSeq, sink, ac.signal, get)
       if (busy) armBusyWatchdog(set, get)
     } catch (e) {
@@ -649,7 +649,7 @@ export function createThreadActions(
       set({ currentTurnId: turnId })
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get)
+      const sink = buildThreadEventSink(set, get, activeThreadId)
       subscribeThreadEventsWithRecovery(p, activeThreadId, seqAtSend, sink, ac.signal, get)
       armBusyWatchdog(set, get)
       await get().refreshThreads()
@@ -678,10 +678,16 @@ export function createThreadActions(
         return false
       }
       set({
-        error: formatRuntimeError(e),
+        blocks: previousBlocks,
         busy: false,
-        currentTurnId: null,
+        currentTurnId: previousCurrentTurnId,
+        currentTurnUserId: previousCurrentTurnUserId,
+        turnStartedAtByUserId: previousTurnStartedAtByUserId,
+        turnDurationByUserId: previousTurnDurationByUserId,
+        turnReasoningFirstAtByUserId: previousTurnReasoningFirstAtByUserId,
+        turnReasoningLastAtByUserId: previousTurnReasoningLastAtByUserId,
         queuedMessages: previousQueuedMessages,
+        error: formatRuntimeError(e),
         ...(shouldOpenSettingsForError(e)
           ? { route: 'settings' as const, settingsSection: 'agents' as const }
           : {})
@@ -768,7 +774,7 @@ export function createThreadActions(
       set({ currentTurnId: turnId })
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get)
+      const sink = buildThreadEventSink(set, get, activeThreadId)
       subscribeThreadEventsWithRecovery(p, activeThreadId, seqAtSend, sink, ac.signal, get)
       armBusyWatchdog(set, get)
       await get().refreshThreads()

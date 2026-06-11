@@ -238,7 +238,9 @@ export function registerRuntimeSseIpc(options: {
         if (!state.stoppedByClient && !ac.signal.aborted) {
           wc.send('runtime:sse-end', { streamId: id })
         }
-        sseControllers.delete(id)
+        if (sseControllers.get(id) === state) {
+          sseControllers.delete(id)
+        }
       }
     })()
 
