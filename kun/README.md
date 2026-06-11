@@ -87,16 +87,57 @@ Kun can also run as a standalone agent without the GUI:
 
 ```bash
 kun run --data-dir ~/.deepseekgui/kun --workspace "$PWD" "summarize this repo"
+kun run --rigorous --data-dir ~/.deepseekgui/kun --workspace "$PWD" "make a careful change"
 kun chat --data-dir ~/.deepseekgui/kun --workspace "$PWD"
 kun exec --data-dir ~/.deepseekgui/kun --workspace "$PWD" --list-tools
 kun exec --data-dir ~/.deepseekgui/kun --workspace "$PWD" read --args '{"path":"README.md"}'
 ```
 
 - `kun run` creates a thread, runs one turn, streams assistant text, and exits.
+- `kun run --rigorous` runs an opt-in four-stage pipeline: planner, executor, verifier, reviewer.
 - `kun chat` starts a line-oriented REPL. Use `/exit`, `/quit`, or an empty line to stop.
 - `kun exec --list-tools` prints the effective dynamic tool registry for the chosen config/workspace.
-- `kun exec <tool> --args <json>` invokes one tool directly. Use `--json` on `run` or `exec` for machine-readable output.
+- `kun exec <tool> --args <json>` invokes one tool directly. Use `--json` on `run` or `exec` for machine-readable output; `run --json` includes final items and runtime events.
 - Headless approvals are conservative: unknown L2 commands and L4 commands are denied instead of blocking forever. Use `--allow-risky-actions` only when a non-interactive run is expected to perform L3 work such as network access or installs.
+
+## Rigorous Mode
+
+Rigorous mode is opt-in per turn. API callers use `mode: "rigorous"` on
+`StartTurnRequest`; CLI users pass `kun run --rigorous`. Normal turns do
+not touch this pipeline.
+
+The pipeline runs four child roles in sequence:
+
+- `planner` is read-only and produces risks, steps, and verification criteria.
+- `executor` implements the plan with workspace tools.
+- `verifier` receives the user request, planner criteria, changed file list,
+  and a captured `git diff`, but not the executor's narrative.
+- `reviewer` receives the diff, plan, and verification report and emits
+  `ship`, `fix`, or `replan`.
+
+The reviewer can trigger one bounded fix round. After one fix attempt the
+final verdict is surfaced to the parent turn as review items plus an assistant
+summary. Child role approvals are bridged to the parent approval flow; L4
+actions still require explicit approval and are never allow-listed.
+Each `pipeline_stage_finished` event includes the resolved model and, when
+available, the token usage for that specific role run.
+
+Cost expectation: a rigorous turn is roughly four model runs, and six when a
+fix round is used. Configure per-role routing under `roles`:
+
+```json
+{
+  "roles": {
+    "enabled": true,
+    "planner": { "model": "deepseek-v4-pro" },
+    "executor": { "model": "deepseek-v4-pro" },
+    "verifier": { "model": "deepseek-v4-pro", "reasoningEffort": "high" },
+    "reviewer": { "model": "deepseek-v4-pro", "reasoningEffort": "high" }
+  }
+}
+```
+
+Set `"roles": { "enabled": false }` to reject rigorous turn requests.
 
 ## Environment variables
 
@@ -176,6 +217,17 @@ Shape:
   },
   "actionLevels": {
     "enabled": true
+  },
+  "roles": {
+    "enabled": true,
+    "verifier": {
+      "model": "deepseek-v4-pro",
+      "reasoningEffort": "high"
+    },
+    "reviewer": {
+      "model": "deepseek-v4-pro",
+      "reasoningEffort": "high"
+    }
   },
   "models": {
     "profiles": {

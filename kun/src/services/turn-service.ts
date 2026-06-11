@@ -11,6 +11,8 @@ import { makeUserItem, makeErrorItem } from '../domain/item.js'
 import { appendTurnItem, createTurnRecord, finishTurn, replaceTurnItem, startTurn as startTurnRecord } from '../domain/turn.js'
 import { touchThread } from '../domain/thread.js'
 import type { RuntimeEventRecorder } from './runtime-event-recorder.js'
+import type { RolesConfig } from '../config/kun-config.js'
+import { PlannerArtifactSchema } from '../contracts/roles.js'
 
 export type TurnServiceDeps = {
   threadStore: ThreadStore
@@ -21,6 +23,7 @@ export type TurnServiceDeps = {
   compactor: ContextCompactor
   ids: IdGenerator
   nowIso: () => string
+  roles?: RolesConfig
 }
 
 /**
@@ -44,6 +47,14 @@ export class TurnService {
   }): Promise<StartTurnResponse> {
     const thread = await this.deps.threadStore.get(input.threadId)
     if (!thread) throw new Error(`thread not found: ${input.threadId}`)
+    if (input.request.mode === 'rigorous') {
+      if (thread.mode === 'plan') {
+        throw new Error('rigorous mode is only available on agent-mode threads')
+      }
+      if (this.deps.roles?.enabled === false) {
+        throw new Error('rigorous mode is disabled by roles.enabled=false')
+      }
+    }
     const turnId = this.deps.ids.next('turn')
     const turn = createTurnRecord({
       id: turnId,
@@ -53,6 +64,9 @@ export class TurnService {
       reasoningEffort: input.request.reasoningEffort,
       attachmentIds: input.request.attachmentIds ?? [],
       guiPlan: input.request.guiPlan,
+      planArtifact: input.request.planArtifact
+        ? PlannerArtifactSchema.parse(input.request.planArtifact)
+        : undefined,
       mode: input.request.mode
     })
     const userItem = makeUserItem({

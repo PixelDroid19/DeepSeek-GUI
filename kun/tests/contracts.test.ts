@@ -367,17 +367,24 @@ describe('cli', () => {
             }
           }
         },
-        runtime: {
-          toolStorm: {
-            enabled: true,
-            windowSize: 5,
-            threshold: 4
+	        runtime: {
+	          toolStorm: {
+	            enabled: true,
+	            windowSize: 5,
+	            threshold: 4
           },
-          toolArgumentRepair: {
-            maxStringBytes: 4096
-          }
-        },
-        capabilities: {
+	          toolArgumentRepair: {
+	            maxStringBytes: 4096
+	          }
+	        },
+	        roles: {
+	          enabled: true,
+	          verifier: {
+	            model: 'deepseek-v4-pro',
+	            reasoningEffort: 'high'
+	          }
+	        },
+	        capabilities: {
           web: {
             enabled: true,
             fetchEnabled: true,
@@ -432,11 +439,34 @@ describe('cli', () => {
       expect(parsed.models?.profiles?.['custom-1m']?.contextCompaction?.softRatio).toBe(0.7)
       expect(parsed.models?.profiles?.['custom-1m']?.inputModalities).toEqual(['text', 'image'])
       expect(parsed.runtime?.toolStorm?.windowSize).toBe(5)
-      expect(parsed.runtime?.toolStorm?.threshold).toBe(4)
-      expect(parsed.runtime?.toolArgumentRepair?.maxStringBytes).toBe(4096)
-      expect(parsed.capabilities.web.enabled).toBe(true)
+	      expect(parsed.runtime?.toolStorm?.threshold).toBe(4)
+	      expect(parsed.runtime?.toolArgumentRepair?.maxStringBytes).toBe(4096)
+	      expect(parsed.roles?.verifier?.reasoningEffort).toBe('high')
+	      expect(parsed.capabilities.web.enabled).toBe(true)
       expect(parsed.capabilities.web.fetchEnabled).toBe(true)
       expect(parsed.capabilities.skills.roots).toEqual(['/tmp/skills'])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+	  })
+
+  it('rejects invalid role reasoning effort in config', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kun-config-'))
+    try {
+      const configPath = join(dir, 'kun.config.json')
+      await writeFile(configPath, JSON.stringify({
+        serve: {
+          dataDir: join(dir, 'data')
+        },
+        roles: {
+          verifier: {
+            reasoningEffort: 'ultra'
+          }
+        }
+      }), 'utf8')
+
+      expect(() => parseServeOptions(['--config', configPath]))
+        .toThrow(/reasoningEffort/)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

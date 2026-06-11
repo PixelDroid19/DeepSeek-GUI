@@ -100,11 +100,31 @@ describe('action risk levels', () => {
 
   it('classifies through env-assignment prefixes and separated rm flags', () => {
     expect(classifyAction({ callId: 'c1', toolName: 'bash', arguments: { command: 'FOO=1 sudo whoami' } }).level).toBe(4)
+    expect(classifyAction({ callId: 'c1', toolName: 'bash', arguments: { command: 'FOO="bar baz" sudo whoami' } }).level).toBe(4)
     expect(classifyAction({ callId: 'c1', toolName: 'bash', arguments: { command: 'NODE_ENV=test ls' } }).level).toBe(0)
     expect(classifyAction({ callId: 'c1', toolName: 'bash', arguments: { command: 'rm -r -f build' } }).level).toBe(4)
     expect(classifyAction({ callId: 'c1', toolName: 'bash', arguments: { command: 'rm --recursive --force build' } }).level).toBe(4)
     // Non-recursive force removal stays below L4.
     expect(classifyAction({ callId: 'c1', toolName: 'bash', arguments: { command: 'rm --force file.txt' } }).level).toBeLessThan(4)
+  })
+
+  it('does not treat mixed compound commands as known-safe by prefix', () => {
+    expect(classifyAction({ callId: 'c1', toolName: 'bash', arguments: { command: 'npm run test && node scripts/custom.js' } })).toMatchObject({
+      level: 2,
+      knownSafe: false
+    })
+    expect(classifyAction({ callId: 'c1', toolName: 'bash', arguments: { command: 'npm test & sudo whoami' } })).toMatchObject({
+      level: 4,
+      knownSafe: false
+    })
+    expect(classifyAction({ callId: 'c1', toolName: 'bash', arguments: { command: 'npm test\nsudo whoami' } })).toMatchObject({
+      level: 4,
+      knownSafe: false
+    })
+    expect(classifyAction({ callId: 'c1', toolName: 'bash', arguments: { command: 'npm run test && npm run lint' } })).toMatchObject({
+      level: 2,
+      knownSafe: true
+    })
   })
 
   it('can disable level-based gating', async () => {

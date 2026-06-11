@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { ReviewOutputSchema, ReviewTargetSchema } from './review.js'
 import { RuntimeErrorSeverity } from './errors.js'
+import { RoleIdSchema } from './roles.js'
 
 /**
  * Conversation items returned as part of a thread or turn.
@@ -118,6 +119,7 @@ export const ReviewTurnItem = TurnItemBase.extend({
   kind: z.literal('review'),
   target: ReviewTargetSchema,
   title: z.string().min(1),
+  roleName: RoleIdSchema.optional(),
   reviewText: z.string().optional(),
   output: ReviewOutputSchema.optional()
 })

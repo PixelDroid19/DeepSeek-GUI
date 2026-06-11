@@ -43,15 +43,15 @@ export function classifyAction(
   if (call.toolName === 'bash') {
     const command = commandFromArgs(call.arguments)
     const normalizedCommand = command ? normalizeCommand(command) : ''
-    if (!normalizedCommand) {
+    if (!command || !normalizedCommand) {
       return { level: 2, reason: 'bash command missing or empty', normalizedCommand }
     }
-    const segments = splitCommandSegments(normalizedCommand)
+    const segments = splitCommandSegments(command)
     const classified = segments.map(classifyCommandSegment)
     const max = classified.reduce((best, current) =>
       current.level > best.level ? current : best
     , classified[0] ?? { level: 2 as ActionLevel, reason: 'unknown bash command' })
-    const knownSafe = max.level === 2 && isKnownSafeCommand(normalizedCommand)
+    const knownSafe = max.level === 2 && isKnownSafeCommand(command)
     return {
       level: max.level,
       reason: knownSafe
@@ -84,6 +84,12 @@ export function classifyAction(
 }
 
 export function isKnownSafeCommand(command: string): boolean {
+  const segments = splitCommandSegments(command)
+  if (segments.length > 1) return segments.every(isKnownSafeCommandSegment)
+  return isKnownSafeCommandSegment(command)
+}
+
+function isKnownSafeCommandSegment(command: string): boolean {
   const normalized = normalizeCommand(command)
   return SAFE_RUNNERS.some((safe) =>
     normalized === safe ||
@@ -92,10 +98,45 @@ export function isKnownSafeCommand(command: string): boolean {
 }
 
 export function splitCommandSegments(command: string): string[] {
-  return command
-    .split(/\s*(?:&&|\|\||[;|])\s*/g)
-    .map((segment) => segment.trim())
-    .filter(Boolean)
+  const segments: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+  let escaping = false
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index] ?? ''
+    const next = command[index + 1] ?? ''
+    if (escaping) {
+      current += char
+      escaping = false
+      continue
+    }
+    if (char === '\\' && quote !== "'") {
+      current += char
+      escaping = true
+      continue
+    }
+    if ((char === '"' || char === "'") && !quote) {
+      quote = char
+      current += char
+      continue
+    }
+    if (quote === char) {
+      quote = null
+      current += char
+      continue
+    }
+    if (!quote && (char === '\n' || char === ';' || char === '|' || char === '&')) {
+      const trimmed = current.trim()
+      if (trimmed) segments.push(trimmed)
+      current = ''
+      if ((char === '&' && next === '&') || (char === '|' && next === '|')) index += 1
+      continue
+    }
+    current += char
+  }
+  const trimmed = current.trim()
+  if (trimmed) segments.push(trimmed)
+  return segments
 }
 
 function classifyCommandSegment(segment: string): RuntimeActionClassification {
@@ -107,7 +148,7 @@ function classifyCommandSegment(segment: string): RuntimeActionClassification {
   }
   // Skip leading environment assignments (`FOO=bar cmd ...`) so they
   // cannot mask the real head command from classification.
-  const tokens = segment.split(/\s+/).filter(Boolean)
+  const tokens = tokenizeShellWords(segment)
   while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens.shift()
   const head = tokens[0] ?? ''
   if (!head) return { level: 2, reason: 'empty command segment' }
@@ -140,6 +181,43 @@ function classifyCommandSegment(segment: string): RuntimeActionClassification {
   if (L0_HEADS.has(head)) return { level: 0, reason: `${head} is read-only` }
   if (isKnownSafeCommand(segment)) return { level: 2, reason: 'known-safe local command', knownSafe: true }
   return { level: 2, reason: `unknown local command ${head}` }
+}
+
+function tokenizeShellWords(segment: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+  let escaping = false
+  for (let index = 0; index < segment.length; index += 1) {
+    const char = segment[index] ?? ''
+    if (escaping) {
+      current += char
+      escaping = false
+      continue
+    }
+    if (char === '\\' && quote !== "'") {
+      escaping = true
+      continue
+    }
+    if ((char === '"' || char === "'") && !quote) {
+      quote = char
+      continue
+    }
+    if (quote === char) {
+      quote = null
+      continue
+    }
+    if (!quote && /\s/.test(char)) {
+      if (current) {
+        tokens.push(current)
+        current = ''
+      }
+      continue
+    }
+    current += char
+  }
+  if (current) tokens.push(current)
+  return tokens
 }
 
 function classifyGit(tokens: string[]): RuntimeActionClassification {

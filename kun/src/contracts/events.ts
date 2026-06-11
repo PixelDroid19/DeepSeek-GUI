@@ -3,6 +3,7 @@ import { TurnItem } from './items.js'
 import { ThreadGoalSchema, ThreadTodoListSchema } from './threads.js'
 import { UsageSnapshotSchema } from './usage.js'
 import { RuntimeErrorSeverity } from './errors.js'
+import { RoleIdSchema } from './roles.js'
 
 /**
  * Persisted runtime events. Every event has a per-thread `seq` so the
@@ -38,6 +39,8 @@ export const RuntimeEventKind = z.enum([
   'todos_updated',
   'todos_cleared',
   'pipeline_stage',
+  'pipeline_stage_started',
+  'pipeline_stage_finished',
   'usage',
   'error',
   'heartbeat'
@@ -218,6 +221,24 @@ export const PipelineStageEvent = RuntimeEventBase.extend({
 })
 export type PipelineStageEvent = z.infer<typeof PipelineStageEvent>
 
+export const RolePipelineStageStartedEvent = RuntimeEventBase.extend({
+  kind: z.literal('pipeline_stage_started'),
+  role: RoleIdSchema,
+  status: z.literal('running'),
+  model: z.string().min(1).optional()
+})
+export type RolePipelineStageStartedEvent = z.infer<typeof RolePipelineStageStartedEvent>
+
+export const RolePipelineStageFinishedEvent = RuntimeEventBase.extend({
+  kind: z.literal('pipeline_stage_finished'),
+  role: RoleIdSchema,
+  status: z.enum(['completed', 'failed', 'aborted', 'degraded', 'skipped']),
+  model: z.string().min(1).optional(),
+  artifactSummary: z.string().optional(),
+  usage: UsageSnapshotSchema.optional()
+})
+export type RolePipelineStageFinishedEvent = z.infer<typeof RolePipelineStageFinishedEvent>
+
 export const ErrorEvent = RuntimeEventBase.extend({
   kind: z.literal('error'),
   message: z.string(),
@@ -246,6 +267,8 @@ export const RuntimeEvent = z.discriminatedUnion('kind', [
   GoalEvent,
   TodoEvent,
   PipelineStageEvent,
+  RolePipelineStageStartedEvent,
+  RolePipelineStageFinishedEvent,
   UsageEvent,
   ErrorEvent,
   HeartbeatEvent

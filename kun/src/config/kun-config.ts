@@ -19,6 +19,8 @@ import {
   MODEL_ENDPOINT_FORMATS,
   normalizeModelEndpointFormat
 } from '../contracts/model-endpoint-format.js'
+import { RoleIdSchema } from '../contracts/roles.js'
+import { TurnReasoningEffortSchema } from '../contracts/turns.js'
 
 export const KUN_CONFIG_FILENAME = 'config.json'
 export const DEFAULT_KUN_MODEL = 'deepseek-v4-pro'
@@ -201,6 +203,28 @@ export const DEFAULT_ACTION_LEVELS_CONFIG: ActionLevelsConfig = {
   enabled: true
 }
 
+export const RoleOverrideConfigSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    model: z.string().min(1).optional(),
+    reasoningEffort: TurnReasoningEffortSchema.optional()
+  })
+  .strict()
+
+export const RolesConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    planner: RoleOverrideConfigSchema.optional(),
+    executor: RoleOverrideConfigSchema.optional(),
+    verifier: RoleOverrideConfigSchema.optional(),
+    reviewer: RoleOverrideConfigSchema.optional()
+  })
+  .strict()
+
+export const DEFAULT_ROLES_CONFIG: RolesConfig = {
+  enabled: true
+}
+
 export const StorageConfigSchema = z
   .object({
     backend: z.enum(['hybrid', 'file']).default('hybrid'),
@@ -230,7 +254,8 @@ export const KunServeConfigSchema = z
     tokenEconomyMode: z.boolean().optional(),
     tokenEconomy: TokenEconomyConfigSchema.optional(),
     insecure: z.boolean().optional(),
-    storage: StorageConfigSchema.optional()
+    storage: StorageConfigSchema.optional(),
+    roles: RolesConfigSchema.optional()
   })
   .strict()
 
@@ -244,6 +269,7 @@ export const KunConfigSchema = z
     contextEngine: ContextEngineConfigSchema.optional(),
     memory: MemoryConfigSchema.optional(),
     actionLevels: ActionLevelsConfigSchema.optional(),
+    roles: RolesConfigSchema.optional(),
     capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG)
   })
   .strict()
@@ -259,6 +285,9 @@ export type TelemetryConfig = z.infer<typeof TelemetryConfigSchema>
 export type ContextEngineConfig = z.infer<typeof ContextEngineConfigSchema>
 export type MemoryConfig = z.infer<typeof MemoryConfigSchema>
 export type ActionLevelsConfig = z.infer<typeof ActionLevelsConfigSchema>
+export type RoleOverrideConfig = z.infer<typeof RoleOverrideConfigSchema>
+export type RolesConfig = z.infer<typeof RolesConfigSchema>
+export type RoleConfigKey = z.infer<typeof RoleIdSchema>
 
 export type LoadedKunConfig = {
   path: string

@@ -1,5 +1,6 @@
 import type { TurnItem } from '../contracts/items.js'
 import type { ReviewOutput, ReviewTarget } from '../contracts/review.js'
+import type { RoleId } from '../contracts/roles.js'
 
 export type ItemEntity = TurnItem
 
@@ -215,6 +216,7 @@ export function makeReviewItem(input: {
   threadId: string
   target: ReviewTarget
   title: string
+  roleName?: RoleId
   status?: 'running' | 'completed' | 'failed' | 'aborted'
   reviewText?: string
   output?: ReviewOutput
@@ -236,6 +238,7 @@ export function makeReviewItem(input: {
     kind: 'review',
     target: input.target,
     title: input.title,
+    ...(input.roleName ? { roleName: input.roleName } : {}),
     ...(input.reviewText ? { reviewText: input.reviewText } : {}),
     ...(input.output ? { output: input.output } : {})
   }

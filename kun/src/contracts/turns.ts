@@ -2,14 +2,16 @@ import { z } from 'zod'
 import { TurnItem } from './items.js'
 import { isGuiPlanRelativePath } from '../shared/gui-plan.js'
 import { ApprovalPolicySchema } from './policy.js'
+import { PlannerArtifactSchema } from './roles.js'
 
 /**
  * Mode enum, inlined here (instead of importing `ThreadMode` from
  * `threads.js`) to avoid a `threads <-> turns` module init cycle:
- * `threads.ts` already imports `TurnSchema` from this file. The two
- * literals must stay in sync with `ThreadMode` in `threads.ts`.
+ * `threads.ts` already imports `TurnSchema` from this file. `agent`
+ * and `plan` must stay in sync with `ThreadMode`; `rigorous` is a
+ * per-turn override that still runs on agent-mode threads.
  */
-const TurnModeSchema = z.enum(['agent', 'plan'])
+const TurnModeSchema = z.enum(['agent', 'plan', 'rigorous'])
 export const TurnReasoningEffortSchema = z.enum(['auto', 'off', 'low', 'medium', 'high', 'max'])
 export type TurnReasoningEffort = z.infer<typeof TurnReasoningEffortSchema>
 
@@ -71,10 +73,12 @@ export const TurnSchema = z.object({
   toolCatalogToolCount: z.number().int().nonnegative().optional(),
   toolCatalogDrift: z.boolean().optional(),
   guiPlan: GuiPlanContextSchema.optional(),
+  planArtifact: PlannerArtifactSchema.optional(),
   /**
    * Optional per-turn mode override. When set, it takes precedence over
    * the thread mode for this turn (e.g. a Plan-mode turn inside an
-   * otherwise agent thread, or a Build turn that runs as agent).
+   * otherwise agent thread, a Build turn that runs as agent, or a
+   * rigorous turn that dispatches through the role pipeline.
    */
   mode: TurnModeSchema.optional(),
   error: z.string().optional()
@@ -90,7 +94,8 @@ export const StartTurnRequest = z.object({
   /**
    * Optional per-turn mode. Overrides the thread mode for this turn so
    * the GUI can toggle Plan/agent without recreating the thread. In Plan
-   * mode Kun advertises `create_plan` for the whole conversation.
+   * mode Kun advertises `create_plan`; in rigorous mode Kun dispatches
+   * through the role pipeline instead of the normal loop.
    */
   mode: TurnModeSchema.optional(),
   attachments: z
@@ -107,7 +112,8 @@ export const StartTurnRequest = z.object({
    * `create_plan` tool for the turn and writes only to the reserved
    * path advertised in the context.
    */
-  guiPlan: GuiPlanContextSchema.optional()
+  guiPlan: GuiPlanContextSchema.optional(),
+  planArtifact: PlannerArtifactSchema.optional()
 })
 export type StartTurnRequest = z.input<typeof StartTurnRequest>
 

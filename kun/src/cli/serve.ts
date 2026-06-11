@@ -139,6 +139,7 @@ export function parseServeOptions(
     contextEngine: loadedConfig?.config.contextEngine,
     memory: loadedConfig?.config.memory,
     actionLevels: loadedConfig?.config.actionLevels,
+    roles: loadedConfig?.config.roles ?? configServe.roles ?? DEFAULT_SERVE_OPTIONS.roles,
     runtime: loadedConfig?.config.runtime,
     capabilities: loadedConfig?.config.capabilities ?? DEFAULT_SERVE_OPTIONS.capabilities
   }

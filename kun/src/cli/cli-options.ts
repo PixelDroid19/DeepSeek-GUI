@@ -10,10 +10,12 @@ import {
   ContextCompactionConfigSchema,
   ContextEngineConfigSchema,
   MemoryConfigSchema,
+  DEFAULT_ROLES_CONFIG,
   TelemetryConfigSchema,
   DEFAULT_KUN_MODEL,
   DEFAULT_STORAGE_CONFIG,
   ModelConfigSchema,
+  RolesConfigSchema,
   RuntimeTuningConfigSchema,
   StorageConfigSchema,
   TokenEconomyConfigSchema
@@ -61,6 +63,7 @@ export const ServeOptionsSchema = z.object({
   contextEngine: ContextEngineConfigSchema.optional(),
   memory: MemoryConfigSchema.optional(),
   actionLevels: ActionLevelsConfigSchema.optional(),
+  roles: RolesConfigSchema.optional(),
   runtime: RuntimeTuningConfigSchema.optional(),
   capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG)
 })
@@ -80,5 +83,6 @@ export const DEFAULT_SERVE_OPTIONS: ServeOptions = {
   tokenEconomyMode: false,
   insecure: false,
   storage: DEFAULT_STORAGE_CONFIG,
+  roles: DEFAULT_ROLES_CONFIG,
   capabilities: DEFAULT_KUN_CAPABILITIES_CONFIG
 }

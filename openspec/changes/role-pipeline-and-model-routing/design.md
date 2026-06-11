@@ -59,7 +59,7 @@ The verifier prompt contains: the user request, the planner's plan (risks + crit
 On `fix`: executor re-runs once with the verifier findings appended, then verifier re-runs, then reviewer issues the final verdict regardless. On `replan` or a second non-ship verdict: stop and surface everything to the user as the turn result. Rationale: unbounded agent loops burn tokens hiding problems; the user is the correct escalation point after one honest attempt.
 
 ### D8 — Pipeline progress via existing event channel
-Reuse the `RuntimeEventRecorder` with new additive event kinds `pipeline_stage_started` / `pipeline_stage_finished { role, status, artifactSummary }`, plus persisting the verifier report and reviewer verdict as turn items on the PARENT thread (new item kinds `verification` and `verdict`, or reuse of the existing `review` item kind — decision: reuse `review` item with a `role` field to avoid GUI breakage). Child transcripts stay in their in-memory stores; only artifacts and usage roll up.
+Reuse the `RuntimeEventRecorder` with new additive event kinds `pipeline_stage_started` / `pipeline_stage_finished { role, status, model, artifactSummary, usage? }`, plus persisting the verifier report and reviewer verdict as turn items on the PARENT thread (new item kinds `verification` and `verdict`, or reuse of the existing `review` item kind — decision: reuse `review` item with `roleName` metadata because `role` is already the base item sender field). Child transcripts stay in their in-memory stores; only artifacts and usage roll up.
 
 ## Risks / Trade-offs
 
@@ -83,4 +83,4 @@ Rollback: requests without `mode: 'rigorous'` never touch the pipeline; `roles.e
 
 - Should the planner stage be skippable when the GUI already ran a plan turn (reuse the existing `guiPlan` artifact as the plan input)? Leaning yes — accept an optional `planArtifact` input; resolve during implementation.
 - Whether verifier `commandsRun` should be cross-checked against telemetry records (it self-reports; telemetry has ground truth). Cheap integrity check — include if low-effort.
-- Usage attribution: per-stage usage rolls into the parent thread snapshot — confirm `UsageService` supports labeled merges or add stage labels to the rollup.
+- Usage attribution: per-stage usage is attached to `pipeline_stage_finished`, and the same usage is also rolled into the parent thread snapshot.

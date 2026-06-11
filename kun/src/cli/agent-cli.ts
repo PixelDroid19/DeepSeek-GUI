@@ -42,6 +42,7 @@ Common options:
   --workspace <path>         Workspace root for run/chat/exec
   --model <model>            Model id
   --approval-policy <p>      on-request | untrusted | never | auto | suggest
+  --rigorous                 Run one-shot through planner/executor/verifier/reviewer
   --allow-risky-actions      Headless: auto-allow L3 actions; L4 remains denied
   --json                     Emit machine-readable JSON where supported
 
@@ -134,7 +135,7 @@ async function runOneShot(argv: readonly string[], io: CliIo): Promise<number> {
     })
     const turn = await runtime.turnService.startTurn({
       threadId: thread.id,
-      request: { prompt, model: parsed.options.model, mode: 'agent' }
+      request: { prompt, model: parsed.options.model, mode: hasFlag(argv, 'rigorous') ? 'rigorous' : 'agent' }
     })
     let streamed = false
     const unsubscribe = parsed.json ? undefined : runtime.eventBus.subscribe(thread.id, (event) => {
@@ -148,7 +149,8 @@ async function runOneShot(argv: readonly string[], io: CliIo): Promise<number> {
     stopApprovals()
     const items = await runtime.sessionStore.loadItems(thread.id)
     if (parsed.json) {
-      io.stdout.write(JSON.stringify({ threadId: thread.id, turnId: turn.turnId, status, items }) + '\n')
+      const events = await runtime.sessionStore.loadEventsSince(thread.id, 0)
+      io.stdout.write(JSON.stringify({ threadId: thread.id, turnId: turn.turnId, status, items, events }) + '\n')
     } else {
       if (!streamed) {
         const text = assistantText(items)
@@ -360,7 +362,7 @@ function buildExecContext(
     approvalPolicy: options.approvalPolicy,
     abortSignal: new AbortController().signal,
     awaitApproval: async (approval) =>
-      headless.allowRiskyActions && approval.actionLevel === 3
+      headless.allowRiskyActions && approval.actionLevel !== undefined && approval.actionLevel <= 3
         ? 'allow'
         : 'deny'
   }
@@ -373,12 +375,15 @@ function installHeadlessApprovalResponder(input: {
 }): () => void {
   return input.runtime.eventBus.subscribe(input.threadId, (event) => {
     if (event.kind !== 'approval_requested') return
-    const decision = input.allowRiskyActions && event.actionLevel === 3 ? 'allow' : 'deny'
+    const decision =
+      input.allowRiskyActions && event.actionLevel !== undefined && event.actionLevel <= 3
+        ? 'allow'
+        : 'deny'
     input.runtime.approvalGate.decide(
       event.approvalId,
       decision,
       decision === 'allow'
-        ? 'headless --allow-risky-actions approved L3 action'
+        ? `headless --allow-risky-actions approved L${event.actionLevel} action`
         : 'headless mode denied approval request'
     )
   })

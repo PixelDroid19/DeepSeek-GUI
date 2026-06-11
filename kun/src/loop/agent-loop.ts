@@ -152,6 +152,16 @@ function latestUserMessageText(items: readonly TurnItem[], turnId: string): stri
   return ''
 }
 
+function intersectAllowedToolNames(
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined
+): readonly string[] | undefined {
+  if (!left) return right
+  if (!right) return left
+  const rightSet = new Set(right)
+  return left.filter((toolName) => rightSet.has(toolName))
+}
+
 export type AgentLoopOptions = {
   threadStore: ThreadStore
   sessionStore: SessionStore
@@ -180,6 +190,8 @@ export type AgentLoopOptions = {
   toolArgumentRepair?: {
     maxStringBytes?: number
   }
+  /** Optional hard allow-list applied before tools are advertised or executed. */
+  allowedToolNames?: readonly string[]
   /**
    * Optional fallback GUI plan context for embedders that run the loop
    * without persisted turn metadata. Normal serve mode reads GUI plan
@@ -546,7 +558,8 @@ export class AgentLoop {
     const approvalPolicy = normalizeApprovalPolicy(thread?.approvalPolicy)
     // Per-turn mode overrides the thread mode so the GUI can toggle
     // Plan/agent (and run Build as agent) without recreating the thread.
-    const effectiveMode = turn?.mode ?? thread?.mode
+    const requestedMode = turn?.mode ?? thread?.mode
+    const effectiveMode = requestedMode === 'plan' ? 'plan' : requestedMode === 'agent' ? 'agent' : thread?.mode
     const modelRoute = await this.resolveTurnModel({
       threadId,
       turnId,
@@ -589,7 +602,7 @@ export class AgentLoop {
       : goalContinuationInstruction(thread?.goal)
     const activeTodoInstruction = todoContinuationInstruction(thread?.todos)
     const allowedToolNames = allowedToolNamesWithGuiStateTools(
-      skillResolution.allowedToolNames,
+      intersectAllowedToolNames(skillResolution.allowedToolNames, this.opts.allowedToolNames),
       activeGoalInstruction !== null
     )
     const toolContext: ToolHostContext = {

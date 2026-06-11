@@ -65,7 +65,7 @@ Approvals raised inside role child runs SHALL surface through the parent approva
 - **THEN** the child run terminates without hanging
 
 ### Requirement: Pipeline progress and artifacts are observable
-The pipeline SHALL emit `pipeline_stage_started` and `pipeline_stage_finished` runtime events per stage (role, status), persist the verifier report and reviewer verdict as turn items on the parent thread, and roll up per-stage token usage into the parent thread's usage.
+The pipeline SHALL emit `pipeline_stage_started` and `pipeline_stage_finished` runtime events per stage (role, status), attach per-stage token usage to finished-stage events when provider usage is available, persist the verifier report and reviewer verdict as turn items on the parent thread, and roll up per-stage token usage into the parent thread's usage.
 
 #### Scenario: Events and items persisted
 - **WHEN** a rigorous turn completes

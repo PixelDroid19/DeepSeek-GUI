@@ -2,6 +2,10 @@ import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { z } from 'zod'
 import type { SubagentsCapabilityConfig } from '../contracts/capabilities.js'
+import type { SandboxMode } from '../contracts/policy.js'
+import type { TurnReasoningEffort } from '../contracts/turns.js'
+import type { ApprovalRequest, ApprovalResolution } from '../domain/approval.js'
+import type { StageArtifact, StageArtifactKind } from '../contracts/roles.js'
 import type { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
 import type { UsageSnapshot } from '../contracts/usage.js'
 
@@ -48,8 +52,20 @@ export type ChildRunExecutor = (input: {
   prompt: string
   workspace?: string
   model?: string
+  reasoningEffort?: TurnReasoningEffort
+  allowedToolNames?: readonly string[]
+  sandboxMode?: SandboxMode
+  systemPromptAddendum?: string
+  artifactKind?: StageArtifactKind
+  approvalBridge?: (approval: ApprovalRequest) => Promise<ApprovalResolution>
   signal: AbortSignal
-}) => Promise<{ summary: string; usage?: ChildRunRecord['usage'] }>
+}) => Promise<{
+  summary: string
+  rawText?: string
+  artifact?: StageArtifact
+  artifactParseError?: string
+  usage?: ChildRunRecord['usage']
+}>
 
 export type ChildRunAggregate = {
   key: string
@@ -113,6 +129,12 @@ export class DelegationRuntime {
     prompt: string
     workspace?: string
     model?: string
+    reasoningEffort?: TurnReasoningEffort
+    allowedToolNames?: readonly string[]
+    sandboxMode?: SandboxMode
+    systemPromptAddendum?: string
+    artifactKind?: StageArtifactKind
+    approvalBridge?: (approval: ApprovalRequest) => Promise<ApprovalResolution>
     signal: AbortSignal
   }): Promise<ChildRunRecord> {
     if (!this.options.config.enabled) throw new Error('delegation is disabled by config')
@@ -146,6 +168,12 @@ export class DelegationRuntime {
         prompt: input.prompt,
         workspace: input.workspace,
         model: input.model,
+        reasoningEffort: input.reasoningEffort,
+        allowedToolNames: input.allowedToolNames,
+        sandboxMode: input.sandboxMode,
+        systemPromptAddendum: input.systemPromptAddendum,
+        artifactKind: input.artifactKind,
+        approvalBridge: input.approvalBridge,
         signal: input.signal
       })
       record = ChildRunRecord.parse({

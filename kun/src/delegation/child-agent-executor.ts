@@ -7,7 +7,10 @@ import type { ImmutablePrefix } from '../cache/immutable-prefix.js'
 import type { ModelCapabilityMetadata } from '../contracts/capabilities.js'
 import type { TurnItem } from '../contracts/items.js'
 import type { ApprovalPolicy, SandboxMode } from '../contracts/policy.js'
+import { parseStageArtifact } from '../contracts/roles.js'
 import type { RuntimeTuningConfig } from '../config/kun-config.js'
+import { createImmutablePrefix } from '../cache/immutable-prefix.js'
+import type { ApprovalRequest, ApprovalResolution } from '../domain/approval.js'
 import { AgentLoop } from '../loop/agent-loop.js'
 import type { ContextCompactionConfig, ModelConfig } from '../loop/model-context-profile.js'
 import { ContextCompactor } from '../loop/context-compactor.js'
@@ -16,6 +19,7 @@ import { SteeringQueue } from '../loop/steering-queue.js'
 import type { TokenEconomyConfig } from '../loop/token-economy.js'
 import type { MemoryStore } from '../memory/memory-store.js'
 import type { ModelClient } from '../ports/model-client.js'
+import type { ApprovalGate } from '../ports/approval-gate.js'
 import { RandomIdGenerator } from '../ports/id-generator.js'
 import type { ToolHost } from '../ports/tool-host.js'
 import type { SkillRuntime } from '../skills/skill-runtime.js'
@@ -79,10 +83,20 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
       ids,
       nowIso
     })
+    const childPrefix = input.systemPromptAddendum?.trim()
+      ? createImmutablePrefix({
+          systemPrompt: `${options.prefix.systemPrompt}\n\n${input.systemPromptAddendum.trim()}`,
+          tools: options.prefix.tools,
+          pinnedConstraints: options.prefix.pinnedConstraints,
+          fewShots: options.prefix.fewShots
+        })
+      : options.prefix
     const loop = new AgentLoop({
       threadStore,
       sessionStore,
-      approvalGate: new InMemoryApprovalGate(),
+      approvalGate: input.approvalBridge
+        ? new BridgedApprovalGate(input.approvalBridge, input.signal)
+        : new AutoAllowApprovalGate(),
       userInputGate: new InMemoryUserInputGate(),
       model: options.model,
       toolHost: options.toolHost,
@@ -92,7 +106,7 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
       inflight,
       steering,
       compactor,
-      prefix: options.prefix,
+      prefix: childPrefix,
       ids,
       nowIso,
       ...(options.modelCapabilities ? { modelCapabilities: options.modelCapabilities } : {}),
@@ -101,7 +115,8 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
       ...(options.contextCompaction ? { contextCompaction: options.contextCompaction } : {}),
       ...(options.tokenEconomy ? { tokenEconomy: options.tokenEconomy } : {}),
       ...(options.runtime?.toolStorm ? { toolStorm: options.runtime.toolStorm } : {}),
-      ...(options.runtime?.toolArgumentRepair ? { toolArgumentRepair: options.runtime.toolArgumentRepair } : {})
+      ...(options.runtime?.toolArgumentRepair ? { toolArgumentRepair: options.runtime.toolArgumentRepair } : {}),
+      ...(input.allowedToolNames ? { allowedToolNames: input.allowedToolNames } : {})
     })
 
     const model = input.model?.trim() || options.defaultModel
@@ -111,7 +126,7 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
       model,
       mode: 'agent',
       approvalPolicy: options.approvalPolicy ?? 'auto',
-      ...(options.sandboxMode ? { sandboxMode: options.sandboxMode } : {})
+      ...(input.sandboxMode ?? options.sandboxMode ? { sandboxMode: input.sandboxMode ?? options.sandboxMode } : {})
     }, {
       id: input.childId,
       title: childThreadTitle(input.childId, input.label)
@@ -121,24 +136,77 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
       request: {
         prompt: input.prompt,
         model,
+        reasoningEffort: input.reasoningEffort,
         mode: 'agent'
       }
     })
-    const status = await loop.runTurn(thread.id, started.turnId)
-    const runtimeError = (await sessionStore.loadEventsSince(thread.id, 0))
-      .find((event) => event.kind === 'error' && event.turnId === started.turnId)
-    if (runtimeError?.kind === 'error') {
-      throw new Error(runtimeError.message)
+    const abortChild = (): void => {
+      void turns.interruptTurn({
+        threadId: thread.id,
+        turnId: started.turnId
+      }).catch(() => undefined)
     }
-    const items = await sessionStore.loadItems(thread.id)
-    const summary = summarizeChildTurn(items, started.turnId, status)
-    if (status !== 'completed') {
-      throw new Error(summary || `child agent ${status}`)
+    if (input.signal.aborted) abortChild()
+    else input.signal.addEventListener('abort', abortChild, { once: true })
+    try {
+      const status = await loop.runTurn(thread.id, started.turnId)
+      const runtimeError = (await sessionStore.loadEventsSince(thread.id, 0))
+        .find((event) => event.kind === 'error' && event.turnId === started.turnId)
+      if (runtimeError?.kind === 'error') {
+        throw new Error(runtimeError.message)
+      }
+      const items = await sessionStore.loadItems(thread.id)
+      const summary = summarizeChildTurn(items, started.turnId, status)
+      if (status !== 'completed') {
+        throw new Error(summary || `child agent ${status}`)
+      }
+      const parsed = input.artifactKind ? parseStageArtifact(input.artifactKind, summary) : undefined
+      return {
+        summary,
+        rawText: summary,
+        ...(parsed?.ok ? { artifact: parsed.artifact } : {}),
+        ...(parsed && !parsed.ok ? { artifactParseError: parsed.error } : {}),
+        usage: usage.forThread(thread.id)
+      }
+    } finally {
+      input.signal.removeEventListener('abort', abortChild)
     }
-    return {
-      summary,
-      usage: usage.forThread(thread.id)
-    }
+  }
+}
+
+class AutoAllowApprovalGate extends InMemoryApprovalGate {
+  override request(): Promise<'allow'> {
+    return Promise.resolve('allow')
+  }
+}
+
+class BridgedApprovalGate implements ApprovalGate {
+  constructor(
+    private readonly bridge: (approval: ApprovalRequest) => Promise<ApprovalResolution>,
+    private readonly signal: AbortSignal
+  ) {}
+
+  request(approval: ApprovalRequest): Promise<ApprovalResolution> {
+    if (this.signal.aborted) return Promise.resolve('deny')
+    return new Promise((resolve, reject) => {
+      const onAbort = (): void => resolve('deny')
+      this.signal.addEventListener('abort', onAbort, { once: true })
+      this.bridge(approval)
+        .then(resolve, reject)
+        .finally(() => this.signal.removeEventListener('abort', onAbort))
+    })
+  }
+
+  decide(): boolean {
+    return false
+  }
+
+  pending(): [] {
+    return []
+  }
+
+  get(): undefined {
+    return undefined
   }
 }
 

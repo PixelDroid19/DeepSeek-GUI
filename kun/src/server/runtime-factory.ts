@@ -32,10 +32,12 @@ import {
   DEFAULT_ACTION_LEVELS_CONFIG,
   DEFAULT_CONTEXT_ENGINE_CONFIG,
   DEFAULT_MEMORY_CONFIG,
+  DEFAULT_ROLES_CONFIG,
   DEFAULT_TELEMETRY_CONFIG,
   type ActionLevelsConfig,
   type ContextEngineConfig,
   type MemoryConfig,
+  type RolesConfig,
   type TelemetryConfig
 } from '../config/kun-config.js'
 import { ContextEngineRuntime } from '../context-engine/context-engine-runtime.js'
@@ -73,6 +75,7 @@ import { SkillRuntime } from '../skills/skill-runtime.js'
 import { FileMemoryStore } from '../memory/memory-store.js'
 import { DelegationRuntime, FileDelegationStore } from '../delegation/delegation-runtime.js'
 import { createChildAgentExecutor } from '../delegation/child-agent-executor.js'
+import { RigorousPipeline } from '../orchestration/rigorous-pipeline.js'
 
 export type KunServeRuntimeOptions = {
   host: string
@@ -95,6 +98,7 @@ export type KunServeRuntimeOptions = {
   contextEngine?: ContextEngineConfig
   memory?: MemoryConfig
   actionLevels?: ActionLevelsConfig
+  roles?: RolesConfig
   runtime?: RuntimeTuningConfig
   storage?: StorageConfig
   capabilities?: KunCapabilitiesConfig
@@ -137,6 +141,7 @@ export async function createKunServeRuntime(
   const nowIso = () => new Date().toISOString()
   const allocateSeq = (threadId: string) => eventBus.allocateSeq(threadId)
   const events = new RuntimeEventRecorder({ eventBus, sessionStore, allocateSeq, nowIso })
+  const rolesConfig = { ...DEFAULT_ROLES_CONFIG, ...(options.roles ?? {}) }
   const prefix = createImmutablePrefix({
     systemPrompt: KUN_SYSTEM_PROMPT,
     pinnedConstraints: [
@@ -153,7 +158,8 @@ export async function createKunServeRuntime(
     steering,
     compactor,
     ids,
-    nowIso
+    nowIso,
+    roles: rolesConfig
   })
   const threadService = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
   await seedUsageCarryover({ threadStore, sessionStore, usageService })
@@ -222,28 +228,29 @@ export async function createKunServeRuntime(
     actionLevels: actionLevelsConfig,
     workspaceAllowlist
   })
+  const childAgentExecutor = createChildAgentExecutor({
+    model: modelClient,
+    toolHost: childToolHost,
+    prefix,
+    defaultModel: options.model,
+    models: options.models,
+    contextCompaction: options.contextCompaction,
+    approvalPolicy: options.approvalPolicy,
+    sandboxMode: options.sandboxMode,
+    modelCapabilities: (model) => modelCapabilitiesForModel(model, modelProfiles),
+    skillRuntime,
+    tokenEconomy,
+    ...(options.runtime ? { runtime: options.runtime } : {}),
+    ...(memoryStore ? { memoryStore } : {}),
+    nowIso
+  })
   const delegationRuntime = options.capabilities?.subagents.enabled
     ? new DelegationRuntime({
         config: options.capabilities.subagents,
         store: new FileDelegationStore(join(options.dataDir, 'child-runs')),
         events,
         nowIso,
-        executor: createChildAgentExecutor({
-          model: modelClient,
-          toolHost: childToolHost,
-          prefix,
-          defaultModel: options.model,
-          models: options.models,
-          contextCompaction: options.contextCompaction,
-          approvalPolicy: options.approvalPolicy,
-          sandboxMode: options.sandboxMode,
-          modelCapabilities: (model) => modelCapabilitiesForModel(model, modelProfiles),
-          skillRuntime,
-          tokenEconomy,
-          ...(options.runtime ? { runtime: options.runtime } : {}),
-          ...(memoryStore ? { memoryStore } : {}),
-          nowIso
-        }),
+        executor: childAgentExecutor,
         recordExternalUsage: (threadId, usage) => {
           usageService.record(threadId, usage)
         }
@@ -356,6 +363,17 @@ export async function createKunServeRuntime(
       })
     }
   })
+  const rigorousPipeline = new RigorousPipeline({
+    threadStore,
+    turns: turnService,
+    events,
+    approvalGate,
+    usage: usageService,
+    childExecutor: childAgentExecutor,
+    roles: rolesConfig,
+    defaultModel: options.model,
+    nowIso
+  })
   const startedAt = options.startedAt ?? nowIso()
   return {
     threadService,
@@ -371,7 +389,12 @@ export async function createKunServeRuntime(
     toolHost,
     ...(attachmentStore ? { attachmentStore } : {}),
     ...(memoryStore ? { memoryStore } : {}),
-    runTurn(threadId, turnId) {
+    async runTurn(threadId, turnId) {
+      const turn = await turnService.getTurn(threadId, turnId)
+      if (turn?.mode === 'rigorous') {
+        const status = await rigorousPipeline.run(threadId, turnId)
+        return status === 'fallback' ? loop.runTurn(threadId, turnId) : status
+      }
       return loop.runTurn(threadId, turnId)
     },
     runReview(input) {

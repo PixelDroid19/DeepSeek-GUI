@@ -11,6 +11,7 @@ import { ServeExitCode } from '../src/cli/serve.js'
 import type { ServeOptions } from '../src/cli/cli-options.js'
 import type { ServerRuntime } from '../src/server/routes/server-runtime.js'
 import type { TurnItem } from '../src/contracts/items.js'
+import type { RuntimeEvent } from '../src/contracts/events.js'
 import { CapabilityRegistry } from '../src/adapters/tool/capability-registry.js'
 import { LocalToolHost } from '../src/adapters/tool/local-tool-host.js'
 import { GOAL_TOOL_NAMES } from '../src/adapters/tool/goal-tools.js'
@@ -57,15 +58,18 @@ function assistantItem(text: string): TurnItem {
 
 function fakeRuntime(input: {
   items?: TurnItem[]
+  events?: RuntimeEvent[]
   status?: 'completed' | 'failed' | 'aborted'
   throwRun?: boolean
   toolHost?: ServerRuntime['toolHost']
   onShutdown?: () => void
   onOptions?: (options: ServeOptions) => void
+  onStartTurn?: (input: Parameters<ServerRuntime['turnService']['startTurn']>[0]) => void
 } = {}): CliIo['createRuntime'] {
   return async (options) => {
     input.onOptions?.(options)
     const items = input.items ?? [assistantItem('hello from fake model')]
+    const events = input.events ?? []
     const status = input.status ?? 'completed'
     return {
       threadService: {
@@ -85,17 +89,21 @@ function fakeRuntime(input: {
         })
       },
       turnService: {
-        startTurn: async () => ({
-          threadId: 'thr_1',
-          turnId: 'turn_1',
-          userMessageItemId: 'item_user'
-        })
+        startTurn: async (startInput: Parameters<ServerRuntime['turnService']['startTurn']>[0]) => {
+          input.onStartTurn?.(startInput)
+          return {
+            threadId: 'thr_1',
+            turnId: 'turn_1',
+            userMessageItemId: 'item_user'
+          }
+        }
       },
       eventBus: {
         subscribe: () => () => undefined
       },
       sessionStore: {
-        loadItems: async () => items
+        loadItems: async () => items,
+        loadEventsSince: async () => events
       },
       toolHost: input.toolHost,
       runTurn: async () => {
@@ -268,7 +276,17 @@ describe('Kun agent CLI commands', () => {
   })
 
   it('runs one prompt and emits machine-readable JSON', async () => {
-    const c = capture({ createRuntime: fakeRuntime() })
+    const c = capture({
+      createRuntime: fakeRuntime({
+        events: [{
+          kind: 'turn_started',
+          seq: 1,
+          timestamp: 'now',
+          threadId: 'thr_1',
+          turnId: 'turn_1'
+        }]
+      })
+    })
     const code = await runAgentCommand('run', [
       '--data-dir',
       dataDir,
@@ -278,9 +296,10 @@ describe('Kun agent CLI commands', () => {
     ], c.io)
 
     expect(code).toBe(ServeExitCode.ok)
-    const parsed = JSON.parse(c.stdout) as { status: string; items: TurnItem[] }
+    const parsed = JSON.parse(c.stdout) as { status: string; items: TurnItem[]; events: RuntimeEvent[] }
     expect(parsed.status).toBe('completed')
     expect(parsed.items.some((item) => item.kind === 'assistant_text')).toBe(true)
+    expect(parsed.events.map((event) => event.kind)).toEqual(['turn_started'])
   })
 
   it('returns runtime failures from one-shot runs', async () => {
@@ -339,5 +358,27 @@ describe('Kun agent CLI commands', () => {
     expect(seen?.model).toBe('deepseek-v4-pro')
     expect(seen?.approvalPolicy).toBe('auto')
     expect(seen?.dataDir).toBe(dataDir)
+  })
+
+  it('passes rigorous mode for kun run --rigorous', async () => {
+    let mode: unknown
+    const c = capture({
+      createRuntime: fakeRuntime({
+        onStartTurn: (input) => {
+          mode = input.request.mode
+        }
+      })
+    })
+    const code = await runAgentCommand('run', [
+      '--data-dir',
+      dataDir,
+      '--rigorous',
+      '--prompt',
+      'hello',
+      '--json'
+    ], c.io)
+
+    expect(code).toBe(ServeExitCode.ok)
+    expect(mode).toBe('rigorous')
   })
 })
