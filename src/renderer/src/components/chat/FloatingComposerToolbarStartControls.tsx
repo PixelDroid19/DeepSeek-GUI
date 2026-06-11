@@ -15,6 +15,7 @@ export function FloatingComposerToolbarStartControls({
   goalBadgeLabel,
   mode,
   planBadgeLabel,
+  showAttachButton = true,
   showComposerMenuButton,
   onAttachmentInput,
   onComposerMenuClick,
@@ -33,6 +34,8 @@ export function FloatingComposerToolbarStartControls({
   goalBadgeLabel: string
   mode: 'plan' | 'agent'
   planBadgeLabel: string
+  /** Hide the inline attach button when the composer menu hosts the action instead. */
+  showAttachButton?: boolean
   showComposerMenuButton: boolean
   onAttachmentInput: (event: ChangeEvent<HTMLInputElement>) => void
   onComposerMenuClick: () => void
@@ -50,20 +53,22 @@ export function FloatingComposerToolbarStartControls({
             className="hidden"
             onChange={onAttachmentInput}
           />
-          <button
-            type="button"
-            disabled={!canPickAttachment}
-            onClick={onOpenFilePicker}
-            className="ds-no-drag flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-45"
-            aria-label={addImageLabel}
-            title={addImageLabel}
-          >
-            {attachmentUploadBusy ? (
-              <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
-            ) : (
-              <ImagePlus className="h-4 w-4" strokeWidth={1.8} />
-            )}
-          </button>
+          {showAttachButton ? (
+            <button
+              type="button"
+              disabled={!canPickAttachment}
+              onClick={onOpenFilePicker}
+              className="ds-no-drag flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-45"
+              aria-label={addImageLabel}
+              title={addImageLabel}
+            >
+              {attachmentUploadBusy ? (
+                <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
+              ) : (
+                <ImagePlus className="h-4 w-4" strokeWidth={1.8} />
+              )}
+            </button>
+          ) : null}
         </>
       ) : null}
       {showComposerMenuButton ? (

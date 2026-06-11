@@ -136,11 +136,14 @@ export function resolveComposerPasteImageTransfer({
     return { action: 'ignore', files: [], preventDefault: false }
   }
 
-  const shouldPreventDefault = !plainText || imageTransferHasImages(source)
+  // Only suppress the native paste when the transfer claims image content we
+  // could not extract; an empty or text-only paste keeps its default behavior
+  // and the clipboard bridge runs silently only when text already pasted.
+  const transferClaimsImages = imageTransferHasImages(source)
   return {
     action: 'paste-clipboard-image',
-    preventDefault: shouldPreventDefault,
-    silentNoImage: !shouldPreventDefault
+    preventDefault: transferClaimsImages,
+    silentNoImage: Boolean(plainText) && !transferClaimsImages
   }
 }
 

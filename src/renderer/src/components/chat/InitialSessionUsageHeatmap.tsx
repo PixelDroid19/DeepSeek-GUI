@@ -725,17 +725,8 @@ function UsageHeroSection({
 }
 
 function CollapsedCalendarCard({ onExpand }: { onExpand: () => void }): ReactElement {
-  const { t } = useTranslation('common')
   return (
     <div className="-mt-1 flex w-full min-w-0 flex-col items-center gap-3 text-center">
-      <div className="max-w-[620px]">
-        <h2 className="text-[20px] font-semibold leading-tight tracking-[0] text-ds-ink sm:text-[22px]">
-          {t('usageHeatmapCollapsedTitle')}
-        </h2>
-        <p className="mt-2 text-[13.5px] leading-6 text-ds-muted">
-          {t('usageHeatmapCollapsedSub')}
-        </p>
-      </div>
       <UsageHeroToggle expanded={false} onToggle={onExpand} />
     </div>
   )

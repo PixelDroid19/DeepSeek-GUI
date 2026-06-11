@@ -1,4 +1,5 @@
 import type { TurnItem } from '../contracts/items.js'
+import { normalizeTextBlock } from './text-normalization.js'
 
 export type RequestHistoryHygieneOptions = {
   maxToolResultLines?: number
@@ -18,9 +19,7 @@ const DEFAULT_MAX_ARRAY_ITEMS = 80
 const MAX_SIGNAL_LINES = 48
 const MAX_LINE_CHARS = 280
 const LONG_ARGUMENT_PREVIEW_CHARS = 160
-const ESC = String.fromCharCode(27)
 
-const ANSI_RE = new RegExp(`${ESC}\\[[0-9;?]*[ -/]*[@-~]`, 'g')
 const SIGNAL_LINE_RE =
   /\b(error|failed?|fatal|panic|exception|traceback|warning|warn|denied|timeout|timed out|not found|cannot|invalid)\b/i
 const BASE64_KEY_RE = /(?:^|_)(?:data_)?base64$/i
@@ -268,39 +267,6 @@ function compactArgumentValue(
 
 function shouldOmitBase64(key: string, value: string): boolean {
   return value.length > 256 && (BASE64_KEY_RE.test(key) || DATA_URL_RE.test(value))
-}
-
-function normalizeTextBlock(text: string): string {
-  const stripped = text.replace(/\r\n/g, '\n').replace(ANSI_RE, '')
-  const lines = stripped.split('\n').map((line) => line.trimEnd())
-  const out: string[] = []
-  let blankRun = 0
-  let previous = ''
-  let repeatCount = 0
-  const flushRepeat = () => {
-    if (repeatCount > 1) out.push(`[previous line repeated ${repeatCount - 1} time(s)]`)
-    repeatCount = 0
-  }
-  for (const line of lines) {
-    if (!line.trim()) {
-      flushRepeat()
-      blankRun += 1
-      if (blankRun <= 2) out.push('')
-      previous = ''
-      continue
-    }
-    blankRun = 0
-    if (line === previous) {
-      repeatCount += 1
-      continue
-    }
-    flushRepeat()
-    out.push(line)
-    previous = line
-    repeatCount = 1
-  }
-  flushRepeat()
-  return out.join('\n').trim()
 }
 
 function fitLinesToBudget(lines: string[], budget: { maxBytes: number; maxTokens: number }): string[] {

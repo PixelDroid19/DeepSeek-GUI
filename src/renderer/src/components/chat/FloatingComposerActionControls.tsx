@@ -1,4 +1,4 @@
-import { Send, Square } from 'lucide-react'
+import { Loader2, Send, Square } from 'lucide-react'
 import type { ReactElement } from 'react'
 import type { ModelProviderModelGroup } from '@shared/ds-gui-api'
 import {
@@ -19,6 +19,7 @@ export function FloatingComposerActionControls({
   modelPickerMode,
   primaryActionDisabled,
   primaryActionLabel,
+  primaryActionLoading = false,
   stretchModelPicker,
   onComposerModelChange,
   onComposerReasoningEffortChange,
@@ -37,6 +38,8 @@ export function FloatingComposerActionControls({
   modelPickerMode: 'select' | 'combobox'
   primaryActionDisabled: boolean
   primaryActionLabel: string
+  /** Show a spinner instead of the send icon (e.g. while the runtime connects). */
+  primaryActionLoading?: boolean
   stretchModelPicker: boolean
   onComposerModelChange: (modelId: string) => void
   onComposerReasoningEffortChange?: (effort: ComposerReasoningEffort) => void
@@ -82,7 +85,11 @@ export function FloatingComposerActionControls({
         aria-label={primaryActionLabel}
         title={primaryActionLabel}
       >
-        <Send className="h-4 w-4" strokeWidth={2.2} />
+        {primaryActionLoading ? (
+          <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2.2} />
+        ) : (
+          <Send className="h-4 w-4" strokeWidth={2.2} />
+        )}
       </button>
     </div>
   )

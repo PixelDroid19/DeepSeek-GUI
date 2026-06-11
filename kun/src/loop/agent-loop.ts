@@ -30,7 +30,6 @@ import {
 import { detectVolatilePrefixContent } from '../cache/prefix-volatility.js'
 import { buildToolCatalogFingerprint } from '../cache/tool-catalog-fingerprint.js'
 import {
-  makeUserItem,
   makeToolCallItem,
   makeToolResultItem,
   makeUserInputItem,
@@ -105,7 +104,8 @@ import { prepareCompletedStreamToolCall } from './model-stream-tool-call.js'
 import {
   appendAssistantContentDelta,
   buildCompletedAssistantContentItems,
-  createAssistantContentStreamState
+  createAssistantContentStreamState,
+  type AssistantContentStreamState
 } from './model-stream-assistant-content.js'
 import { resolveModelStepStreamOutcome } from './model-step-stream-outcome.js'
 
@@ -197,6 +197,40 @@ export type AgentLoopOptions = {
   }) => Promise<void>
 }
 
+type TurnStatus = 'completed' | 'failed' | 'aborted'
+
+type ModelStepResult = 'continue' | 'stop' | 'failed' | 'aborted'
+
+/** Everything a model step needs after request preparation succeeded. */
+type PreparedModelStep = {
+  kind: 'ready'
+  request: ModelRequest
+  healedItems: TurnItem[]
+  turnPrompt: string | undefined
+  workspace: string
+  effectiveMode: 'agent' | 'plan' | undefined
+  activePlanContext: GuiPlanContext | undefined
+  approvalPolicy: ToolHostContext['approvalPolicy']
+  modelCapabilities: ModelCapabilityMetadata
+  activeSkillIds: readonly string[]
+  allowedToolNames: readonly string[] | undefined
+  activeGoalInstruction: string | null
+  toolProviderMetadata: ReadonlyMap<
+    string,
+    { providerId: string | undefined; providerKind: ToolProviderKind | undefined }
+  >
+  toolProviderKinds: ReadonlyMap<string, ToolProviderKind | undefined>
+  toolKinds: ReadonlyMap<string, ModelToolSpec['toolKind']>
+}
+
+type PrepareModelStepResult = PreparedModelStep | { kind: 'stop' } | { kind: 'aborted' }
+
+type StreamedModelStep = {
+  assistantContent: AssistantContentStreamState
+  completedToolCalls: ToolCallLike[]
+  stopReason: 'stop' | 'tool_calls' | 'length' | 'error'
+}
+
 /**
  * Cache-first agent loop. The loop:
  * 1. Drains pending steering text and injects it as user messages.
@@ -208,6 +242,11 @@ export type AgentLoopOptions = {
  *
  * The loop is driven by `runTurn(threadId, turnId)` and is fully
  * cancellable through the AbortSignal returned by `getAbortController`.
+ *
+ * Each model step runs in three phases:
+ * - `prepareModelStep` resolves history, routing, tools, and the request.
+ * - `consumeModelStream` streams the response and persists tool-call items.
+ * - `modelStep` resolves the stream outcome and dispatches tool calls.
  */
 export class AgentLoop {
   private readonly opts: AgentLoopOptions
@@ -225,7 +264,7 @@ export class AgentLoop {
    * (completed, failed, or aborted). All errors are caught and
    * surfaced through the `error` runtime event.
    */
-  async runTurn(threadId: string, turnId: string): Promise<'completed' | 'failed' | 'aborted'> {
+  async runTurn(threadId: string, turnId: string): Promise<TurnStatus> {
     const signal = this.opts.turns.getAbortController(turnId)
     if (!signal) {
       await this.failTurn(threadId, turnId, 'no abort controller for turn')
@@ -243,39 +282,42 @@ export class AgentLoop {
         this.toolStormBreakers.set(turnId, new ToolStormBreaker(this.opts.toolStorm))
       }
       await this.recordPipelineStage(threadId, turnId, 'pre_start')
-      await this.drainSteering(threadId, turnId, signal)
+      await this.drainSteering(threadId, turnId)
       await this.recordPipelineStage(threadId, turnId, 'post_start')
       const status = await this.loop(threadId, turnId, signal)
       await this.opts.turns.finishTurn({ threadId, turnId, status })
       return status
     } catch (error) {
-      const raw = error instanceof Error ? error.message : String(error)
-      // Best-effort enrichment so the renderer can show "what failed where"
-      // instead of the bare "Kun turn failed" string. See issue #26.
-      const modelInfo = this.opts.model && 'config' in this.opts.model
-        ? (this.opts.model as { config: { model?: string; baseUrl?: string } }).config
-        : undefined
-      const modelName = modelInfo?.model ?? 'unknown'
-      const provider = modelInfo?.baseUrl ?? 'unknown'
-      const stack = error instanceof Error
-        ? (error.stack?.split('\n').slice(0, 3).join(' | ') ?? '')
-        : ''
-      const message = [
-        '[Kun turn failed]',
-        `turn=${turnId}`,
-        `thread=${threadId}`,
-        `model=${modelName}`,
-        `provider=${provider}`,
-        `error=${raw}`,
-        stack ? `stack=${stack}` : ''
-      ].filter(Boolean).join(' ')
-      await this.failTurn(threadId, turnId, message)
+      await this.failTurn(threadId, turnId, this.describeTurnFailure(threadId, turnId, error))
       return 'failed'
     } finally {
       await this.finishGoalElapsedTimer(threadId, goalTimer)
       this.autoModelRoutes.delete(autoModelRouteKey(threadId, turnId))
       this.toolStormBreakers.delete(turnId)
     }
+  }
+
+  /**
+   * Best-effort enrichment so the renderer can show "what failed where"
+   * instead of the bare "Kun turn failed" string. See issue #26.
+   */
+  private describeTurnFailure(threadId: string, turnId: string, error: unknown): string {
+    const raw = error instanceof Error ? error.message : String(error)
+    const modelInfo = this.opts.model && 'config' in this.opts.model
+      ? (this.opts.model as { config: { model?: string; baseUrl?: string } }).config
+      : undefined
+    const stack = error instanceof Error
+      ? (error.stack?.split('\n').slice(0, 3).join(' | ') ?? '')
+      : ''
+    return [
+      '[Kun turn failed]',
+      `turn=${turnId}`,
+      `thread=${threadId}`,
+      `model=${modelInfo?.model ?? 'unknown'}`,
+      `provider=${modelInfo?.baseUrl ?? 'unknown'}`,
+      `error=${raw}`,
+      stack ? `stack=${stack}` : ''
+    ].filter(Boolean).join(' ')
   }
 
   private async failTurn(threadId: string, turnId: string, message: string): Promise<void> {
@@ -308,10 +350,8 @@ export class AgentLoop {
     })
   }
 
-  private async drainSteering(threadId: string, turnId: string, signal: AbortSignal): Promise<void> {
-    const pending = this.opts.steering.drain()
-    if (pending.length === 0) return
-    for (const text of pending) {
+  private async drainSteering(threadId: string, turnId: string): Promise<void> {
+    for (const text of this.opts.steering.drain()) {
       const item: TurnItem = {
         id: this.opts.ids.next('item_steered'),
         turnId,
@@ -325,17 +365,16 @@ export class AgentLoop {
       }
       await this.opts.turns.applyItem(threadId, item)
     }
-    void signal
   }
 
   private async loop(
     threadId: string,
     turnId: string,
     signal: AbortSignal
-  ): Promise<'completed' | 'failed' | 'aborted'> {
+  ): Promise<TurnStatus> {
     for (let step = 0; ; step += 1) {
       if (signal.aborted) return 'aborted'
-      await this.drainSteering(threadId, turnId, signal)
+      await this.drainSteering(threadId, turnId)
       const stepResult = await this.modelStep(threadId, turnId, signal, step)
       if (stepResult === 'stop') return 'completed'
       if (stepResult === 'failed') return 'failed'
@@ -348,7 +387,107 @@ export class AgentLoop {
     turnId: string,
     signal: AbortSignal,
     stepIndex = 0
-  ): Promise<'continue' | 'stop' | 'failed' | 'aborted'> {
+  ): Promise<ModelStepResult> {
+    const prepared = await this.prepareModelStep(threadId, turnId, signal, stepIndex)
+    if (prepared.kind !== 'ready') return prepared.kind
+
+    const streamed = await this.consumeModelStream(threadId, turnId, signal, prepared)
+    if (streamed === 'aborted') return 'aborted'
+    const { assistantContent, completedToolCalls, stopReason } = streamed
+
+    await this.recordPipelineStage(threadId, turnId, 'response_received', {
+      stopReason,
+      toolCallCount: completedToolCalls.length
+    })
+    for (const completed of buildCompletedAssistantContentItems({
+      state: assistantContent,
+      threadId,
+      turnId,
+      nextItemId: (kind) => this.opts.ids.next(kind)
+    })) {
+      await this.opts.turns.applyItem(threadId, completed.item)
+    }
+
+    const dispatchBase = {
+      threadId,
+      turnId,
+      workspace: prepared.workspace,
+      threadMode: prepared.effectiveMode,
+      activePlanContext: prepared.activePlanContext,
+      modelCapabilities: prepared.modelCapabilities,
+      activeSkillIds: prepared.activeSkillIds,
+      allowedToolNames: prepared.allowedToolNames,
+      toolProviderKinds: prepared.toolProviderKinds,
+      approvalPolicy: prepared.approvalPolicy,
+      signal
+    }
+    const streamOutcome = resolveModelStepStreamOutcome({
+      assistantText: assistantContent.text,
+      completedToolCallCount: completedToolCalls.length,
+      hasActiveGoalInstruction: prepared.activeGoalInstruction !== null,
+      requiredToolName: prepared.request.requiredToolName,
+      stopReason
+    })
+    switch (streamOutcome.kind) {
+      case 'failed':
+        return 'failed'
+      case 'stop':
+        return 'stop'
+      case 'continue':
+        return 'continue'
+      case 'required-tool-missing': {
+        await this.opts.events.record({
+          kind: 'error',
+          threadId,
+          turnId,
+          message: streamOutcome.message,
+          code: streamOutcome.code
+        })
+        await this.opts.turns.applyItem(
+          threadId,
+          makeErrorItem({
+            id: this.opts.ids.next('item_error'),
+            turnId,
+            threadId,
+            message: streamOutcome.message,
+            code: streamOutcome.code
+          })
+        )
+        return 'failed'
+      }
+      case 'materialize-required-plan': {
+        const call = await this.materializeRequiredPlanCall({
+          threadId,
+          turnId,
+          prepared,
+          assistantText: assistantContent.text
+        })
+        if (!call) return 'failed'
+        const dispatched = await this.dispatchToolCalls({ ...dispatchBase, calls: [call] })
+        return dispatched === 'aborted' ? 'aborted' : 'continue'
+      }
+      case 'dispatch-tool-calls': {
+        const dispatched = await this.dispatchToolCalls({
+          ...dispatchBase,
+          calls: completedToolCalls
+        })
+        return dispatched === 'aborted' ? 'aborted' : 'continue'
+      }
+    }
+  }
+
+  /**
+   * Resolve everything a model step needs before sending the request:
+   * budget gate, healed history, model routing, skills, memories, the
+   * tool catalog (with drift detection), compaction, and finally the
+   * token-economy-trimmed request itself.
+   */
+  private async prepareModelStep(
+    threadId: string,
+    turnId: string,
+    signal: AbortSignal,
+    stepIndex: number
+  ): Promise<PrepareModelStepResult> {
     if (shouldVerifyImmutablePrefix()) {
       verifyImmutablePrefix(this.opts.prefix)
     }
@@ -370,7 +509,7 @@ export class AgentLoop {
       events: this.opts.events,
       nowIso: this.opts.nowIso
     })
-    if (budgetGate === 'blocked') return 'stop'
+    if (budgetGate === 'blocked') return { kind: 'stop' }
     const loadedItems = await this.opts.sessionStore.loadItems(threadId)
     const healed = healLoadedHistoryItems(loadedItems)
     if (healed.changed) {
@@ -416,16 +555,17 @@ export class AgentLoop {
     })
     const model = modelRoute.model
     const modelCapabilities = this.opts.modelCapabilities?.(model) ?? modelCapabilitiesForModel(model)
+    const workspace = thread?.workspace ?? ''
     const attachments = await resolveModelAttachments({
       attachmentIds: turn?.attachmentIds ?? [],
       attachmentStore: this.opts.attachmentStore,
       threadId,
-      workspace: thread?.workspace ?? '',
+      workspace,
       modelCapabilities
     })
     const skillResolution = this.opts.skillRuntime?.resolveTurn({
       prompt: turn?.prompt ?? '',
-      workspace: thread?.workspace ?? ''
+      workspace
     }) ?? {
       activeSkillIds: [],
       activations: [],
@@ -434,7 +574,7 @@ export class AgentLoop {
     }
     const memories = await this.retrieveMemories({
       prompt: turn?.prompt ?? '',
-      workspace: thread?.workspace ?? ''
+      workspace
     })
     const planTurnActive = effectiveMode === 'plan' || Boolean(activePlanContext)
     const activeGoalInstruction = planTurnActive
@@ -448,7 +588,7 @@ export class AgentLoop {
     const toolContext: ToolHostContext = {
       threadId,
       turnId,
-      workspace: thread?.workspace ?? '',
+      workspace,
       threadMode: effectiveMode,
       ...(activePlanContext ? { guiPlan: activePlanContext } : {}),
       model: modelCapabilities,
@@ -466,10 +606,12 @@ export class AgentLoop {
     const toolProviderMetadata = new Map(
       tools.map((tool) => [tool.name, { providerId: tool.providerId, providerKind: tool.providerKind }])
     )
+    const toolProviderKinds = new Map(tools.map((tool) => [tool.name, tool.providerKind]))
+    const toolKinds = new Map(toolSpecs.map((tool) => [tool.name, tool.toolKind]))
     const toolCatalog = buildToolCatalogFingerprint(toolSpecs)
     const toolCatalogDrift = this.recordToolCatalogFingerprint({
       threadId,
-      workspace: thread?.workspace ?? '',
+      workspace,
       mode: effectiveMode ?? 'agent',
       model: modelCapabilities.id,
       activeSkillIds: skillResolution.activeSkillIds,
@@ -502,22 +644,21 @@ export class AgentLoop {
         toolCatalogDrift: toolCatalogDrift.kind !== 'none'
       })
     }
-    if (toolCatalogDrift.kind === 'breaking') return 'stop'
-    const toolKinds = new Map(toolSpecs.map((tool) => [tool.name, tool.toolKind]))
+    if (toolCatalogDrift.kind === 'breaking') return { kind: 'stop' }
     const createPlanSatisfied = planTurnActive
       ? hasSuccessfulCreatePlanResult(healed.items, turnId)
       : false
+    // Final step of a plan turn that still owes a plan. Offer ONLY create_plan
+    // (this DeepSeek-compatible provider ignores a forced tool_choice, so we
+    // remove the investigation tools instead) so the model can only save the
+    // plan or answer with plan text that the create_plan fallback materializes.
     const requiredToolName = resolveRequiredToolName({
       createPlanSatisfied,
       planTurnActive,
       toolSpecs
     })
-    // Final step of a plan turn that still owes a plan. Offer ONLY create_plan
-    // (this DeepSeek-compatible provider ignores a forced tool_choice, so we
-    // remove the investigation tools instead) so the model can only save the
-    // plan or answer with plan text that the create_plan fallback materializes.
     const history = await this.compactIfNeeded(items, model, signal, { threadId, turnId })
-    if (signal.aborted) return 'aborted'
+    if (signal.aborted) return { kind: 'aborted' }
     await this.recordPipelineStage(threadId, turnId, 'input_compressed', {
       historyItems: history.length
     })
@@ -570,9 +711,6 @@ export class AgentLoop {
         sentInputTokens: estimateModelRequestInputTokens(request)
       })
     }
-    const assistantContent = createAssistantContentStreamState()
-    const completedToolCalls: ToolCallLike[] = []
-    let stopReason: 'stop' | 'tool_calls' | 'length' | 'error' = 'stop'
     await this.recordPipelineStage(threadId, turnId, 'pre_send', {
       model: request.model,
       historyItems: request.history.length,
@@ -585,30 +723,46 @@ export class AgentLoop {
         modelCapabilities
       })
     })
+    return {
+      kind: 'ready',
+      request,
+      healedItems: healed.items,
+      turnPrompt: turn?.prompt,
+      workspace,
+      effectiveMode,
+      activePlanContext,
+      approvalPolicy,
+      modelCapabilities,
+      activeSkillIds: skillResolution.activeSkillIds,
+      allowedToolNames,
+      activeGoalInstruction,
+      toolProviderMetadata,
+      toolProviderKinds,
+      toolKinds
+    }
+  }
+
+  /**
+   * Stream one model response: emit text/reasoning delta events, persist
+   * completed tool-call items, and fold usage telemetry as it arrives.
+   */
+  private async consumeModelStream(
+    threadId: string,
+    turnId: string,
+    signal: AbortSignal,
+    prepared: PreparedModelStep
+  ): Promise<StreamedModelStep | 'aborted'> {
+    const { request } = prepared
+    const assistantContent = createAssistantContentStreamState()
+    const completedToolCalls: ToolCallLike[] = []
+    let stopReason: StreamedModelStep['stopReason'] = 'stop'
     await this.recordPipelineStage(threadId, turnId, 'post_send', {
       model: request.model
     })
     for await (const chunk of this.opts.model.stream(request)) {
       if (signal.aborted) return 'aborted'
       switch (chunk.kind) {
-        case 'assistant_text_delta': {
-          const delta = appendAssistantContentDelta({
-            state: assistantContent,
-            kind: chunk.kind,
-            text: chunk.text,
-            threadId,
-            turnId,
-            nextItemId: (kind) => this.opts.ids.next(kind)
-          })
-          await this.opts.events.record({
-            kind: 'assistant_text_delta',
-            threadId,
-            turnId,
-            itemId: delta.itemId,
-            item: delta.item
-          })
-          break
-        }
+        case 'assistant_text_delta':
         case 'assistant_reasoning_delta': {
           const delta = appendAssistantContentDelta({
             state: assistantContent,
@@ -619,7 +773,7 @@ export class AgentLoop {
             nextItemId: (kind) => this.opts.ids.next(kind)
           })
           await this.opts.events.record({
-            kind: 'assistant_reasoning_delta',
+            kind: chunk.kind,
             threadId,
             turnId,
             itemId: delta.itemId,
@@ -630,17 +784,17 @@ export class AgentLoop {
         case 'tool_call_delta':
           break
         case 'tool_call_complete': {
-          const prepared = prepareCompletedStreamToolCall({
+          const preparedCall = prepareCompletedStreamToolCall({
             callId: chunk.callId,
             toolName: chunk.toolName,
             arguments: chunk.arguments,
-            providerMetadata: toolProviderMetadata,
-            toolKinds,
+            providerMetadata: prepared.toolProviderMetadata,
+            toolKinds: prepared.toolKinds,
             ...(this.opts.toolArgumentRepair?.maxStringBytes !== undefined
               ? { maxStringBytes: this.opts.toolArgumentRepair.maxStringBytes }
               : {})
           })
-          completedToolCalls.push(prepared.call)
+          completedToolCalls.push(preparedCall.call)
           const itemId = `item_tool_${turnId}_${chunk.callId}`
           await this.opts.turns.applyItem(
             threadId,
@@ -650,9 +804,9 @@ export class AgentLoop {
               threadId,
               callId: chunk.callId,
               toolName: chunk.toolName,
-              toolKind: prepared.toolKind,
-              arguments: prepared.arguments,
-              ...(prepared.summary ? { summary: prepared.summary } : {})
+              toolKind: preparedCall.toolKind,
+              arguments: preparedCall.arguments,
+              ...(preparedCall.summary ? { summary: preparedCall.summary } : {})
             })
           )
           await this.opts.events.record({
@@ -693,111 +847,40 @@ export class AgentLoop {
           break
       }
     }
-    await this.recordPipelineStage(threadId, turnId, 'response_received', {
-      stopReason,
-      toolCallCount: completedToolCalls.length
+    return { assistantContent, completedToolCalls, stopReason }
+  }
+
+  /**
+   * Build and persist the synthetic `create_plan` call used when a plan
+   * turn finished without saving a plan. Returns null when the fallback
+   * cannot be materialized (which fails the step).
+   */
+  private async materializeRequiredPlanCall(input: {
+    threadId: string
+    turnId: string
+    prepared: PreparedModelStep
+    assistantText: string
+  }): Promise<ToolCallLike | null> {
+    const { threadId, turnId, prepared } = input
+    const callId = this.opts.ids.next('call_plan')
+    const provider = prepared.toolProviderMetadata.get(CREATE_PLAN_TOOL_NAME)
+    const call = buildCreatePlanFallbackToolCall({
+      callId,
+      requiredToolName: prepared.request.requiredToolName,
+      assistantText: input.assistantText,
+      activePlanContext: prepared.activePlanContext,
+      latestUserMessageText: latestUserMessageText(prepared.healedItems, turnId),
+      turnPrompt: prepared.turnPrompt,
+      providerId: provider?.providerId,
+      toolKind: prepared.toolKinds.get(CREATE_PLAN_TOOL_NAME)
     })
-    for (const completed of buildCompletedAssistantContentItems({
-      state: assistantContent,
-      threadId,
-      turnId,
-      nextItemId: (kind) => this.opts.ids.next(kind)
-    })) {
-      await this.opts.turns.applyItem(
-        threadId,
-        completed.item
-      )
-    }
-    const streamOutcome = resolveModelStepStreamOutcome({
-      assistantText: assistantContent.text,
-      completedToolCallCount: completedToolCalls.length,
-      hasActiveGoalInstruction: Boolean(activeGoalInstruction),
-      requiredToolName: request.requiredToolName,
-      stopReason
-    })
-    switch (streamOutcome.kind) {
-      case 'failed':
-        return 'failed'
-      case 'materialize-required-plan': {
-        const callId = this.opts.ids.next('call_plan')
-        const provider = toolProviderMetadata.get(CREATE_PLAN_TOOL_NAME)
-        const toolKind = toolKinds.get(CREATE_PLAN_TOOL_NAME)
-        const call = buildCreatePlanFallbackToolCall({
-          callId,
-          requiredToolName: request.requiredToolName,
-          assistantText: assistantContent.text,
-          activePlanContext,
-          latestUserMessageText: latestUserMessageText(healed.items, turnId),
-          turnPrompt: turn?.prompt,
-          providerId: provider?.providerId,
-          toolKind,
-        })
-        if (!call) return 'failed'
-        const itemId = `item_tool_${turnId}_${callId}`
-        const materialized = buildMaterializedCreatePlanToolCall({ call, itemId, threadId, turnId })
-        if (!materialized) return 'failed'
-        await this.opts.turns.applyItem(threadId, materialized.item)
-        await this.opts.events.record(materialized.readyEvent)
-        const dispatched = await this.dispatchToolCalls({
-          calls: [call],
-          threadId,
-          turnId,
-          workspace: thread?.workspace ?? '',
-          threadMode: effectiveMode,
-          activePlanContext,
-          modelCapabilities,
-          activeSkillIds: skillResolution.activeSkillIds,
-          allowedToolNames,
-          toolProviderKinds: new Map(tools.map((tool) => [tool.name, tool.providerKind])),
-          approvalPolicy,
-          signal
-        })
-        if (dispatched === 'aborted') return 'aborted'
-        return 'continue'
-      }
-      case 'required-tool-missing': {
-        await this.opts.events.record({
-          kind: 'error',
-          threadId,
-          turnId,
-          message: streamOutcome.message,
-          code: streamOutcome.code
-        })
-        await this.opts.turns.applyItem(
-          threadId,
-          makeErrorItem({
-            id: this.opts.ids.next('item_error'),
-            turnId,
-            threadId,
-            message: streamOutcome.message,
-            code: streamOutcome.code
-          })
-        )
-        return 'failed'
-      }
-      case 'continue':
-        return 'continue'
-      case 'stop':
-        return 'stop'
-      case 'dispatch-tool-calls':
-        break
-    }
-    const dispatched = await this.dispatchToolCalls({
-      calls: completedToolCalls,
-      threadId,
-      turnId,
-      workspace: thread?.workspace ?? '',
-      threadMode: effectiveMode,
-      activePlanContext,
-      modelCapabilities,
-      activeSkillIds: skillResolution.activeSkillIds,
-      allowedToolNames,
-      toolProviderKinds: new Map(tools.map((tool) => [tool.name, tool.providerKind])),
-      approvalPolicy,
-      signal
-    })
-    if (dispatched === 'aborted') return 'aborted'
-    return 'continue'
+    if (!call) return null
+    const itemId = `item_tool_${turnId}_${callId}`
+    const materialized = buildMaterializedCreatePlanToolCall({ call, itemId, threadId, turnId })
+    if (!materialized) return null
+    await this.opts.turns.applyItem(threadId, materialized.item)
+    await this.opts.events.record(materialized.readyEvent)
+    return call
   }
 
   private async dispatchToolCalls(input: {
@@ -1119,27 +1202,27 @@ export class AgentLoop {
       prompt: input.prompt,
       questions: input.questions
     })
-    if (!signal.aborted) {
-      return new Promise<UserInputResolution>((resolve, reject) => {
-        const onAbort = (): void => {
-          this.opts.userInputGate.resolve(input.id, { status: 'cancelled' })
-          signal.removeEventListener('abort', onAbort)
-          reject(new Error('cancelled while awaiting user input'))
-        }
-        signal.addEventListener('abort', onAbort, { once: true })
-        pending
-          .then((resolution) => {
-            signal.removeEventListener('abort', onAbort)
-            resolve(resolution)
-          })
-          .catch((error) => {
-            signal.removeEventListener('abort', onAbort)
-            reject(error)
-          })
-      })
+    if (signal.aborted) {
+      this.opts.userInputGate.resolve(input.id, { status: 'cancelled' })
+      throw new Error('cancelled while awaiting user input')
     }
-    this.opts.userInputGate.resolve(input.id, { status: 'cancelled' })
-    throw new Error('cancelled while awaiting user input')
+    return new Promise<UserInputResolution>((resolve, reject) => {
+      const onAbort = (): void => {
+        this.opts.userInputGate.resolve(input.id, { status: 'cancelled' })
+        signal.removeEventListener('abort', onAbort)
+        reject(new Error('cancelled while awaiting user input'))
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      pending
+        .then((resolution) => {
+          signal.removeEventListener('abort', onAbort)
+          resolve(resolution)
+        })
+        .catch((error) => {
+          signal.removeEventListener('abort', onAbort)
+          reject(error)
+        })
+    })
   }
 
   private async compactIfNeeded(

@@ -798,8 +798,8 @@ export function FloatingComposer({
 
   return (
     <div className={compact
-      ? 'ds-floating-composer pointer-events-auto w-full pb-0 pt-0'
-      : 'ds-floating-composer ds-chat-column-inset pointer-events-auto w-full max-w-4xl pb-3 pt-0'}
+      ? 'ds-floating-composer ds-no-drag pointer-events-auto w-full pb-0 pt-0'
+      : 'ds-floating-composer ds-no-drag ds-chat-column-inset pointer-events-auto w-full max-w-4xl pb-3 pt-0'}
     >
       <FloatingComposerQueuedMessages
         messages={queuedMessages}
@@ -832,6 +832,14 @@ export function FloatingComposer({
         {composerMenuOpen && slashQuery == null ? (
           <FloatingComposerOptionsMenu
             panelRef={composerMenuPanelRef}
+            addImageLabel={t('composerAddImage')}
+            attachmentUploadBusy={attachmentUploadBusy}
+            canPickAttachment={canPickAttachment}
+            showAddImage={attachmentUploadEnabled}
+            onAddImageClick={() => {
+              setComposerMenuOpen(false)
+              fileInputRef.current?.click()
+            }}
             canOpenGoalPanel={canOpenGoalPanel}
             canTogglePlanMode={canTogglePlanMode}
             goalChecked={goalMenuChecked}
@@ -895,7 +903,7 @@ export function FloatingComposer({
         ) : null}
 
         <div
-          className={`ds-composer-shell ds-chat-composer ds-frosted flex flex-col gap-1 px-3 pb-2 pt-2 transition ${
+          className={`ds-composer-shell ds-chat-composer ds-frosted ds-no-drag flex flex-col gap-1 px-3 pb-2 pt-2 transition ${
             draft.focused ? 'ds-chat-composer-focus' : ''
           } ${compact ? 'rounded-[24px] px-3 py-2 shadow-none' : ''}`}
           onPaste={handleComposerPaste}
@@ -905,7 +913,7 @@ export function FloatingComposer({
           <textarea
             ref={draft.textareaRef}
             rows={1}
-            className={`ds-no-drag block min-w-0 resize-none break-words bg-transparent px-1 py-0.5 text-[15px] leading-[1.45] text-ds-ink placeholder:text-ds-faint focus:outline-none [overflow-wrap:anywhere] ${
+            className={`ds-no-drag block w-full min-w-0 resize-none break-words bg-transparent px-1 py-0.5 text-[15px] leading-[1.45] text-ds-ink placeholder:text-ds-faint focus:outline-none [overflow-wrap:anywhere] ${
               canEditComposer ? '' : 'opacity-80'
             } ${compact ? 'text-[14px]' : 'min-h-[40px]'}`}
             placeholder={placeholder}
@@ -952,6 +960,7 @@ export function FloatingComposer({
                 goalBadgeLabel={t('slashCommandGoalTitle')}
                 mode={mode}
                 planBadgeLabel={t('slashCommandPlanTitle')}
+                showAttachButton={!showComposerMenuButton}
                 showComposerMenuButton={showComposerMenuButton}
                 onAttachmentInput={handleAttachmentInput}
                 onComposerMenuClick={handleComposerMenuButtonClick}
@@ -971,6 +980,7 @@ export function FloatingComposer({
               modelPickerMode={modelPickerMode}
               primaryActionDisabled={primaryActionDisabled}
               primaryActionLabel={primaryActionLabel}
+              primaryActionLoading={!runtimeReady}
               stretchModelPicker={stretchModelPicker}
               onComposerModelChange={onComposerModelChange}
               onComposerReasoningEffortChange={onComposerReasoningEffortChange}

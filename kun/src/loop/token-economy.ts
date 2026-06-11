@@ -1,6 +1,7 @@
 import type { TurnItem } from '../contracts/items.js'
 import type { ModelRequest, ModelToolSpec } from '../ports/model-client.js'
 import type { RequestHistoryHygieneOptions } from './request-history-hygiene.js'
+import { normalizeTextBlock } from './text-normalization.js'
 
 export type TokenEconomyConfig = {
   enabled?: boolean
@@ -42,13 +43,11 @@ const MAX_FIND_MATCHES = 160
 const MAX_LS_ENTRIES = 120
 const MAX_ARRAY_ITEMS = 80
 const MAX_LINE_CHARS = 260
-const ESC = String.fromCharCode(27)
 const PROTECTED_SEGMENT_PREFIX = '__KUN_PROTECTED_SEGMENT_'
 const PROTECTED_SEGMENT_SUFFIX = '__'
 
 const SIGNAL_LINE_RE =
   /\b(error|failed?|fatal|panic|exception|traceback|warning|warn|denied|timeout|timed out|not found|cannot|invalid)\b/i
-const ANSI_RE = new RegExp(`${ESC}\\[[0-9;?]*[ -/]*[@-~]`, 'g')
 const FILLERS_RE =
   /\b(?:just|really|basically|actually|simply|quite|very|essentially|literally|generally)\b/gi
 const PLEASANTRIES_RE =
@@ -344,39 +343,6 @@ function compactHeadText(
   ].join('\n')
 }
 
-function normalizeTextBlock(text: string): string {
-  const stripped = text.replace(/\r\n/g, '\n').replace(ANSI_RE, '')
-  const lines = stripped.split('\n').map((line) => line.trimEnd())
-  const out: string[] = []
-  let blankRun = 0
-  let previous = ''
-  let repeatCount = 0
-  const flushRepeat = () => {
-    if (repeatCount > 1) out.push(`[previous line repeated ${repeatCount - 1} time(s)]`)
-    repeatCount = 0
-  }
-  for (const line of lines) {
-    if (!line.trim()) {
-      flushRepeat()
-      blankRun += 1
-      if (blankRun <= 2) out.push('')
-      previous = ''
-      continue
-    }
-    blankRun = 0
-    if (line === previous) {
-      repeatCount += 1
-      continue
-    }
-    flushRepeat()
-    out.push(line)
-    previous = line
-    repeatCount = 1
-  }
-  flushRepeat()
-  return out.join('\n').trim()
-}
-
 function splitLines(text: string): string[] {
   if (!text) return []
   return text.split('\n')
@@ -402,7 +368,7 @@ function fitLinesToBudget(lines: string[], maxLines: number, maxBytes: number): 
 function compactLine(line: string): string {
   if (line.length <= MAX_LINE_CHARS) return line.trim()
   const head = Math.floor(MAX_LINE_CHARS * 0.6)
-  const tail = MAX_LINE_CHARS - head - 5
+  const tail = Math.max(0, MAX_LINE_CHARS - head - 5)
   return `${line.slice(0, head).trimEnd()} ... ${line.slice(-tail).trimStart()}`
 }
 

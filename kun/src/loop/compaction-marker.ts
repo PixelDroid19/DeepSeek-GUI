@@ -61,6 +61,14 @@ function compactionDigestShape(item: TurnItem): unknown {
         sourceItemIds: item.sourceItemIds,
         replacedTokens: item.replacedTokens
       }
+    case 'review':
+      return {
+        kind: item.kind,
+        target: stableShape(item.target),
+        title: item.title,
+        reviewText: item.reviewText,
+        output: stableShape(item.output)
+      }
     case 'error':
       return {
         kind: item.kind,

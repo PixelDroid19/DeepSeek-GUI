@@ -1,4 +1,4 @@
-import { FileText, ListTodo, Loader2, Target } from 'lucide-react'
+import { FileText, ImagePlus, ListTodo, Loader2, Target } from 'lucide-react'
 import type { ReactElement, Ref } from 'react'
 import type { ComposerFileReference } from '../../lib/composer-file-references'
 import { formatComposerFileMentionToken } from '../../lib/composer-file-references'
@@ -78,23 +78,33 @@ export function FloatingComposerSlashMenu({
 }
 
 export function FloatingComposerOptionsMenu({
+  addImageLabel,
+  attachmentUploadBusy = false,
   canOpenGoalPanel,
+  canPickAttachment = false,
   canTogglePlanMode,
   goalChecked,
   mode,
   panelRef,
   planModeLabel,
   pursueGoalLabel,
+  showAddImage = false,
+  onAddImageClick,
   onGoalClick,
   onPlanClick
 }: {
+  addImageLabel?: string
+  attachmentUploadBusy?: boolean
   canOpenGoalPanel: boolean
+  canPickAttachment?: boolean
   canTogglePlanMode: boolean
   goalChecked: boolean
   mode: 'plan' | 'agent'
   panelRef?: Ref<HTMLDivElement>
   planModeLabel: string
   pursueGoalLabel: string
+  showAddImage?: boolean
+  onAddImageClick?: () => void
   onGoalClick: () => void
   onPlanClick: () => void
 }): ReactElement {
@@ -103,6 +113,21 @@ export function FloatingComposerOptionsMenu({
       ref={panelRef}
       className="absolute bottom-12 left-1 z-40 w-48 overflow-hidden rounded-[18px] border border-ds-border bg-white py-1.5 text-[13px] text-ds-muted shadow-[0_18px_48px_rgba(15,23,42,0.16)] dark:bg-ds-card"
     >
+      {showAddImage ? (
+        <button
+          type="button"
+          disabled={!canPickAttachment}
+          onClick={onAddImageClick}
+          className="ds-no-drag flex h-8 w-full items-center gap-2 px-3 text-left transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent disabled:hover:text-ds-muted"
+        >
+          {attachmentUploadBusy ? (
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" strokeWidth={1.9} />
+          ) : (
+            <ImagePlus className="h-3.5 w-3.5 shrink-0" strokeWidth={1.9} />
+          )}
+          <span className="min-w-0 flex-1 truncate">{addImageLabel}</span>
+        </button>
+      ) : null}
       <button
         type="button"
         disabled={!canTogglePlanMode}

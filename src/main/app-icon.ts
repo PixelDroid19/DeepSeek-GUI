@@ -27,6 +27,9 @@ export function resolveAppIconPath(source: string, baseDir: string = __dirname):
   // 但实际文件并不在 d:\chunks\...,而是在 main bundle 输出目录里。必须先把
   // 前导斜杠剥掉,再判断 absoluteness。Windows 风格的真绝对路径(带盘符或 UNC)
   // 不以斜杠开头,原样透传。
+  // 跨平台识别 Windows 真绝对路径(盘符或 UNC):在 macOS/Linux 上跑测试或
+  // 处理外部传入的 Windows 路径时,posix 的 isAbsolute 会判 false,导致错误 join。
+  if (/^(?:[A-Za-z]:[\\/]|\\\\)/.test(source)) return source
   const normalized = source.replace(/^\/+/, '')
   return isAbsolute(normalized) ? normalized : join(baseDir, normalized)
 }

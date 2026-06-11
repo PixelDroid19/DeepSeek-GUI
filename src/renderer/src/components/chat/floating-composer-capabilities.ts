@@ -40,11 +40,11 @@ export function resolveComposerCapabilityState(input: {
   showToolbarStartControls: boolean
   stretchModelPicker: boolean
 } {
-  const canEditComposer = input.runtimeReady && (
-    input.route === 'claw'
-      ? input.clawHasInboundConversation
-      : true
-  )
+  // Typing stays available while the runtime is still connecting so the user
+  // can draft; sending is gated separately through canCompose/canSend.
+  const canEditComposer = input.route === 'claw'
+    ? input.clawHasInboundConversation
+    : true
   const canCompose = input.runtimeReady && (
     input.route === 'claw'
       ? input.clawHasInboundConversation
@@ -55,7 +55,9 @@ export function resolveComposerCapabilityState(input: {
   const canTogglePlanMode = canCompose && input.hasPlanCommand
   const canOpenGoalPanel = canCompose && input.route !== 'claw'
   const canRunReview = canCompose && input.route !== 'claw' && input.hasReviewCommand
-  const canOpenComposerMenu = showComposerMenuButton && (canTogglePlanMode || canOpenGoalPanel || canRunReview)
+  const canPickAttachment = canCompose && input.attachmentUploadEnabled && !input.attachmentUploadBusy
+  const canOpenComposerMenu =
+    showComposerMenuButton && (canTogglePlanMode || canOpenGoalPanel || canRunReview || canPickAttachment)
   const showToolbarStartControls = input.attachmentUploadEnabled || showComposerMenuButton
   return {
     canEditComposer,
@@ -66,7 +68,7 @@ export function resolveComposerCapabilityState(input: {
       (input.attachmentUploadEnabled && input.attachmentCount > 0) ||
       (input.fileReferenceEnabled && input.fileReferenceCount > 0)
     ),
-    canPickAttachment: canCompose && input.attachmentUploadEnabled && !input.attachmentUploadBusy,
+    canPickAttachment,
     showIntentToolbar,
     showComposerMenuButton,
     canTogglePlanMode,
