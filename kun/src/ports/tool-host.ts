@@ -93,6 +93,7 @@ export type ToolCallLike = {
   callId: string
   toolName: string
   providerId?: string
+  providerKind?: ToolProviderKind
   toolKind?: 'tool_call' | 'command_execution' | 'file_change'
   arguments: Record<string, unknown>
 }

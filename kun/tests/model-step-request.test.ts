@@ -195,6 +195,7 @@ describe('model step request helpers', () => {
       callId: 'call_plan_1',
       latestUserMessageText: 'latest user request',
       providerId: 'provider_plan',
+      providerKind: 'gui',
       requiredToolName: CREATE_PLAN_TOOL_NAME,
       toolKind: 'tool_call',
       turnPrompt: 'turn prompt',
@@ -210,6 +211,7 @@ describe('model step request helpers', () => {
       callId: 'call_plan_1',
       toolName: CREATE_PLAN_TOOL_NAME,
       providerId: 'provider_plan',
+      providerKind: 'gui',
       toolKind: 'tool_call',
       arguments: {
         markdown: '# Plan\n\nDo it.',

@@ -23,6 +23,7 @@ import type { MemoryStore } from '../src/memory/memory-store.js'
 import type { TokenEconomyConfig } from '../src/loop/token-economy.js'
 import type { ToolStormBreakerOptions } from '../src/loop/tool-storm-breaker.js'
 import type { ContextCompactionConfig } from '../src/loop/model-context-profile.js'
+import type { ContextEngineRuntime } from '../src/context-engine/context-engine-runtime.js'
 
 export type Harness = {
   threadId: string
@@ -84,6 +85,7 @@ export function makeHarness(
     toolArgumentRepair?: {
       maxStringBytes?: number
     }
+    contextEngine?: ContextEngineRuntime
   } = {}
 ): Harness {
   const bus = new InMemoryEventBus()
@@ -137,7 +139,8 @@ export function makeHarness(
     ...(options.tokenEconomy ? { tokenEconomy: options.tokenEconomy } : {}),
     ...(options.contextCompaction ? { contextCompaction: options.contextCompaction } : {}),
     ...(options.toolStorm ? { toolStorm: options.toolStorm } : {}),
-    ...(options.toolArgumentRepair ? { toolArgumentRepair: options.toolArgumentRepair } : {})
+    ...(options.toolArgumentRepair ? { toolArgumentRepair: options.toolArgumentRepair } : {}),
+    ...(options.contextEngine ? { contextEngine: options.contextEngine } : {})
   })
 
   return {

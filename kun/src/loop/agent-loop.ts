@@ -14,12 +14,15 @@ import type { SessionStore } from '../ports/session-store.js'
 import type { ApprovalGate } from '../ports/approval-gate.js'
 import type { UserInputGate, UserInputResolution } from '../ports/user-input-gate.js'
 import type { UsageService } from '../services/usage-service.js'
+import type { UsageSnapshot } from '../contracts/usage.js'
 import type { TurnService } from '../services/turn-service.js'
 import type { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
 import type { PipelineStage } from '../contracts/events.js'
 import type { IdGenerator } from '../ports/id-generator.js'
 import type { ImmutablePrefix } from '../cache/immutable-prefix.js'
 import { ContextCompactor } from './context-compactor.js'
+import { parseCompactionExtraction } from './compaction-extraction.js'
+import type { ContextEngineRuntime } from '../context-engine/context-engine-runtime.js'
 import { InflightTracker } from './inflight-tracker.js'
 import { SteeringQueue } from './steering-queue.js'
 import {
@@ -172,6 +175,7 @@ export type AgentLoopOptions = {
   memoryStore?: MemoryStore
   tokenEconomy?: TokenEconomyConfig
   contextCompaction?: ContextCompactionConfig
+  contextEngine?: ContextEngineRuntime
   toolStorm?: ToolStormBreakerOptions & { enabled?: boolean }
   toolArgumentRepair?: {
     maxStringBytes?: number
@@ -254,6 +258,7 @@ export class AgentLoop {
   private readonly promptTokenPressure = new Map<string, { model: string; promptTokens: number }>()
   private readonly toolStormBreakers = new Map<string, ToolStormBreaker>()
   private readonly toolCatalogSnapshots = new Map<string, ToolCatalogSnapshot>()
+  private readonly turnTokenUsage = new Map<string, { inputTokens: number; outputTokens: number }>()
 
   constructor(opts: AgentLoopOptions) {
     this.opts = opts
@@ -286,9 +291,11 @@ export class AgentLoop {
       await this.recordPipelineStage(threadId, turnId, 'post_start')
       const status = await this.loop(threadId, turnId, signal)
       await this.opts.turns.finishTurn({ threadId, turnId, status })
+      await this.finishContextEngineTurn(threadId, turnId, status)
       return status
     } catch (error) {
       await this.failTurn(threadId, turnId, this.describeTurnFailure(threadId, turnId, error))
+      await this.finishContextEngineTurn(threadId, turnId, 'failed')
       return 'failed'
     } finally {
       await this.finishGoalElapsedTimer(threadId, goalTimer)
@@ -657,7 +664,7 @@ export class AgentLoop {
       planTurnActive,
       toolSpecs
     })
-    const history = await this.compactIfNeeded(items, model, signal, { threadId, turnId })
+    const history = await this.compactIfNeeded(items, model, signal, { threadId, turnId, workspace })
     if (signal.aborted) return { kind: 'aborted' }
     await this.recordPipelineStage(threadId, turnId, 'input_compressed', {
       historyItems: history.length
@@ -672,6 +679,13 @@ export class AgentLoop {
         : null,
       toolCatalogDriftMessage
     })
+    if (this.opts.contextEngine) {
+      if (stepIndex === 0) {
+        await this.opts.contextEngine.onTurnStart({ threadId, turnId, workspace })
+      }
+      const workspaceState = await this.opts.contextEngine.renderInjection(workspace)
+      if (workspaceState) contextInstructions.push(workspaceState)
+    }
     await this.recordPipelineStage(threadId, turnId, 'input_remembered', {
       memoryCount: memories.length,
       contextInstructionCount: contextInstructions.length
@@ -822,6 +836,7 @@ export class AgentLoop {
         }
         case 'usage': {
           this.recordPromptPressure(threadId, request.model, chunk.usage.promptTokens)
+          this.recordTurnTokenUsage(turnId, chunk.usage)
           const usage = this.opts.usage.record(threadId, chunk.usage)
           await this.opts.events.record({
             kind: 'usage',
@@ -872,6 +887,7 @@ export class AgentLoop {
       latestUserMessageText: latestUserMessageText(prepared.healedItems, turnId),
       turnPrompt: prepared.turnPrompt,
       providerId: provider?.providerId,
+      providerKind: provider?.providerKind,
       toolKind: prepared.toolKinds.get(CREATE_PLAN_TOOL_NAME)
     })
     if (!call) return null
@@ -1229,7 +1245,7 @@ export class AgentLoop {
     items: TurnItem[],
     model: string,
     signal: AbortSignal,
-    context: { threadId: string; turnId: string }
+    context: { threadId: string; turnId: string; workspace?: string }
   ): Promise<TurnItem[]> {
     const pressure = this.consumePromptPressure(context.threadId, model)
     const thresholdModel = pressure?.model || model
@@ -1265,6 +1281,7 @@ export class AgentLoop {
       })
       if (signal.aborted) return items
       if (modelSummary) {
+        const { summary, extraction } = parseCompactionExtraction(modelSummary)
         result = this.opts.compactor.compact({
           threadId,
           turnId,
@@ -1273,8 +1290,15 @@ export class AgentLoop {
           reason: plan.reason,
           mode: plan.mode,
           keepRecent: plan.keepRecent,
-          summaryOverride: modelSummary
+          summaryOverride: summary
         })
+        if (extraction && context.workspace && this.opts.contextEngine) {
+          await this.opts.contextEngine.onCompactionExtracted({
+            workspace: context.workspace,
+            sourceTurnId: turnId,
+            ...extraction
+          })
+        }
       }
     }
     // Persist the new compaction summary so the on-disk history
@@ -1354,6 +1378,29 @@ export class AgentLoop {
     const current = this.promptTokenPressure.get(threadId)
     if (current && current.promptTokens >= promptTokens) return
     this.promptTokenPressure.set(threadId, { model, promptTokens })
+  }
+
+  private recordTurnTokenUsage(turnId: string, usage: UsageSnapshot): void {
+    const current = this.turnTokenUsage.get(turnId) ?? { inputTokens: 0, outputTokens: 0 }
+    current.inputTokens += usage.promptTokens
+    current.outputTokens += usage.completionTokens
+    this.turnTokenUsage.set(turnId, current)
+  }
+
+  private async finishContextEngineTurn(
+    threadId: string,
+    turnId: string,
+    stopReason: string
+  ): Promise<void> {
+    const usage = this.turnTokenUsage.get(turnId)
+    this.turnTokenUsage.delete(turnId)
+    await this.opts.contextEngine?.onTurnFinished({
+      threadId,
+      turnId,
+      stopReason,
+      ...(usage && usage.inputTokens > 0 ? { inputTokens: usage.inputTokens } : {}),
+      ...(usage && usage.outputTokens > 0 ? { outputTokens: usage.outputTokens } : {})
+    })
   }
 
   private async recordToolCatalogDrift(input: {

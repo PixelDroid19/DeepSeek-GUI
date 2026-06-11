@@ -160,6 +160,15 @@ Shape:
     "summaryMaxTokens": 1200,
     "summaryInputMaxBytes": 98304
   },
+  "telemetry": {
+    "enabled": true,
+    "rotateBytes": 10485760,
+    "keepFiles": 3
+  },
+  "contextEngine": {
+    "enabled": true,
+    "injectionTokenBudget": 2000
+  },
   "models": {
     "profiles": {
       "deepseek-v4-pro": {
@@ -282,6 +291,8 @@ Settings page reads both routes.
   attachments/     # Image metadata + content blobs when enabled
   memory/          # Long-term memory records and tombstones when enabled
   child-runs/      # Delegated child run records when subagents are enabled
+  ledger/          # Per-workspace context-engine ledger ({workspaceHash}.json)
+  telemetry/       # Per-workspace tool/turn telemetry (JSONL, size-rotated)
   threads/
     index.json
     {threadId}/
@@ -296,6 +307,18 @@ Atomic JSON writes are used for `index.json`, `thread.json`, and
 `session.json`. JSONL streams are append-only and tolerate malformed
 lines (the next replay skips them). The renderer can re-read a
 thread by listing `index.json` and replaying the per-thread JSONL.
+
+`ledger/` and `telemetry/` are owned by the context engine
+(`contextEngine` / `telemetry` config sections). The ledger is a
+projection of runtime events (hot files, recent command errors, git
+state, decisions extracted during compaction) injected each turn as a
+budgeted `<workspace-state>` block; telemetry records every tool
+execution and per-turn outcome. Both directories are always safe to
+delete: the ledger degrades to empty and rebuilds from new sessions,
+and telemetry is expendable. Set `telemetry.enabled: false` to stop
+JSONL telemetry writes. Set `contextEngine.enabled: false` to skip
+`<workspace-state>` injection while continuing to project the ledger,
+which supports A/B measurement with the same runtime observations.
 
 ## HTTP API
 

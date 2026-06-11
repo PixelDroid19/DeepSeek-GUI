@@ -25,6 +25,7 @@ describe('model stream tool call helpers', () => {
         callId: 'call_1',
         toolName: 'read',
         providerId: 'local',
+        providerKind: 'built-in',
         toolKind: 'tool_call',
         arguments: { path: 'src/app.ts' }
       },

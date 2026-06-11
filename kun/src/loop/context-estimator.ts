@@ -1,5 +1,12 @@
 import type { TurnItem } from '../contracts/items.js'
 
+export const DEFAULT_CHARS_PER_TOKEN = 4
+
+export function estimateTextTokens(text?: string, charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
+  if (!text?.trim()) return 0
+  return Math.max(1, Math.ceil(text.length / charsPerToken))
+}
+
 /**
  * Very small token estimator. The estimator prefers reported usage
  * when available, otherwise approximates one token per ~4 characters of
@@ -10,13 +17,13 @@ import type { TurnItem } from '../contracts/items.js'
 export class ContextEstimator {
   private readonly charsPerToken: number
 
-  constructor(charsPerToken = 4) {
+  constructor(charsPerToken = DEFAULT_CHARS_PER_TOKEN) {
     this.charsPerToken = charsPerToken
   }
 
   estimateItem(item: TurnItem): number {
     const text = this.collectText(item)
-    return Math.max(1, Math.ceil(text.length / this.charsPerToken))
+    return Math.max(1, estimateTextTokens(text, this.charsPerToken))
   }
 
   estimateItems(items: TurnItem[]): number {

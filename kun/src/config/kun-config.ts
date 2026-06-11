@@ -154,6 +154,33 @@ export const TokenEconomyConfigSchema = z
   })
   .strict()
 
+export const TelemetryConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    dir: z.string().min(1).optional(),
+    rotateBytes: PositiveInt.default(10 * 1024 * 1024),
+    keepFiles: PositiveInt.default(3)
+  })
+  .strict()
+
+export const DEFAULT_TELEMETRY_CONFIG: TelemetryConfig = {
+  enabled: true,
+  rotateBytes: 10 * 1024 * 1024,
+  keepFiles: 3
+}
+
+export const ContextEngineConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    injectionTokenBudget: PositiveInt.default(2000)
+  })
+  .strict()
+
+export const DEFAULT_CONTEXT_ENGINE_CONFIG: ContextEngineConfig = {
+  enabled: true,
+  injectionTokenBudget: 2000
+}
+
 export const StorageConfigSchema = z
   .object({
     backend: z.enum(['hybrid', 'file']).default('hybrid'),
@@ -193,6 +220,8 @@ export const KunConfigSchema = z
     models: ModelConfigSchema.optional(),
     contextCompaction: ContextCompactionConfigSchema.optional(),
     runtime: RuntimeTuningConfigSchema.optional(),
+    telemetry: TelemetryConfigSchema.optional(),
+    contextEngine: ContextEngineConfigSchema.optional(),
     capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG)
   })
   .strict()
@@ -204,6 +233,8 @@ export type ContextCompactionConfig = z.infer<typeof ContextCompactionConfigSche
 export type RuntimeTuningConfig = z.infer<typeof RuntimeTuningConfigSchema>
 export type TokenEconomyConfig = z.infer<typeof TokenEconomyConfigSchema>
 export type StorageConfig = z.infer<typeof StorageConfigSchema>
+export type TelemetryConfig = z.infer<typeof TelemetryConfigSchema>
+export type ContextEngineConfig = z.infer<typeof ContextEngineConfigSchema>
 
 export type LoadedKunConfig = {
   path: string

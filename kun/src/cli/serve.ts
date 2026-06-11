@@ -135,6 +135,8 @@ export function parseServeOptions(
     },
     models: loadedConfig?.config.models,
     contextCompaction: loadedConfig?.config.contextCompaction,
+    telemetry: loadedConfig?.config.telemetry,
+    contextEngine: loadedConfig?.config.contextEngine,
     runtime: loadedConfig?.config.runtime,
     capabilities: loadedConfig?.config.capabilities ?? DEFAULT_SERVE_OPTIONS.capabilities
   }

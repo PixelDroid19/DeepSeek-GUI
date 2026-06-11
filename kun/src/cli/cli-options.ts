@@ -7,6 +7,8 @@ import {
 } from '../contracts/policy.js'
 import {
   ContextCompactionConfigSchema,
+  ContextEngineConfigSchema,
+  TelemetryConfigSchema,
   DEFAULT_KUN_MODEL,
   DEFAULT_STORAGE_CONFIG,
   ModelConfigSchema,
@@ -53,6 +55,8 @@ export const ServeOptionsSchema = z.object({
   storage: StorageConfigSchema.default(DEFAULT_STORAGE_CONFIG),
   models: ModelConfigSchema.optional(),
   contextCompaction: ContextCompactionConfigSchema.optional(),
+  telemetry: TelemetryConfigSchema.optional(),
+  contextEngine: ContextEngineConfigSchema.optional(),
   runtime: RuntimeTuningConfigSchema.optional(),
   capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG)
 })

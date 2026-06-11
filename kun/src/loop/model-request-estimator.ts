@@ -1,10 +1,12 @@
 import type { TurnItem } from '../contracts/items.js'
 import type { ModelRequest, ModelTextAttachmentFallback, ModelToolSpec } from '../ports/model-client.js'
-import { ContextEstimator } from './context-estimator.js'
+import {
+  ContextEstimator,
+  DEFAULT_CHARS_PER_TOKEN,
+  estimateTextTokens
+} from './context-estimator.js'
 
-const CHARS_PER_TOKEN = 4
-
-const estimator = new ContextEstimator(CHARS_PER_TOKEN)
+const estimator = new ContextEstimator(DEFAULT_CHARS_PER_TOKEN)
 
 export function estimateModelRequestInputTokens(request: ModelRequest): number {
   let tokens = 0
@@ -47,6 +49,5 @@ function estimateTextFallbacks(fallbacks?: ModelTextAttachmentFallback[]): numbe
 }
 
 function estimateText(text?: string): number {
-  if (!text?.trim()) return 0
-  return Math.max(1, Math.ceil(text.length / CHARS_PER_TOKEN))
+  return estimateTextTokens(text, DEFAULT_CHARS_PER_TOKEN)
 }

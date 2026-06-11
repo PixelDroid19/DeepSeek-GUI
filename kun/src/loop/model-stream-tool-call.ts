@@ -44,6 +44,7 @@ export function prepareCompletedStreamToolCall({
       callId,
       toolName,
       ...(provider?.providerId ? { providerId: provider.providerId } : {}),
+      ...(provider?.providerKind ? { providerKind: provider.providerKind } : {}),
       ...(toolKind ? { toolKind } : {}),
       arguments: repaired.arguments
     },

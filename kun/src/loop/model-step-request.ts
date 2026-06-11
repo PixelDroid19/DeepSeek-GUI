@@ -116,6 +116,7 @@ export function buildCreatePlanFallbackToolCall({
   callId,
   latestUserMessageText,
   providerId,
+  providerKind,
   requiredToolName,
   toolKind,
   turnPrompt
@@ -125,6 +126,7 @@ export function buildCreatePlanFallbackToolCall({
   callId: string
   latestUserMessageText: string
   providerId?: string
+  providerKind?: ToolCallLike['providerKind']
   requiredToolName?: string
   toolKind?: ToolCallLike['toolKind']
   turnPrompt?: string
@@ -155,6 +157,7 @@ export function buildCreatePlanFallbackToolCall({
     callId,
     toolName: CREATE_PLAN_TOOL_NAME,
     ...(providerId ? { providerId } : {}),
+    ...(providerKind ? { providerKind } : {}),
     ...(toolKind ? { toolKind } : {}),
     arguments: argumentsForFallback
   }

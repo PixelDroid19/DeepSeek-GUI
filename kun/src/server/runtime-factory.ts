@@ -29,6 +29,14 @@ import { AgentLoop } from '../loop/agent-loop.js'
 import { ContextCompactor } from '../loop/context-compactor.js'
 import type { TokenEconomyConfig } from '../loop/token-economy.js'
 import {
+  DEFAULT_CONTEXT_ENGINE_CONFIG,
+  DEFAULT_TELEMETRY_CONFIG,
+  type ContextEngineConfig,
+  type TelemetryConfig
+} from '../config/kun-config.js'
+import { ContextEngineRuntime } from '../context-engine/context-engine-runtime.js'
+import { TelemetryToolHost } from '../telemetry/telemetry-tool-host.js'
+import {
   modelCapabilitiesForModel,
   modelContextProfilesFromConfig,
   type ContextCompactionConfig,
@@ -78,6 +86,8 @@ export type KunServeRuntimeOptions = {
   insecure: boolean
   models?: ModelConfig
   contextCompaction?: ContextCompactionConfig
+  telemetry?: TelemetryConfig
+  contextEngine?: ContextEngineConfig
   runtime?: RuntimeTuningConfig
   storage?: StorageConfig
   capabilities?: KunCapabilitiesConfig
@@ -273,7 +283,19 @@ export async function createKunServeRuntime(
     },
     ...buildDelegationToolProviders(delegationRuntime)
   ])
-  const toolHost = new LocalToolHost({ registry, readTracker: true })
+  const telemetryConfig = { ...DEFAULT_TELEMETRY_CONFIG, ...(options.telemetry ?? {}) }
+  const contextEngineConfig = { ...DEFAULT_CONTEXT_ENGINE_CONFIG, ...(options.contextEngine ?? {}) }
+  const contextEngine = new ContextEngineRuntime({
+    dataDir: options.dataDir,
+    telemetry: telemetryConfig,
+    contextEngine: contextEngineConfig,
+    nowIso,
+    onWarning: (message) => console.warn(`[kun] ${message}`)
+  })
+  const localToolHost = new LocalToolHost({ registry, readTracker: true })
+  const toolHost = telemetryConfig.enabled || contextEngineConfig.enabled
+    ? new TelemetryToolHost(localToolHost, contextEngine)
+    : localToolHost
   const loop = new AgentLoop({
     threadStore,
     sessionStore,
@@ -294,6 +316,7 @@ export async function createKunServeRuntime(
     skillRuntime,
     tokenEconomy,
     contextCompaction: options.contextCompaction,
+    contextEngine,
     ...(options.runtime?.toolStorm ? { toolStorm: options.runtime.toolStorm } : {}),
     ...(options.runtime?.toolArgumentRepair ? { toolArgumentRepair: options.runtime.toolArgumentRepair } : {}),
     ...(attachmentStore ? { attachmentStore } : {}),
