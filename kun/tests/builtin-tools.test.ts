@@ -118,7 +118,7 @@ describe('Kun built-in tools', () => {
       }
     })
 
-    let seenInput: { questions: Array<{ options: Array<{ label: string; description: string }> }> } | null = null
+    const seenInputs: Array<{ questions: Array<{ options: Array<{ label: string; description: string }> }> }> = []
     const result = await host.execute(
       {
         callId: 'call_input',
@@ -132,7 +132,7 @@ describe('Kun built-in tools', () => {
       {
         ...buildContext(workspace),
         awaitUserInput: async (input) => {
-          seenInput = input
+          seenInputs.push(input)
           return {
             status: 'submitted',
             answers: [{ id: input.questions[0]?.id ?? 'choice', label: 'South', value: 'South' }]
@@ -141,7 +141,7 @@ describe('Kun built-in tools', () => {
       }
     )
 
-    expect(seenInput?.questions[0]?.options).toEqual([
+    expect(seenInputs[0]?.questions[0]?.options).toEqual([
       { label: 'South', description: '' },
       { label: 'North', description: 'Cooler weather' }
     ])

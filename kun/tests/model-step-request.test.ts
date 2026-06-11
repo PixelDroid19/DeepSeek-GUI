@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { CREATE_PLAN_TOOL_NAME } from '../src/adapters/tool/create-plan-tool.js'
-import type { TurnItem } from '../src/contracts/items.js'
+import type { ToolResultTurnItem, TurnItem } from '../src/contracts/items.js'
 import type { ModelInputAttachment, ModelTextAttachmentFallback, ModelToolSpec } from '../src/ports/model-client.js'
 import {
   buildCreatePlanFallbackToolCall,
@@ -22,21 +22,22 @@ function tool(name: string): ModelToolSpec {
 
 describe('model step request helpers', () => {
   it('detects whether a plan turn already produced a successful create_plan result', () => {
+    const firstResult: ToolResultTurnItem = {
+      id: 'item_1',
+      turnId: 'turn_1',
+      threadId: 'thread_1',
+      role: 'tool',
+      status: 'completed',
+      createdAt: '2026-06-06T00:00:00.000Z',
+      kind: 'tool_result',
+      callId: 'call_1',
+      toolName: CREATE_PLAN_TOOL_NAME,
+      toolKind: 'tool_call',
+      output: { ok: true },
+      isError: false
+    }
     const items: TurnItem[] = [
-      {
-        id: 'item_1',
-        turnId: 'turn_1',
-        threadId: 'thread_1',
-        role: 'tool',
-        status: 'completed',
-        createdAt: '2026-06-06T00:00:00.000Z',
-        kind: 'tool_result',
-        callId: 'call_1',
-        toolName: CREATE_PLAN_TOOL_NAME,
-        toolKind: 'tool_call',
-        output: { ok: true },
-        isError: false
-      },
+      firstResult,
       {
         id: 'item_2',
         turnId: 'turn_2',
@@ -57,11 +58,11 @@ describe('model step request helpers', () => {
     expect(hasSuccessfulCreatePlanResult(items, 'turn_2')).toBe(true)
     expect(hasSuccessfulCreatePlanResult(items, 'turn_missing')).toBe(false)
     expect(hasSuccessfulCreatePlanResult([{
-      ...items[0]!,
+      ...firstResult,
       isError: true
     }], 'turn_1')).toBe(false)
     expect(hasSuccessfulCreatePlanResult([{
-      ...items[0]!,
+      ...firstResult,
       status: 'failed'
     }], 'turn_1')).toBe(false)
   })
