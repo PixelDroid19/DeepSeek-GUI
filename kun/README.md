@@ -67,6 +67,7 @@ Run from the `kun/` directory.
 | `--model` | Default model id | `deepseek-v4-pro` |
 | `--approval-policy` | `on-request` \| `untrusted` \| `never` \| `auto` \| `suggest` | `auto` |
 | `--sandbox-mode` | `read-only` \| `workspace-write` \| `danger-full-access` \| `external-sandbox` | `workspace-write` |
+| `--allow-risky-actions` | Headless `run`/`exec`: auto-allow L3 actions; L4 remains denied | off |
 | `--insecure` | Disable bearer token check (local dev only) | off |
 
 Example:
@@ -95,6 +96,7 @@ kun exec --data-dir ~/.deepseekgui/kun --workspace "$PWD" read --args '{"path":"
 - `kun chat` starts a line-oriented REPL. Use `/exit`, `/quit`, or an empty line to stop.
 - `kun exec --list-tools` prints the effective dynamic tool registry for the chosen config/workspace.
 - `kun exec <tool> --args <json>` invokes one tool directly. Use `--json` on `run` or `exec` for machine-readable output.
+- Headless approvals are conservative: unknown L2 commands and L4 commands are denied instead of blocking forever. Use `--allow-risky-actions` only when a non-interactive run is expected to perform L3 work such as network access or installs.
 
 ## Environment variables
 
@@ -168,6 +170,12 @@ Shape:
   "contextEngine": {
     "enabled": true,
     "injectionTokenBudget": 2000
+  },
+  "memory": {
+    "autoFormation": true
+  },
+  "actionLevels": {
+    "enabled": true
   },
   "models": {
     "profiles": {
@@ -293,6 +301,7 @@ Settings page reads both routes.
   child-runs/      # Delegated child run records when subagents are enabled
   ledger/          # Per-workspace context-engine ledger ({workspaceHash}.json)
   telemetry/       # Per-workspace tool/turn telemetry (JSONL, size-rotated)
+  allowlist/       # Per-workspace remembered L2/L3 command patterns
   threads/
     index.json
     {threadId}/
@@ -319,6 +328,31 @@ and telemetry is expendable. Set `telemetry.enabled: false` to stop
 JSONL telemetry writes. Set `contextEngine.enabled: false` to skip
 `<workspace-state>` injection while continuing to project the ledger,
 which supports A/B measurement with the same runtime observations.
+
+Memory records may include provenance and freshness metadata:
+`provenance.kind` is `verified-by-command`, `observed-in-file`,
+`user-stated`, or `model-inferred`; optional evidence can record
+`command`, `file`, `commit`, and `branch`, plus `verifiedAt`.
+`ttl.expiresAt` excludes old records from retrieval, and
+`ttl.staleWhen` can mark a record stale when its evidence file changes
+or when git observes a different branch. Stale records stay on disk
+with `staleAt` for review, but they are not injected. Evidence-less
+model-inferred records are capped at confidence `0.5` and render as
+unverified hypotheses.
+
+When `memory.autoFormation` is true, structured compaction extracts can
+form workspace memories: decisions become low-confidence hypotheses,
+and resolved-error entries become command-verified memories. Formation
+is capped per compaction and deduplicated by normalized content.
+
+Action levels classify each tool call before execution: L0 read, L1
+workspace edit, L2 local execution, L3 network/install/delegation, and
+L4 destructive/credentials/publish. `actionLevels.enabled: false`
+restores the pre-change level-gating behavior. L2/L3 command approvals
+can be remembered per workspace in `allowlist/`; L4 actions are never
+allow-listable. The default sandbox mode is now `workspace-write`
+(breaking for CLI users who relied on the old implicit
+`danger-full-access`; set it explicitly to keep that behavior).
 
 ## HTTP API
 

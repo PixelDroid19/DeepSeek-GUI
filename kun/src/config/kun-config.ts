@@ -181,6 +181,26 @@ export const DEFAULT_CONTEXT_ENGINE_CONFIG: ContextEngineConfig = {
   injectionTokenBudget: 2000
 }
 
+export const MemoryConfigSchema = z
+  .object({
+    autoFormation: z.boolean().default(true)
+  })
+  .strict()
+
+export const DEFAULT_MEMORY_CONFIG: MemoryConfig = {
+  autoFormation: true
+}
+
+export const ActionLevelsConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true)
+  })
+  .strict()
+
+export const DEFAULT_ACTION_LEVELS_CONFIG: ActionLevelsConfig = {
+  enabled: true
+}
+
 export const StorageConfigSchema = z
   .object({
     backend: z.enum(['hybrid', 'file']).default('hybrid'),
@@ -222,6 +242,8 @@ export const KunConfigSchema = z
     runtime: RuntimeTuningConfigSchema.optional(),
     telemetry: TelemetryConfigSchema.optional(),
     contextEngine: ContextEngineConfigSchema.optional(),
+    memory: MemoryConfigSchema.optional(),
+    actionLevels: ActionLevelsConfigSchema.optional(),
     capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG)
   })
   .strict()
@@ -235,6 +257,8 @@ export type TokenEconomyConfig = z.infer<typeof TokenEconomyConfigSchema>
 export type StorageConfig = z.infer<typeof StorageConfigSchema>
 export type TelemetryConfig = z.infer<typeof TelemetryConfigSchema>
 export type ContextEngineConfig = z.infer<typeof ContextEngineConfigSchema>
+export type MemoryConfig = z.infer<typeof MemoryConfigSchema>
+export type ActionLevelsConfig = z.infer<typeof ActionLevelsConfigSchema>
 
 export type LoadedKunConfig = {
   path: string

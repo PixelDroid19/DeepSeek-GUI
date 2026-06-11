@@ -110,7 +110,10 @@ describe('InMemorySessionStore', () => {
 
 describe('LocalToolHost', () => {
   it('runs an auto tool without approval', async () => {
-    const host = new LocalToolHost({ tools: defaultLocalTools })
+    const host = new LocalToolHost({
+      tools: defaultLocalTools,
+      actionLevels: { enabled: false }
+    })
     const result = await host.execute(
       { callId: 'c1', toolName: 'echo', arguments: { text: 'hi' } },
       {

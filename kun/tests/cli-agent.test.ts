@@ -171,6 +171,49 @@ describe('Kun agent CLI commands', () => {
     expect(item.output.echoed).toBe('hi')
   })
 
+  it('requires an explicit headless flag before kun exec allows L3 actions', async () => {
+    const toolHost = new LocalToolHost({
+      tools: [
+        LocalToolHost.defineTool({
+          name: 'bash',
+          toolKind: 'command_execution',
+          policy: 'auto',
+          description: 'fake bash',
+          inputSchema: { type: 'object', properties: {} },
+          execute: async () => ({ output: { ok: true } })
+        })
+      ]
+    })
+    const denied = capture({ createRuntime: fakeRuntime({ toolHost }) })
+    const deniedCode = await runAgentCommand('exec', [
+      '--data-dir',
+      dataDir,
+      '--workspace',
+      dataDir,
+      'bash',
+      '--args',
+      '{"command":"curl https://example.test"}',
+      '--json'
+    ], denied.io)
+    expect(deniedCode).toBe(ServeExitCode.ok)
+    expect(JSON.parse(denied.stdout)).toMatchObject({ kind: 'approval', status: 'pending' })
+
+    const allowed = capture({ createRuntime: fakeRuntime({ toolHost }) })
+    const allowedCode = await runAgentCommand('exec', [
+      '--data-dir',
+      dataDir,
+      '--workspace',
+      dataDir,
+      '--allow-risky-actions',
+      'bash',
+      '--args',
+      '{"command":"curl https://example.test"}',
+      '--json'
+    ], allowed.io)
+    expect(allowedCode).toBe(ServeExitCode.ok)
+    expect(JSON.parse(allowed.stdout)).toMatchObject({ kind: 'tool_result', output: { ok: true } })
+  })
+
   it('lists dynamic runtime tools from kun exec', async () => {
     const webTool = LocalToolHost.defineTool({
       name: 'web_fetch',

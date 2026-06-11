@@ -1,5 +1,5 @@
 import type { ApprovalPolicy } from '../contracts/policy.js'
-import type { ApprovalRequest } from '../domain/approval.js'
+import type { ApprovalRequest, ApprovalResolution } from '../domain/approval.js'
 import type { TurnItem } from '../contracts/items.js'
 import type { ModelCapabilityMetadata } from '../contracts/capabilities.js'
 import type {
@@ -82,7 +82,7 @@ export type ToolHostContext = {
   approvalPolicy: ApprovalPolicy
   abortSignal: AbortSignal
   /** Resolves a pending approval with the user's decision. */
-  awaitApproval: (approval: ApprovalRequest) => Promise<'allow' | 'deny'>
+  awaitApproval: (approval: ApprovalRequest) => Promise<ApprovalResolution>
   /** Resolves structured GUI input requested by a tool call. */
   awaitUserInput?: (
     input: Omit<UserInputRequest, 'threadId' | 'turnId'>

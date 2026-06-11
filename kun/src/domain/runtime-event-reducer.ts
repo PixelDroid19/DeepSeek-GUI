@@ -303,6 +303,8 @@ function upsertApprovalFromEvent(
         toolName: event.toolName,
         summary: event.summary ?? '',
         status,
+        ...(event.actionLevel !== undefined ? { actionLevel: event.actionLevel } : {}),
+        ...(event.actionReason ? { actionReason: event.actionReason } : {}),
         ...(status !== 'pending' ? { finishedAt: event.timestamp } : {})
       }
   upsertItem(projection, item, 'replace')

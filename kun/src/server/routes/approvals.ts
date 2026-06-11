@@ -28,7 +28,12 @@ export async function decideApproval(input: {
   if (!approval) {
     return ERRORS.notFound(`approval not found: ${input.approvalId}`)
   }
-  const ok = input.gate.decide(input.approvalId, parsed.data.decision, parsed.data.reason)
+  const ok = input.gate.decide(
+    input.approvalId,
+    parsed.data.decision,
+    parsed.data.reason,
+    parsed.data.rememberPattern
+  )
   if (!ok) {
     return ERRORS.conflict(`approval already decided: ${input.approvalId}`)
   }
@@ -45,7 +50,9 @@ export async function decideApproval(input: {
     approvalId: input.approvalId,
     toolName: approval.toolName,
     status: response.status,
-    summary: approval.summary
+    summary: approval.summary,
+    ...(approval.actionLevel !== undefined ? { actionLevel: approval.actionLevel } : {}),
+    ...(approval.actionReason ? { actionReason: approval.actionReason } : {})
   })
   return jsonResponse(response)
 }

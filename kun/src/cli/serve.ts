@@ -137,6 +137,8 @@ export function parseServeOptions(
     contextCompaction: loadedConfig?.config.contextCompaction,
     telemetry: loadedConfig?.config.telemetry,
     contextEngine: loadedConfig?.config.contextEngine,
+    memory: loadedConfig?.config.memory,
+    actionLevels: loadedConfig?.config.actionLevels,
     runtime: loadedConfig?.config.runtime,
     capabilities: loadedConfig?.config.capabilities ?? DEFAULT_SERVE_OPTIONS.capabilities
   }

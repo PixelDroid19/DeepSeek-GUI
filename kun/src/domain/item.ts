@@ -134,6 +134,8 @@ export function makeApprovalItem(input: {
   approvalId: string
   toolName: string
   summary: string
+  actionLevel?: number
+  actionReason?: string
 }): TurnItem {
   return {
     id: input.id,
@@ -145,7 +147,9 @@ export function makeApprovalItem(input: {
     approvalId: input.approvalId,
     toolName: input.toolName,
     summary: input.summary,
-    status: 'pending'
+    status: 'pending',
+    ...(input.actionLevel !== undefined ? { actionLevel: input.actionLevel } : {}),
+    ...(input.actionReason ? { actionReason: input.actionReason } : {})
   }
 }
 

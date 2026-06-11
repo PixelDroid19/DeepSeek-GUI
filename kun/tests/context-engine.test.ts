@@ -16,9 +16,11 @@ import { extractToolTarget, normalizeCommand } from '../src/telemetry/target-nor
 import type { ToolHost, ToolHostContext } from '../src/ports/tool-host.js'
 import {
   DEFAULT_CONTEXT_ENGINE_CONFIG,
+  DEFAULT_MEMORY_CONFIG,
   DEFAULT_TELEMETRY_CONFIG,
   KunConfigSchema
 } from '../src/config/kun-config.js'
+import { FileMemoryStore, type MemoryStore } from '../src/memory/memory-store.js'
 
 const tempDirs: string[] = []
 function tempDir(): string {
@@ -431,5 +433,141 @@ describe('context engine runtime safety', () => {
     expect(persisted).not.toContain('exposed')
     expect(persisted).not.toContain('abc123')
     expect(persisted).not.toContain('hidden')
+  })
+
+  it('marks matching file-evidence memories stale from tool ledger events', async () => {
+    const dataDir = tempDir()
+    const workspace = tempDir()
+    const memory = new FileMemoryStore({
+      rootDir: join(dataDir, 'memory'),
+      config: { enabled: true, scopes: ['workspace'], maxInjectedRecords: 8 },
+      nowIso: () => AT,
+      idGenerator: () => 'mem_1'
+    })
+    await memory.create({
+      content: 'Config lives in src/config.ts',
+      scope: 'workspace',
+      workspace,
+      provenance: {
+        kind: 'observed-in-file',
+        evidence: { file: 'src/config.ts' },
+        verifiedAt: AT
+      },
+      ttl: { staleWhen: 'file-changes' }
+    })
+    const runtime = new ContextEngineRuntime({
+      dataDir,
+      telemetry: DEFAULT_TELEMETRY_CONFIG,
+      contextEngine: DEFAULT_CONTEXT_ENGINE_CONFIG,
+      memory: DEFAULT_MEMORY_CONFIG,
+      memoryStore: memory,
+      nowIso: () => '2026-06-12T00:00:00.000Z'
+    })
+
+    runtime.onToolExecution({
+      workspace,
+      toolKind: 'file_change',
+      record: {
+        type: 'tool-execution',
+        tool: 'write',
+        target: 'src/config.ts',
+        threadId: 'thread_1',
+        turnId: 'turn_1',
+        startedAt: AT,
+        durationMs: 1,
+        isError: false
+      }
+    })
+    await runtime.flush()
+
+    expect((await memory.list({ workspace }))[0].staleAt).toBe('2026-06-12T00:00:00.000Z')
+  })
+
+  it('forms memories from compaction extracts and honors the auto-formation flag', async () => {
+    const dataDir = tempDir()
+    const workspace = tempDir()
+    const memory = new FileMemoryStore({
+      rootDir: join(dataDir, 'memory'),
+      config: { enabled: true, scopes: ['workspace'], maxInjectedRecords: 8 },
+      nowIso: () => AT,
+      idGenerator: () => `mem_${Math.random().toString(36).slice(2, 8)}`
+    })
+    const runtime = new ContextEngineRuntime({
+      dataDir,
+      telemetry: DEFAULT_TELEMETRY_CONFIG,
+      contextEngine: DEFAULT_CONTEXT_ENGINE_CONFIG,
+      memory: DEFAULT_MEMORY_CONFIG,
+      memoryStore: memory,
+      nowIso: () => AT
+    })
+
+    await runtime.onCompactionExtracted({
+      workspace,
+      sourceThreadId: 'thread_1',
+      sourceTurnId: 'turn_9',
+      decisions: ['use Zod for contracts'],
+      filesTouched: [],
+      errorsResolved: ['npm test fixed missing mock'],
+      pending: []
+    })
+    expect((await memory.list({ workspace })).map((item) => item.provenance?.kind).sort()).toEqual([
+      'model-inferred',
+      'verified-by-command'
+    ])
+
+    const disabled = new ContextEngineRuntime({
+      dataDir: tempDir(),
+      telemetry: DEFAULT_TELEMETRY_CONFIG,
+      contextEngine: DEFAULT_CONTEXT_ENGINE_CONFIG,
+      memory: { autoFormation: false },
+      memoryStore: memory,
+      nowIso: () => AT
+    })
+    await disabled.onCompactionExtracted({
+      workspace,
+      sourceThreadId: 'thread_1',
+      sourceTurnId: 'turn_10',
+      decisions: ['another decision'],
+      filesTouched: [],
+      errorsResolved: [],
+      pending: []
+    })
+    expect(await memory.list({ workspace })).toHaveLength(2)
+  })
+
+  it('swallows memory formation failures', async () => {
+    const failingStore: MemoryStore = {
+      create: async () => { throw new Error('write failed') },
+      update: async () => { throw new Error('not used') },
+      markStale: async () => { throw new Error('not used') },
+      delete: async () => { throw new Error('not used') },
+      list: async () => [],
+      retrieve: async () => [],
+      diagnostics: async () => ({
+        enabled: true,
+        rootDir: '/tmp/memory',
+        activeCount: 0,
+        tombstoneCount: 0,
+        lastInjectedIds: []
+      }),
+      setLastInjected: () => undefined
+    }
+    const runtime = new ContextEngineRuntime({
+      dataDir: tempDir(),
+      telemetry: DEFAULT_TELEMETRY_CONFIG,
+      contextEngine: DEFAULT_CONTEXT_ENGINE_CONFIG,
+      memory: DEFAULT_MEMORY_CONFIG,
+      memoryStore: failingStore,
+      nowIso: () => AT
+    })
+    await expect(runtime.onCompactionExtracted({
+      workspace: tempDir(),
+      sourceThreadId: 'thread_1',
+      sourceTurnId: 'turn_1',
+      decisions: ['decision'],
+      filesTouched: [],
+      errorsResolved: [],
+      pending: []
+    })).resolves.toBeUndefined()
   })
 })

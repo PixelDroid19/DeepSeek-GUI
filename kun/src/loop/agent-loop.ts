@@ -1295,6 +1295,7 @@ export class AgentLoop {
         if (extraction && context.workspace && this.opts.contextEngine) {
           await this.opts.contextEngine.onCompactionExtracted({
             workspace: context.workspace,
+            sourceThreadId: threadId,
             sourceTurnId: turnId,
             ...extraction
           })

@@ -1,4 +1,4 @@
-import type { ApprovalRequest } from '../domain/approval.js'
+import type { ApprovalRequest, ApprovalResolution } from '../domain/approval.js'
 
 /**
  * Port for the approval flow used by tool execution. The local gate
@@ -7,8 +7,8 @@ import type { ApprovalRequest } from '../domain/approval.js'
  * proceeding with a tool call.
  */
 export interface ApprovalGate {
-  request(approval: ApprovalRequest): Promise<'allow' | 'deny'>
-  decide(approvalId: string, decision: 'allow' | 'deny', reason?: string): boolean
+  request(approval: ApprovalRequest): Promise<ApprovalResolution>
+  decide(approvalId: string, decision: 'allow' | 'deny', reason?: string, rememberPattern?: boolean): boolean
   pending(threadId?: string): ApprovalRequest[]
   get(approvalId: string): ApprovalRequest | undefined
 }

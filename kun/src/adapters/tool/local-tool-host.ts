@@ -5,7 +5,7 @@ import type {
   ToolCallLike,
   ToolExecutionUpdate
 } from '../../ports/tool-host.js'
-import type { ApprovalRequest } from '../../domain/approval.js'
+import type { ApprovalRequest, ApprovalResolution } from '../../domain/approval.js'
 import { createApprovalRequest } from '../../domain/approval.js'
 import type { TurnItem } from '../../contracts/items.js'
 import { makeToolResultItem, makeApprovalItem } from '../../domain/item.js'
@@ -25,6 +25,11 @@ import {
   ReadTracker,
   type ReadTrackerOptions
 } from './read-tracker.js'
+import {
+  classifyAction,
+  type RuntimeActionClassification
+} from './action-classifier.js'
+import { WorkspaceAllowlistStore } from './workspace-allowlist-store.js'
 
 /**
  * A single registered tool. Tools are pure functions that observe the
@@ -64,6 +69,8 @@ export type LocalToolHostOptions = {
   hooks?: readonly ResolvedToolHook[]
   /** Runtime read-before-edit guard. Disabled by default for direct unit use. */
   readTracker?: boolean | ReadTrackerOptions
+  actionLevels?: { enabled?: boolean }
+  workspaceAllowlist?: WorkspaceAllowlistStore
 }
 
 /**
@@ -86,12 +93,16 @@ export class LocalToolHost implements ToolHost {
   private readonly allowList: Set<string>
   private readonly hooks: readonly ResolvedToolHook[]
   private readonly readTracker: ReadTracker
+  private readonly actionLevelsEnabled: boolean
+  private readonly workspaceAllowlist?: WorkspaceAllowlistStore
 
   constructor(options: LocalToolHostOptions) {
     this.registry = options.registry ?? CapabilityRegistry.fromLocalTools(options.tools ?? [])
     this.allowList = new Set(options.allowList ?? [])
     this.hooks = options.hooks ?? []
     this.readTracker = new ReadTracker(normalizeReadTrackerOptions(options.readTracker))
+    this.actionLevelsEnabled = options.actionLevels?.enabled !== false
+    this.workspaceAllowlist = options.workspaceAllowlist
   }
 
   listTools(context?: ToolHostContext) {
@@ -157,7 +168,12 @@ export class LocalToolHost implements ToolHost {
         approved: false
       }
     }
-    const needsApproval = this.requiresApproval(tool, activeCall, context)
+    const classification = classifyAction({
+      ...activeCall,
+      toolKind: activeCall.toolKind ?? tool.toolKind
+    }, context)
+    const levelApproval = await this.requiresActionLevelApproval(classification, context)
+    const needsApproval = levelApproval || this.requiresApproval(tool, activeCall, context)
     if (needsApproval) {
       const approvalId = `appr_${activeCall.callId}`
       const approval: ApprovalRequest = createApprovalRequest({
@@ -165,19 +181,31 @@ export class LocalToolHost implements ToolHost {
         threadId: context.threadId,
         turnId: context.turnId,
         toolName: activeCall.toolName,
-        summary: this.buildApprovalSummary(activeCall)
+        summary: this.buildApprovalSummary(activeCall, classification),
+        actionLevel: classification.level,
+        actionReason: classification.reason
       })
-      const decision = await context.awaitApproval(approval)
-      if (decision !== 'allow') {
+      const resolution = await context.awaitApproval(approval)
+      const normalizedDecision = normalizeApprovalResolution(resolution)
+      if (normalizedDecision.decision !== 'allow') {
         const item = makeApprovalItem({
           id: `item_${approvalId}`,
           turnId: context.turnId,
           threadId: context.threadId,
           approvalId,
           toolName: activeCall.toolName,
-          summary: approval.summary
+          summary: approval.summary,
+          actionLevel: classification.level,
+          actionReason: classification.reason
         })
         return { item, approved: false }
+      }
+      if (normalizedDecision.rememberPattern && classification.normalizedCommand && classification.level < 4) {
+        await this.workspaceAllowlist?.remember(
+          context.workspace,
+          classification.normalizedCommand,
+          classification.level
+        )
       }
     }
     if (context.abortSignal.aborted) {
@@ -267,15 +295,37 @@ export class LocalToolHost implements ToolHost {
     }
   }
 
+  private async requiresActionLevelApproval(
+    classification: RuntimeActionClassification,
+    context: ToolHostContext
+  ): Promise<boolean> {
+    if (!this.actionLevelsEnabled) return false
+    if (classification.level <= 1) return false
+    if (classification.level === 4) return true
+    if (classification.level === 2 && classification.knownSafe) return false
+    if (classification.normalizedCommand && this.workspaceAllowlist) {
+      const allowed = await this.workspaceAllowlist.isAllowed(
+        context.workspace,
+        classification.normalizedCommand,
+        classification.level
+      )
+      if (allowed) return false
+    }
+    return true
+  }
+
   private isInteractiveGuiGateTool(toolName: string): boolean {
     return toolName === 'user_input' || toolName === 'request_user_input'
   }
 
-  private buildApprovalSummary(call: ToolCallLike): string {
+  private buildApprovalSummary(call: ToolCallLike, classification?: RuntimeActionClassification): string {
     const args = Object.entries(call.arguments)
       .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
       .join(', ')
-    return `Run ${call.toolName}(${args})`
+    const level = classification
+      ? ` [L${classification.level}: ${classification.reason}]`
+      : ''
+    return `Run ${call.toolName}(${args})${level}`
   }
 
   private errorToolResult(
@@ -331,6 +381,12 @@ function hookContext(
 function hookErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error)
   return `tool hook failed: ${message}`
+}
+
+function normalizeApprovalResolution(
+  resolution: ApprovalResolution
+): { decision: 'allow' | 'deny'; rememberPattern?: boolean } {
+  return typeof resolution === 'string' ? { decision: resolution } : resolution
 }
 
 /**

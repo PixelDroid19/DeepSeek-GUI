@@ -1,4 +1,8 @@
 export type ApprovalStatus = 'pending' | 'allowed' | 'denied' | 'expired'
+export type ApprovalDecision = 'allow' | 'deny'
+export type ApprovalResolution =
+  | ApprovalDecision
+  | { decision: ApprovalDecision; rememberPattern?: boolean }
 
 /**
  * A pending approval request surfaced by the loop. The runtime stores
@@ -16,6 +20,8 @@ export type ApprovalRequest = {
   createdAt: string
   decidedAt?: string
   reason?: string
+  actionLevel?: number
+  actionReason?: string
 }
 
 export function createApprovalRequest(input: {
@@ -24,6 +30,8 @@ export function createApprovalRequest(input: {
   turnId: string
   toolName: string
   summary: string
+  actionLevel?: number
+  actionReason?: string
   createdAt?: string
 }): ApprovalRequest {
   return {
@@ -33,7 +41,9 @@ export function createApprovalRequest(input: {
     toolName: input.toolName,
     summary: input.summary,
     status: 'pending',
-    createdAt: input.createdAt ?? new Date().toISOString()
+    createdAt: input.createdAt ?? new Date().toISOString(),
+    ...(input.actionLevel !== undefined ? { actionLevel: input.actionLevel } : {}),
+    ...(input.actionReason ? { actionReason: input.actionReason } : {})
   }
 }
 

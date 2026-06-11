@@ -6,8 +6,10 @@ import {
   SandboxModeSchema
 } from '../contracts/policy.js'
 import {
+  ActionLevelsConfigSchema,
   ContextCompactionConfigSchema,
   ContextEngineConfigSchema,
+  MemoryConfigSchema,
   TelemetryConfigSchema,
   DEFAULT_KUN_MODEL,
   DEFAULT_STORAGE_CONFIG,
@@ -57,6 +59,8 @@ export const ServeOptionsSchema = z.object({
   contextCompaction: ContextCompactionConfigSchema.optional(),
   telemetry: TelemetryConfigSchema.optional(),
   contextEngine: ContextEngineConfigSchema.optional(),
+  memory: MemoryConfigSchema.optional(),
+  actionLevels: ActionLevelsConfigSchema.optional(),
   runtime: RuntimeTuningConfigSchema.optional(),
   capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG)
 })

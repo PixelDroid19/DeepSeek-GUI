@@ -118,7 +118,9 @@ export const ApprovalEvent = RuntimeEventBase.extend({
   approvalId: z.string().min(1),
   toolName: z.string().min(1),
   status: z.enum(['pending', 'allowed', 'denied', 'expired']),
-  summary: z.string().optional()
+  summary: z.string().optional(),
+  actionLevel: z.number().int().min(0).max(4).optional(),
+  actionReason: z.string().optional()
 })
 export type ApprovalEvent = z.infer<typeof ApprovalEvent>
 

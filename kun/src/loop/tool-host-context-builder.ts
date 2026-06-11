@@ -1,6 +1,6 @@
 import type { ModelCapabilityMetadata } from '../contracts/capabilities.js'
 import type { ApprovalPolicy } from '../contracts/policy.js'
-import type { ApprovalRequest } from '../domain/approval.js'
+import type { ApprovalRequest, ApprovalResolution } from '../domain/approval.js'
 import type { GuiPlanContext, ToolHostContext } from '../ports/tool-host.js'
 import type {
   UserInputRequest,
@@ -36,7 +36,7 @@ export function buildToolHostContext({
   signal: AbortSignal
   memoryEnabled: boolean
   recordEvent: (event: RuntimeEventDraft) => Promise<unknown>
-  requestApproval: (approval: ApprovalRequest) => Promise<'allow' | 'deny'>
+  requestApproval: (approval: ApprovalRequest) => Promise<ApprovalResolution>
   requestUserInput: (
     input: Omit<UserInputRequest, 'threadId' | 'turnId'>
   ) => Promise<UserInputResolution>
@@ -62,7 +62,9 @@ export function buildToolHostContext({
         approvalId: approval.id,
         toolName: approval.toolName,
         status: 'pending',
-        summary: approval.summary
+        summary: approval.summary,
+        ...(approval.actionLevel !== undefined ? { actionLevel: approval.actionLevel } : {}),
+        ...(approval.actionReason ? { actionReason: approval.actionReason } : {})
       })
       return requestApproval(approval)
     },

@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import type {
   ContextEngineConfig,
+  MemoryConfig,
   TelemetryConfig
 } from '../config/kun-config.js'
 import type { LedgerEvent } from '../contracts/ledger.js'
@@ -15,6 +16,9 @@ import type {
 import { renderWorkspaceStateBlock } from './context-budgeter.js'
 import { WorkspaceLedgerStore, workspaceHash } from './workspace-ledger.js'
 import { redactSensitiveText } from '../telemetry/target-normalization.js'
+import type { MemoryStore } from '../memory/memory-store.js'
+import { MemoryStalenessMonitor } from '../memory/memory-staleness.js'
+import { formMemoriesFromCompaction } from '../memory/memory-formation.js'
 
 const execFileAsync = promisify(execFile)
 const READ_CLASS_TOOLS = new Set(['read', 'grep', 'find', 'ls'])
@@ -32,6 +36,8 @@ export type ContextEngineRuntimeOptions = {
   dataDir: string
   telemetry: TelemetryConfig
   contextEngine: ContextEngineConfig
+  memory?: MemoryConfig
+  memoryStore?: MemoryStore
   nowIso?: () => string
   onWarning?: (message: string) => void
 }
@@ -49,9 +55,17 @@ export class ContextEngineRuntime implements ToolExecutionObserver {
   private readonly turnStats = new Map<string, TurnStats>()
   private readonly gitBaselines = new Map<string, string>()
   private readonly pendingLedgerApplies = new Set<Promise<unknown>>()
+  private readonly staleness?: MemoryStalenessMonitor
 
   constructor(opts: ContextEngineRuntimeOptions) {
     this.opts = opts
+    if (opts.memoryStore) {
+      this.staleness = new MemoryStalenessMonitor({
+        store: opts.memoryStore,
+        nowIso: opts.nowIso,
+        onWarning: opts.onWarning
+      })
+    }
   }
 
   private nowIso(): string {
@@ -133,7 +147,9 @@ export class ContextEngineRuntime implements ToolExecutionObserver {
       this.statsFor(input.turnId, input.workspace)
       const git = await this.observeGit(input.workspace)
       if (git) {
-        await this.ledgerFor(input.workspace).apply([{ ...git, at: this.nowIso() }])
+        const events: LedgerEvent[] = [{ ...git, at: this.nowIso() }]
+        await this.ledgerFor(input.workspace).apply(events)
+        await this.staleness?.applyLedgerEvents(input.workspace, events)
       }
     } catch {
       // git observation must never fail the turn
@@ -191,6 +207,7 @@ export class ContextEngineRuntime implements ToolExecutionObserver {
   /** Feeds structured compaction extracts into the ledger. */
   async onCompactionExtracted(input: {
     workspace: string
+    sourceThreadId: string
     sourceTurnId: string
     decisions: string[]
     filesTouched: string[]
@@ -210,6 +227,22 @@ export class ContextEngineRuntime implements ToolExecutionObserver {
           at: this.nowIso()
         }
       ])
+      if (this.opts.memory?.autoFormation !== false && this.opts.memoryStore) {
+        try {
+          await formMemoriesFromCompaction(this.opts.memoryStore, {
+            workspace: input.workspace,
+            sourceThreadId: input.sourceThreadId,
+            sourceTurnId: input.sourceTurnId,
+            decisions: input.decisions,
+            errorsResolved: input.errorsResolved,
+            nowIso: this.nowIso()
+          })
+        } catch (error) {
+          this.opts.onWarning?.(
+            `Memory auto-formation failed: ${error instanceof Error ? error.message : String(error)}`
+          )
+        }
+      }
     } catch {
       // never propagate
     }
@@ -228,6 +261,9 @@ export class ContextEngineRuntime implements ToolExecutionObserver {
     let pending: Promise<unknown>
     pending = this.ledgerFor(workspace)
       .apply(events)
+      .then(async () => {
+        await this.staleness?.applyLedgerEvents(workspace, events)
+      })
       .catch(() => undefined)
       .finally(() => {
         this.pendingLedgerApplies.delete(pending)

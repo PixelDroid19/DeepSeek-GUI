@@ -7,6 +7,8 @@ import { LocalToolHost } from '../src/adapters/tool/local-tool-host.js'
 import { buildMemoryToolProviders } from '../src/adapters/tool/memory-tool-provider.js'
 import { KunCapabilitiesConfig, type MemoryCapabilityConfig } from '../src/contracts/capabilities.js'
 import { FileMemoryStore } from '../src/memory/memory-store.js'
+import { formMemoriesFromCompaction } from '../src/memory/memory-formation.js'
+import { MemoryStalenessMonitor } from '../src/memory/memory-staleness.js'
 import type { ModelClient, ModelRequest } from '../src/ports/model-client.js'
 import { dispatchRequest } from '../src/server/http-server.js'
 import { bootstrapThread, makeHarness } from './loop-test-harness.js'
@@ -50,6 +52,148 @@ describe('Memory store and recall', () => {
     await store.delete(memory.id)
     expect(await store.retrieve({ query: 'pnpm', workspace: '/tmp/ws', limit: 3 })).toEqual([])
     expect((await store.list({ workspace: '/tmp/ws', includeDeleted: true })).find((item) => item.id === memory.id)?.deletedAt).toBeTruthy()
+  })
+
+  it('caps unverified inferred memory confidence and preserves verified provenance', async () => {
+    const store = createStore()
+    const inferred = await store.create({
+      content: 'Likely uses pnpm',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      confidence: 1
+    })
+    expect(inferred.confidence).toBe(0.5)
+
+    const verified = await store.create({
+      content: 'Tests pass with npm test',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      confidence: 1,
+      provenance: {
+        kind: 'verified-by-command',
+        evidence: { command: 'npm test' },
+        verifiedAt: '2026-06-03T00:00:00.000Z'
+      }
+    })
+    expect(verified.confidence).toBe(1)
+    expect((await createStore().list({ workspace: '/tmp/ws' })).find((item) => item.id === verified.id)).toMatchObject({
+      provenance: { kind: 'verified-by-command', evidence: { command: 'npm test' } }
+    })
+  })
+
+  it('excludes expired and stale memories from retrieval but keeps them on disk', async () => {
+    const store = createStore()
+    const expired = await store.create({
+      content: 'Use expired token',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      ttl: { expiresAt: '2026-06-02T00:00:00.000Z' }
+    })
+    const stale = await store.create({
+      content: 'Use stale token',
+      scope: 'workspace',
+      workspace: '/tmp/ws'
+    })
+    await store.markStale(stale.id, '2026-06-03T00:00:00.000Z')
+
+    expect(await store.retrieve({ query: 'token', workspace: '/tmp/ws', limit: 10 })).toEqual([])
+    expect((await store.list({ workspace: '/tmp/ws' })).map((item) => item.id).sort()).toEqual([
+      expired.id,
+      stale.id
+    ].sort())
+  })
+
+  it('marks memories stale from matching ledger events only', async () => {
+    const store = createStore()
+    const tracked = await store.create({
+      content: 'Config file defines runtime defaults',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      provenance: {
+        kind: 'observed-in-file',
+        evidence: { file: 'src/config.ts' },
+        verifiedAt: '2026-06-03T00:00:00.000Z'
+      },
+      ttl: { staleWhen: 'file-changes' }
+    })
+    const unrelated = await store.create({
+      content: 'Other file memory',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      provenance: {
+        kind: 'observed-in-file',
+        evidence: { file: 'src/other.ts' },
+        verifiedAt: '2026-06-03T00:00:00.000Z'
+      },
+      ttl: { staleWhen: 'file-changes' }
+    })
+    const monitor = new MemoryStalenessMonitor({
+      store,
+      nowIso: () => '2026-06-04T00:00:00.000Z'
+    })
+
+    await monitor.applyLedgerEvents('/tmp/ws', [
+      { kind: 'file-edited', path: 'src/config.ts', turnId: 'turn_1', at: '2026-06-04T00:00:00.000Z' }
+    ])
+
+    expect((await store.list({ workspace: '/tmp/ws' })).find((item) => item.id === tracked.id)?.staleAt).toBe('2026-06-04T00:00:00.000Z')
+    expect((await store.list({ workspace: '/tmp/ws' })).find((item) => item.id === unrelated.id)?.staleAt).toBeUndefined()
+  })
+
+  it('marks branch-sensitive memories stale when git observes a different branch', async () => {
+    const store = createStore()
+    const memory = await store.create({
+      content: 'Feature branch setup uses flag X',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      provenance: {
+        kind: 'verified-by-command',
+        evidence: { branch: 'feature-x', command: 'git status' },
+        verifiedAt: '2026-06-03T00:00:00.000Z'
+      },
+      ttl: { staleWhen: 'branch-changes' }
+    })
+    const monitor = new MemoryStalenessMonitor({
+      store,
+      nowIso: () => '2026-06-04T00:00:00.000Z'
+    })
+
+    await monitor.applyLedgerEvents('/tmp/ws', [
+      { kind: 'git-observed', branch: 'main', sessionCommits: [], dirtyFiles: [], at: '2026-06-04T00:00:00.000Z' }
+    ])
+
+    expect((await store.list({ workspace: '/tmp/ws' })).find((item) => item.id === memory.id)?.staleAt).toBe('2026-06-04T00:00:00.000Z')
+  })
+
+  it('forms deduped capped memories from structured compaction extracts', async () => {
+    const store = createStore()
+    await store.create({
+      content: 'use Zod for contracts',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      provenance: { kind: 'user-stated' }
+    })
+
+    const created = await formMemoriesFromCompaction(store, {
+      workspace: '/tmp/ws',
+      sourceThreadId: 'thr_1',
+      sourceTurnId: 'turn_9',
+      errorsResolved: ['npm test fixed after adding mock', 'cargo test fixed ownership issue'],
+      decisions: [
+        'use Zod for contracts',
+        'keep telemetry JSONL',
+        'inject workspace state',
+        'cap memory formation',
+        'preserve prefix cache',
+        'drop stale files'
+      ],
+      nowIso: '2026-06-03T00:00:00.000Z'
+    })
+
+    expect(created).toHaveLength(5)
+    expect(created.slice(0, 2).every((record) => record.provenance?.kind === 'verified-by-command')).toBe(true)
+    expect(created.some((record) => record.content === 'use Zod for contracts')).toBe(false)
+    expect(created.every((record) => record.sourceThreadId === 'thr_1' && record.sourceTurnId === 'turn_9')).toBe(true)
   })
 
   it('exposes memory API routes with diagnostics', async () => {

@@ -3,8 +3,10 @@ import { join } from 'node:path'
 import type { MemoryCapabilityConfig } from '../contracts/capabilities.js'
 import { atomicWriteFile } from '../adapters/file/atomic-write.js'
 import {
+  effectiveMemoryProvenance,
   MemoryDiagnostics,
   MemoryRecord,
+  isEvidenceLessModelInference,
   type MemoryCreateRequest,
   type MemoryUpdateRequest
 } from '../contracts/memory.js'
@@ -12,6 +14,7 @@ import {
 export interface MemoryStore {
   create(input: MemoryCreateRequest): Promise<MemoryRecord>
   update(id: string, patch: MemoryUpdateRequest): Promise<MemoryRecord>
+  markStale(id: string, at?: string): Promise<MemoryRecord>
   delete(id: string): Promise<MemoryRecord>
   list(filter?: { workspace?: string; includeDeleted?: boolean }): Promise<MemoryRecord[]>
   retrieve(input: { query: string; workspace?: string; limit: number }): Promise<MemoryRecord[]>
@@ -34,7 +37,7 @@ export class FileMemoryStore implements MemoryStore {
   async create(input: MemoryCreateRequest): Promise<MemoryRecord> {
     await mkdir(this.options.rootDir, { recursive: true })
     const now = this.now()
-    const parsed = MemoryRecord.parse({
+    const parsed = normalizeMemoryForWrite(MemoryRecord.parse({
       id: this.options.idGenerator?.() ?? `mem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
       content: input.content,
       scope: input.scope ?? 'workspace',
@@ -42,11 +45,13 @@ export class FileMemoryStore implements MemoryStore {
       project: input.project,
       sourceThreadId: input.sourceThreadId,
       sourceTurnId: input.sourceTurnId,
+      provenance: input.provenance,
+      ttl: input.ttl,
       tags: input.tags ?? [],
       confidence: input.confidence ?? 1,
       createdAt: now,
       updatedAt: now
-    })
+    }))
     await this.write(parsed)
     return parsed
   }
@@ -54,13 +59,27 @@ export class FileMemoryStore implements MemoryStore {
   async update(id: string, patch: MemoryUpdateRequest): Promise<MemoryRecord> {
     const current = await this.mustGet(id)
     const now = this.now()
-    const next = MemoryRecord.parse({
+    const next = normalizeMemoryForWrite(MemoryRecord.parse({
       ...current,
       ...(patch.content !== undefined ? { content: patch.content } : {}),
       ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
       ...(patch.confidence !== undefined ? { confidence: patch.confidence } : {}),
+      ...(patch.provenance !== undefined ? { provenance: patch.provenance } : {}),
+      ...(patch.ttl !== undefined ? { ttl: patch.ttl } : {}),
       ...(patch.disabled === true ? { disabledAt: current.disabledAt ?? now } : {}),
       ...(patch.disabled === false ? { disabledAt: undefined } : {}),
+      updatedAt: now
+    }))
+    await this.write(next)
+    return next
+  }
+
+  async markStale(id: string, at?: string): Promise<MemoryRecord> {
+    const current = await this.mustGet(id)
+    const now = at ?? this.now()
+    const next = MemoryRecord.parse({
+      ...current,
+      staleAt: current.staleAt ?? now,
       updatedAt: now
     })
     await this.write(next)
@@ -89,8 +108,11 @@ export class FileMemoryStore implements MemoryStore {
 
   async retrieve(input: { query: string; workspace?: string; limit: number }): Promise<MemoryRecord[]> {
     if (!this.options.config.enabled) return []
+    const now = this.now()
     const active = (await this.list({ workspace: input.workspace }))
       .filter((record) => !record.disabledAt)
+      .filter((record) => !record.staleAt)
+      .filter((record) => !isExpired(record, now))
     return active
       .map((record) => ({ record, score: scoreMemory(record, input.query) }))
       .filter((entry) => entry.score > 0)
@@ -158,3 +180,23 @@ function scoreMemory(record: MemoryRecord, query: string): number {
   }
   return score * record.confidence
 }
+
+function normalizeMemoryForWrite(record: MemoryRecord): MemoryRecord {
+  return {
+    ...record,
+    confidence: isEvidenceLessModelInference(record)
+      ? Math.min(record.confidence, 0.5)
+      : record.confidence
+  }
+}
+
+function isExpired(record: MemoryRecord, nowIso: string): boolean {
+  const expiresAt = record.ttl?.expiresAt
+  if (!expiresAt) return false
+  const expires = Date.parse(expiresAt)
+  const now = Date.parse(nowIso)
+  if (!Number.isFinite(expires) || !Number.isFinite(now)) return false
+  return expires <= now
+}
+
+export { effectiveMemoryProvenance }

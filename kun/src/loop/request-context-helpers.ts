@@ -1,4 +1,9 @@
 import type { PrefixVolatilityFinding } from '../cache/prefix-volatility.js'
+import {
+  effectiveMemoryProvenance,
+  isEvidenceLessModelInference,
+  type MemoryRecord
+} from '../contracts/memory.js'
 
 export function resolveModelMode(...candidates: Array<string | undefined>): { kind: 'fixed'; model: string } | { kind: 'auto' } {
   for (const candidate of candidates) {
@@ -16,14 +21,38 @@ export function normalizeRequestedReasoningEffort(effort: string | undefined): s
   return normalized && normalized !== 'auto' ? normalized : undefined
 }
 
-export function memoryInstructions(memories: Array<{ id: string; content: string; scope: string }>): string[] {
+export function memoryInstructions(memories: Array<Pick<
+  MemoryRecord,
+  'id' | 'content' | 'provenance'
+> & { scope: string; confidence?: number }>): string[] {
   if (memories.length === 0) return []
+  const facts = memories.filter((memory) => !isEvidenceLessModelInference(memory))
+  const hypotheses = memories.filter((memory) => isEvidenceLessModelInference(memory))
+  const lines = ['Relevant long-term memories for this turn:']
+  if (facts.length) {
+    lines.push(...facts.map((memory) => `- [${memory.id}] (${memory.scope}) ${memory.content}${renderProvenance(memory)}`))
+  }
+  if (hypotheses.length) {
+    lines.push('Prior hypotheses (unverified):')
+    lines.push(...hypotheses.map((memory) =>
+      `- [${memory.id}] (${memory.scope}) hypothesis: ${memory.content} (confidence ${(memory.confidence ?? 0.5).toFixed(2)})`
+    ))
+  }
   return [
-    [
-      'Relevant long-term memories for this turn:',
-      ...memories.map((memory) => `- [${memory.id}] (${memory.scope}) ${memory.content}`)
-    ].join('\n')
+    lines.join('\n')
   ]
+}
+
+function renderProvenance(memory: Pick<MemoryRecord, 'provenance'>): string {
+  const provenance = effectiveMemoryProvenance(memory)
+  const details: string[] = []
+  if (provenance.evidence?.command) details.push(`command \`${provenance.evidence.command}\``)
+  if (provenance.evidence?.file) details.push(`file \`${provenance.evidence.file}\``)
+  if (provenance.evidence?.commit) details.push(`commit ${provenance.evidence.commit}`)
+  if (provenance.evidence?.branch) details.push(`branch ${provenance.evidence.branch}`)
+  if (provenance.verifiedAt) details.push(`verified ${provenance.verifiedAt}`)
+  if (!details.length) return ` (${provenance.kind})`
+  return ` (${provenance.kind}: ${details.join(', ')})`
 }
 
 export function prefixVolatilityStageDetails(

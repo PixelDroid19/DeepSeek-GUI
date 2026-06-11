@@ -10,12 +10,23 @@ describe('request context helpers', () => {
   it('formats long-term memories as one context instruction', () => {
     expect(memoryInstructions([])).toEqual([])
     expect(memoryInstructions([
-      { id: 'mem_1', scope: 'project', content: 'Use Kun runtime only.' },
-      { id: 'mem_2', scope: 'global', content: 'Keep changes small.' }
+      {
+        id: 'mem_1',
+        scope: 'project',
+        content: 'Use Kun runtime only.',
+        confidence: 0.9,
+        provenance: {
+          kind: 'verified-by-command',
+          evidence: { command: 'npm test' },
+          verifiedAt: '2026-06-11T00:00:00.000Z'
+        }
+      },
+      { id: 'mem_2', scope: 'global', content: 'Keep changes small.', confidence: 0.5 }
     ])).toEqual([[
       'Relevant long-term memories for this turn:',
-      '- [mem_1] (project) Use Kun runtime only.',
-      '- [mem_2] (global) Keep changes small.'
+      '- [mem_1] (project) Use Kun runtime only. (verified-by-command: command `npm test`, verified 2026-06-11T00:00:00.000Z)',
+      'Prior hypotheses (unverified):',
+      '- [mem_2] (global) hypothesis: Keep changes small. (confidence 0.50)'
     ].join('\n')])
   })
 

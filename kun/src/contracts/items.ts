@@ -88,7 +88,9 @@ export const ApprovalTurnItem = TurnItemBase.extend({
   approvalId: z.string().min(1),
   toolName: z.string().min(1),
   summary: z.string(),
-  status: z.enum(['pending', 'allowed', 'denied', 'expired'])
+  status: z.enum(['pending', 'allowed', 'denied', 'expired']),
+  actionLevel: z.number().int().min(0).max(4).optional(),
+  actionReason: z.string().optional()
 })
 export type ApprovalTurnItem = z.infer<typeof ApprovalTurnItem>
 

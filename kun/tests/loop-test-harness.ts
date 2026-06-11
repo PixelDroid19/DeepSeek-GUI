@@ -96,7 +96,10 @@ export function makeHarness(
   const inflight = new InflightTracker()
   const steering = new SteeringQueue()
   const compactor = options.compactor ?? new ContextCompactor({ softThreshold: 64, hardThreshold: 128 })
-  const toolHost = new LocalToolHost({ tools: options.tools ?? defaultLocalTools })
+  const toolHost = new LocalToolHost({
+    tools: options.tools ?? defaultLocalTools,
+    actionLevels: { enabled: false }
+  })
   const usage = new UsageService()
   const nowIso = () => new Date().toISOString()
   const nowMs = options.nowMs ?? (() => Date.now())

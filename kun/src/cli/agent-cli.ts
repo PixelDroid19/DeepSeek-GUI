@@ -42,6 +42,7 @@ Common options:
   --workspace <path>         Workspace root for run/chat/exec
   --model <model>            Model id
   --approval-policy <p>      on-request | untrusted | never | auto | suggest
+  --allow-risky-actions      Headless: auto-allow L3 actions; L4 remains denied
   --json                     Emit machine-readable JSON where supported
 
 Exec options:
@@ -126,6 +127,11 @@ async function runOneShot(argv: readonly string[], io: CliIo): Promise<number> {
       approvalPolicy: parsed.options.approvalPolicy,
       sandboxMode: parsed.options.sandboxMode
     })
+    const stopApprovals = installHeadlessApprovalResponder({
+      runtime,
+      threadId: thread.id,
+      allowRiskyActions: hasFlag(argv, 'allow-risky-actions')
+    })
     const turn = await runtime.turnService.startTurn({
       threadId: thread.id,
       request: { prompt, model: parsed.options.model, mode: 'agent' }
@@ -139,6 +145,7 @@ async function runOneShot(argv: readonly string[], io: CliIo): Promise<number> {
     })
     const status = await runtime.runTurn(thread.id, turn.turnId)
     unsubscribe?.()
+    stopApprovals()
     const items = await runtime.sessionStore.loadItems(thread.id)
     if (parsed.json) {
       io.stdout.write(JSON.stringify({ threadId: thread.id, turnId: turn.turnId, status, items }) + '\n')
@@ -172,6 +179,11 @@ async function runChat(argv: readonly string[], io: CliIo): Promise<number> {
       approvalPolicy: parsed.options.approvalPolicy,
       sandboxMode: parsed.options.sandboxMode
     })
+    const stopApprovals = installHeadlessApprovalResponder({
+      runtime,
+      threadId: thread.id,
+      allowRiskyActions: hasFlag(argv, 'allow-risky-actions')
+    })
     const input = io.stdin ?? processStdin
     const terminal = isTtyInput(input)
     const rl = createInterface({
@@ -201,6 +213,7 @@ async function runChat(argv: readonly string[], io: CliIo): Promise<number> {
         }
       }
     } finally {
+      stopApprovals()
       rl.close()
     }
     return ServeExitCode.ok
@@ -253,7 +266,9 @@ async function runExec(argv: readonly string[], io: CliIo): Promise<number> {
     return ServeExitCode.runtime
   }
   const host = runtime.toolHost ?? new LocalToolHost({ tools: buildDefaultLocalTools() })
-  const context = buildExecContext(parsed.options, parsed.workspace)
+  const context = buildExecContext(parsed.options, parsed.workspace, {
+    allowRiskyActions: hasFlag(argv, 'allow-risky-actions')
+  })
   const json = parsed.json
   try {
     if (hasFlag(argv, 'list-tools')) {
@@ -325,7 +340,11 @@ async function shutdownRuntime(
   }
 }
 
-function buildExecContext(options: ServeOptions, workspace: string): ToolHostContext {
+function buildExecContext(
+  options: ServeOptions,
+  workspace: string,
+  headless: { allowRiskyActions: boolean }
+): ToolHostContext {
   const modelProfiles = modelContextProfilesFromConfig({
     contextCompaction: options.contextCompaction,
     models: options.models
@@ -340,8 +359,29 @@ function buildExecContext(options: ServeOptions, workspace: string): ToolHostCon
     delegationPolicy: { enabled: false },
     approvalPolicy: options.approvalPolicy,
     abortSignal: new AbortController().signal,
-    awaitApproval: async () => (options.approvalPolicy === 'auto' ? 'allow' : 'deny')
+    awaitApproval: async (approval) =>
+      headless.allowRiskyActions && approval.actionLevel === 3
+        ? 'allow'
+        : 'deny'
   }
+}
+
+function installHeadlessApprovalResponder(input: {
+  runtime: ServerRuntime
+  threadId: string
+  allowRiskyActions: boolean
+}): () => void {
+  return input.runtime.eventBus.subscribe(input.threadId, (event) => {
+    if (event.kind !== 'approval_requested') return
+    const decision = input.allowRiskyActions && event.actionLevel === 3 ? 'allow' : 'deny'
+    input.runtime.approvalGate.decide(
+      event.approvalId,
+      decision,
+      decision === 'allow'
+        ? 'headless --allow-risky-actions approved L3 action'
+        : 'headless mode denied approval request'
+    )
+  })
 }
 
 function writeParseError(

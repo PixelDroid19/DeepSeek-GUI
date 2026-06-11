@@ -29,13 +29,18 @@ import { AgentLoop } from '../loop/agent-loop.js'
 import { ContextCompactor } from '../loop/context-compactor.js'
 import type { TokenEconomyConfig } from '../loop/token-economy.js'
 import {
+  DEFAULT_ACTION_LEVELS_CONFIG,
   DEFAULT_CONTEXT_ENGINE_CONFIG,
+  DEFAULT_MEMORY_CONFIG,
   DEFAULT_TELEMETRY_CONFIG,
+  type ActionLevelsConfig,
   type ContextEngineConfig,
+  type MemoryConfig,
   type TelemetryConfig
 } from '../config/kun-config.js'
 import { ContextEngineRuntime } from '../context-engine/context-engine-runtime.js'
 import { TelemetryToolHost } from '../telemetry/telemetry-tool-host.js'
+import { WorkspaceAllowlistStore } from '../adapters/tool/workspace-allowlist-store.js'
 import {
   modelCapabilitiesForModel,
   modelContextProfilesFromConfig,
@@ -88,6 +93,8 @@ export type KunServeRuntimeOptions = {
   contextCompaction?: ContextCompactionConfig
   telemetry?: TelemetryConfig
   contextEngine?: ContextEngineConfig
+  memory?: MemoryConfig
+  actionLevels?: ActionLevelsConfig
   runtime?: RuntimeTuningConfig
   storage?: StorageConfig
   capabilities?: KunCapabilitiesConfig
@@ -189,6 +196,13 @@ export async function createKunServeRuntime(
         nowIso
       })
     : undefined
+  const actionLevelsConfig = { ...DEFAULT_ACTION_LEVELS_CONFIG, ...(options.actionLevels ?? {}) }
+  const memoryConfig = { ...DEFAULT_MEMORY_CONFIG, ...(options.memory ?? {}) }
+  const workspaceAllowlist = new WorkspaceAllowlistStore({
+    dir: join(options.dataDir, 'allowlist'),
+    nowIso,
+    onWarning: (message) => console.warn(`[kun] ${message}`)
+  })
   const baseToolProviders = [
     {
       id: 'builtin',
@@ -202,7 +216,12 @@ export async function createKunServeRuntime(
     ...buildMemoryToolProviders(memoryStore)
   ]
   const childRegistry = new CapabilityRegistry(baseToolProviders)
-  const childToolHost = new LocalToolHost({ registry: childRegistry, readTracker: true })
+  const childToolHost = new LocalToolHost({
+    registry: childRegistry,
+    readTracker: true,
+    actionLevels: actionLevelsConfig,
+    workspaceAllowlist
+  })
   const delegationRuntime = options.capabilities?.subagents.enabled
     ? new DelegationRuntime({
         config: options.capabilities.subagents,
@@ -289,10 +308,17 @@ export async function createKunServeRuntime(
     dataDir: options.dataDir,
     telemetry: telemetryConfig,
     contextEngine: contextEngineConfig,
+    memoryStore,
+    memory: memoryConfig,
     nowIso,
     onWarning: (message) => console.warn(`[kun] ${message}`)
   })
-  const localToolHost = new LocalToolHost({ registry, readTracker: true })
+  const localToolHost = new LocalToolHost({
+    registry,
+    readTracker: true,
+    actionLevels: actionLevelsConfig,
+    workspaceAllowlist
+  })
   const toolHost = telemetryConfig.enabled || contextEngineConfig.enabled
     ? new TelemetryToolHost(localToolHost, contextEngine)
     : localToolHost
