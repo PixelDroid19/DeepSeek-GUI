@@ -1,13 +1,15 @@
 import type { ReactElement } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Globe2 } from 'lucide-react'
+import { Check, Globe2 } from 'lucide-react'
 import { formatDevPreviewUrlLabel } from '../lib/dev-preview-detection'
 
 export function DevPreviewLaunchCard({
   url,
+  opened = false,
   onOpen
 }: {
   url: string
+  opened?: boolean
   onOpen: () => void
 }): ReactElement {
   const { t } = useTranslation('common')
@@ -30,14 +32,21 @@ export function DevPreviewLaunchCard({
           </span>
         </div>
       </div>
-      <button
-        type="button"
-        onClick={onOpen}
-        className="inline-flex h-9 shrink-0 items-center justify-center rounded-full bg-accent px-4 text-[13px] font-semibold text-white shadow-[0_10px_24px_rgba(0,136,255,0.22)] transition hover:brightness-110"
-        title={t('devPreviewCardOpen')}
-      >
-        {t('devPreviewCardOpen')}
-      </button>
+      {opened ? (
+        <div className="inline-flex h-9 min-w-0 max-w-[12rem] items-center gap-1.5 rounded-full border border-ds-border-muted bg-ds-surface-subtle px-3 text-[12.5px] font-semibold text-ds-ink dark:bg-white/[0.08]">
+          <Check className="h-3.5 w-3.5 text-emerald-500 dark:text-emerald-300" strokeWidth={2} />
+          <span className="min-w-0 truncate">{t('devPreviewCardOpened')}</span>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={onOpen}
+          className="inline-flex h-9 shrink-0 items-center justify-center rounded-full bg-accent px-4 text-[13px] font-semibold text-white shadow-[0_10px_24px_rgba(0,136,255,0.22)] transition hover:brightness-110"
+          title={t('devPreviewCardOpen')}
+        >
+          {t('devPreviewCardOpen')}
+        </button>
+      )}
     </div>
   )
 }

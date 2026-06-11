@@ -38,7 +38,7 @@ function createTodoWriteTool(threadService: ThreadService): LocalTool {
       'Replace the current thread todo list with the supplied full list.',
       'Use it for visible task tracking in both Agent and Plan modes.',
       'At most one item may be in_progress; if more than one is supplied, only the first in_progress item is kept active.',
-      'Plan mode must still save the plan with create_plan; todo_write does not replace create_plan.'
+      'In Plan mode, save implementation plans with the advertised plan-saving tool; todo_write only updates the progress list.'
     ].join(' '),
     inputSchema: {
       type: 'object',

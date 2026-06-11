@@ -9,8 +9,10 @@ import {
   mergeModelProviderSettings,
   mergeScheduleSettings,
   mergeWriteSettings,
+  normalizeAppBehaviorSettings,
   normalizeClawSettings,
   normalizeGuiUpdateChannel,
+  normalizeKeyboardShortcuts,
   normalizeModelProviderSettings,
   normalizeScheduleSettings,
   normalizeWriteSettings,
@@ -55,6 +57,16 @@ export function mergeSettings(current: AppSettingsV1, patch: SettingsPatch): App
       ...safeCurrent.notifications,
       ...(patch.notifications ?? {})
     },
+    appBehavior: normalizeAppBehaviorSettings({
+      ...safeCurrent.appBehavior,
+      ...(patch.appBehavior ?? {})
+    }),
+    keyboardShortcuts: normalizeKeyboardShortcuts({
+      bindings: {
+        ...safeCurrent.keyboardShortcuts.bindings,
+        ...(patch.keyboardShortcuts?.bindings ?? {})
+      }
+    }),
     write: mergeWriteSettings(safeCurrent.write, patch.write),
     claw: mergeClawSettings(safeCurrent.claw, patch.claw),
     schedule: mergeScheduleSettings(safeCurrent.schedule, patch.schedule),
@@ -90,12 +102,15 @@ export function coerceRendererSettings(settings: AppSettingsV1): AppSettingsV1 {
     notifications: {
       turnComplete: raw.notifications?.turnComplete !== false
     },
+    appBehavior: normalizeAppBehaviorSettings(raw.appBehavior),
+    keyboardShortcuts: normalizeKeyboardShortcuts(raw.keyboardShortcuts),
     write: normalizeWriteSettings(raw.write),
     claw: normalizeClawSettings(raw.claw),
     schedule: normalizeScheduleSettings(raw.schedule),
     guiUpdate: {
       channel: normalizeGuiUpdateChannel(raw.guiUpdate?.channel ?? DEFAULT_GUI_UPDATE_CHANNEL)
-    }
+    },
+    codePromptPrefix: typeof raw.codePromptPrefix === 'string' ? raw.codePromptPrefix : ''
   }
 }
 

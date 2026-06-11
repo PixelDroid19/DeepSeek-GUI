@@ -93,6 +93,14 @@ export function parseServeOptions(
             env.DEEPSEEK_BASE_URL ??
             configServe.baseUrl ??
             DEFAULT_SERVE_OPTIONS.baseUrl,
+    endpointFormat:
+      typeof raw['endpoint-format'] === 'string'
+        ? raw['endpoint-format'] as ServeOptions['endpointFormat']
+        : typeof raw.endpointFormat === 'string'
+          ? raw.endpointFormat as ServeOptions['endpointFormat']
+          : env.KUN_ENDPOINT_FORMAT as ServeOptions['endpointFormat'] | undefined ??
+            configServe.endpointFormat ??
+            DEFAULT_SERVE_OPTIONS.endpointFormat,
     model:
       typeof raw.model === 'string'
         ? raw.model
@@ -152,6 +160,7 @@ Options:
   --runtime-token <token>  Bearer token for /v1/* requests
   --api-key <key>          DeepSeek-compatible API key
   --base-url <url>         DeepSeek-compatible base URL
+  --endpoint-format <f>    chat_completions | responses | messages
   --model <model>          Default model id
   --approval-policy <p>    on-request | untrusted | never | auto | suggest
   --sandbox-mode <mode>    read-only | workspace-write | danger-full-access | external-sandbox

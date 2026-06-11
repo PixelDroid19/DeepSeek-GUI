@@ -128,7 +128,7 @@ describe('AgentLoop', () => {
     expect(status).toBe('failed')
     expect(failed).toMatchObject({
       kind: 'turn_failed',
-      message: 'model stream exploded'
+      message: expect.stringContaining('model stream exploded')
     })
   })
 
@@ -1128,6 +1128,59 @@ describe('AgentLoop', () => {
     await bootstrapThread(h)
     await h.loop.runTurn(h.threadId, h.turnId)
     expect(observedTools).not.toContain(CREATE_PLAN_TOOL_NAME)
+  })
+
+  it('continues after a normal agent turn attempts a non-advertised create_plan call', async () => {
+    const observedRequests: ModelRequest[] = []
+    let calls = 0
+    const h = makeHarness(
+      {
+        provider: 'overeager-planner',
+        model: 'overeager-planner',
+        async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+          observedRequests.push(request)
+          calls += 1
+          if (calls === 1) {
+            yield {
+              kind: 'tool_call_complete',
+              callId: 'call_plan',
+              toolName: CREATE_PLAN_TOOL_NAME,
+              arguments: {
+                markdown: '# Plan',
+                operation: 'draft'
+              }
+            }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
+          yield { kind: 'assistant_text_delta', text: 'I will continue without the plan tool.' }
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      },
+      { tools: buildDefaultLocalTools() }
+    )
+    await bootstrapThread(h)
+
+    const status = await h.loop.runTurn(h.threadId, h.turnId)
+    const items = await h.sessionStore.loadItems(h.threadId)
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    const planCall = items.find(
+      (item) => item.kind === 'tool_call' && item.toolName === CREATE_PLAN_TOOL_NAME
+    )
+    const planResult = items.find(
+      (item) => item.kind === 'tool_result' && item.toolName === CREATE_PLAN_TOOL_NAME
+    )
+
+    expect(status).toBe('completed')
+    expect(observedRequests[0]?.tools.map((tool) => tool.name)).not.toContain(CREATE_PLAN_TOOL_NAME)
+    expect(observedRequests.length).toBe(2)
+    expect(planCall).toMatchObject({ kind: 'tool_call', status: 'failed' })
+    expect(planResult).toMatchObject({ kind: 'tool_result', isError: true })
+    expect(planResult?.kind === 'tool_result' ? JSON.stringify(planResult.output) : '')
+      .toContain('not advertised in this turn context')
+    expect(events.some((event) =>
+      event.kind === 'error' && event.code === 'tool_dispatch_rejected'
+    )).toBe(true)
   })
 
   it('injects active goal guidance and goal status tools into model requests', async () => {

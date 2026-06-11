@@ -4,6 +4,7 @@ import {
   DEFAULT_KUN_DATA_DIR,
   DEFAULT_KUN_MODEL,
   DEFAULT_KUN_PORT,
+  DEFAULT_MODEL_ENDPOINT_FORMAT,
   DEFAULT_SANDBOX_MODE,
   type AppSettingsV1,
   type KunContextCompactionSettingsV1,
@@ -69,7 +70,7 @@ function legacyLocalHttpRuntimeDefaults(port = 7878): LegacyLocalHttpRuntimeSett
     runtimeToken: '',
     extraCorsOrigins: ['http://localhost:5173', 'http://127.0.0.1:5173'],
     approvalPolicy: DEFAULT_APPROVAL_POLICY,
-    sandboxMode: 'workspace-write'
+    sandboxMode: DEFAULT_SANDBOX_MODE
   }
 }
 
@@ -95,6 +96,7 @@ export function defaultKunRuntimeSettings(
     apiKey: '',
     baseUrl: '',
     providerId: '',
+    endpointFormat: DEFAULT_MODEL_ENDPOINT_FORMAT,
     runtimeToken: '',
     dataDir: DEFAULT_KUN_DATA_DIR,
     model: DEFAULT_KUN_MODEL,
@@ -485,6 +487,7 @@ export function migrateLegacyAppSettings(parsed: LegacyAppSettingsShape): Partia
     apiKey: legacySource.apiKey,
     baseUrl: legacySource.baseUrl,
     providerId: '',
+    endpointFormat: DEFAULT_MODEL_ENDPOINT_FORMAT,
     runtimeToken: isReasoningLegacy ? kunDefaults.runtimeToken : legacyLocalHttp.runtimeToken,
     model: isReasoningLegacy ? legacyReasoning.model : kunDefaults.model,
     approvalPolicy: isReasoningLegacy ? kunDefaults.approvalPolicy : legacyLocalHttp.approvalPolicy,
@@ -496,7 +499,8 @@ export function migrateLegacyAppSettings(parsed: LegacyAppSettingsShape): Partia
       : nonEmptyStringOrFallback(explicitKun.apiKey, legacySeed.apiKey),
     baseUrl: hasProviderSettings
       ? parsed.provider?.baseUrl
-      : nonEmptyStringOrFallback(explicitKun.baseUrl, legacySeed.baseUrl)
+      : nonEmptyStringOrFallback(explicitKun.baseUrl, legacySeed.baseUrl),
+    providers: parsed.provider?.providers
   })
   const kun = {
     ...kunDefaults,

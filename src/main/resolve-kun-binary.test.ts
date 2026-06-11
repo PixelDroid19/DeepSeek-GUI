@@ -100,6 +100,7 @@ describe('buildKunServeArgs', () => {
       port: 8899,
       dataDir: '/tmp/kun',
       baseUrl: 'https://api.deepseek.com/beta',
+      endpointFormat: 'responses',
       model: 'deepseek-chat',
       approvalPolicy: 'on-request',
       sandboxMode: 'workspace-write',
@@ -109,6 +110,8 @@ describe('buildKunServeArgs', () => {
 
     expect(args).not.toContain('--api-key')
     expect(args).not.toContain('--runtime-token')
+    expect(args).toContain('--endpoint-format')
+    expect(args).toContain('responses')
     expect(args).toContain('--token-economy-mode')
     expect(args).toContain('false')
   })

@@ -169,6 +169,20 @@
   z-index: 1;
 }
 
+:root:not([data-platform='darwin']) .ds-sidebar-titlebar-spacer {
+  padding-top: 4px;
+  padding-bottom: 6px;
+}
+
+:root:not([data-platform='darwin']) .ds-sidebar-titlebar-row {
+  min-height: 16px;
+  align-items: center;
+}
+
+:root:not([data-platform='darwin']) .ds-sidebar-titlebar-toggle {
+  margin-top: 0;
+}
+
 .ds-titlebar-sidebar-toggle {
   display: inline-flex;
   height: 16px;

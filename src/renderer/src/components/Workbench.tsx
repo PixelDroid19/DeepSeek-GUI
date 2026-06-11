@@ -1032,7 +1032,22 @@ export function Workbench(): ReactElement {
           {activeSddDraft ? (
             <SddDraftEditorView
               leftSidebarCollapsed={leftSidebarCollapsed}
+              assistantOpen={rightPanelMode === 'sdd-ai'}
               onToggleLeftSidebar={toggleLeftSidebar}
+              onToggleAssistant={() => {
+                if (rightPanelMode === 'sdd-ai') {
+                  setRightPanelMode(null)
+                  return
+                }
+                void (async () => {
+                  const draft = useSddDraftStore.getState().activeDraft
+                  if (!draft) return
+                  setRightSidebarWidth((width) => Math.max(width, 420))
+                  const threadId = await ensureSddAssistantThreadForDraft(draft)
+                  if (!threadId) return
+                  setRightPanelMode('sdd-ai')
+                })()
+              }}
               onNext={() => void handleSddNextStep()}
               onClose={() => {
                 void saveActiveSddDraftToDisk()

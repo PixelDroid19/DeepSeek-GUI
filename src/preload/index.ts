@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { DsGuiApi } from '../shared/ds-gui-api'
 
 const api = {
@@ -139,6 +139,8 @@ const api = {
       modelHint: options?.modelHint,
       mode: options?.mode
     }),
+  runDesktopCommand: (command) =>
+    ipcRenderer.invoke('desktop:command', command),
   openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),
   showTurnCompleteNotification: (payload) => ipcRenderer.invoke('notification:turn-complete', payload),
   getAppVersion: () => ipcRenderer.invoke('app:version'),
@@ -159,7 +161,8 @@ const api = {
   logError: (category, message, detail) =>
     ipcRenderer.invoke('log:error', { category, message, detail }),
   getLogPath: () => ipcRenderer.invoke('log:get-path'),
-  openLogDir: () => ipcRenderer.invoke('log:open-dir')
+  openLogDir: () => ipcRenderer.invoke('log:open-dir'),
+  getPathForFile: (file: File) => webUtils.getPathForFile(file)
 } satisfies DsGuiApi
 
 contextBridge.exposeInMainWorld('dsGui', api)

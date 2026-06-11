@@ -26,6 +26,7 @@ describe('FloatingComposer capabilities', () => {
       hasPlanCommand: true,
       hasReviewCommand: true
     })).toMatchObject({
+      canEditComposer: true,
       canCompose: true,
       canSend: true,
       canPickAttachment: true,
@@ -57,6 +58,7 @@ describe('FloatingComposer capabilities', () => {
       hasPlanCommand: true,
       hasReviewCommand: true
     })).toMatchObject({
+      canEditComposer: false,
       canCompose: false,
       canSend: false,
       canOpenGoalPanel: false,

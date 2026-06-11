@@ -1,5 +1,6 @@
 import {
   DEFAULT_DEEPSEEK_BASE_URL,
+  DEFAULT_MODEL_ENDPOINT_FORMAT,
   DEFAULT_MODEL_PROVIDER_ID,
   type AppSettingsV1,
   type KunRuntimeSettingsV1,
@@ -8,6 +9,7 @@ import {
   type ModelProviderSettingsPatchV1,
   type ModelProviderSettingsV1
 } from './app-settings-types'
+import { normalizeModelEndpointFormat } from '../../kun/src/contracts/model-endpoint-format.js'
 import { getKunRuntimeSettings } from './app-settings-kun'
 import { normalizeDeepseekBaseUrl } from './app-settings-normalizers'
 import { DEFAULT_COMPOSER_MODEL_IDS } from './default-composer-models'
@@ -93,7 +95,7 @@ export function getModelProviderProfile(
   providerId: string | undefined
 ): ModelProviderProfileV1 {
   const provider = getModelProviderSettings(settings)
-  const id = normalizeProviderId(providerId || DEFAULT_MODEL_PROVIDER_ID)
+  const id = normalizeModelProviderId(providerId || DEFAULT_MODEL_PROVIDER_ID)
   return provider.providers.find((profile) => profile.id === id) ?? provider.providers[0] ?? defaultModelProviderProfile(provider.apiKey, provider.baseUrl)
 }
 
@@ -121,7 +123,8 @@ export function resolveKunRuntimeSettings(settings: AppSettingsV1): KunRuntimeSe
     baseUrl:
       runtimeBaseUrl && runtimeBaseUrl !== DEFAULT_DEEPSEEK_BASE_URL
         ? normalizeDeepseekBaseUrl(runtimeBaseUrl)
-        : normalizeDeepseekBaseUrl(providerBaseUrl)
+        : normalizeDeepseekBaseUrl(providerBaseUrl),
+    endpointFormat: provider.endpointFormat
   }
 }
 
@@ -131,6 +134,7 @@ function defaultModelProviderProfile(apiKey: string, baseUrl: string): ModelProv
     name: DEFAULT_MODEL_PROVIDER_NAME,
     apiKey: apiKey.trim(),
     baseUrl: normalizeDeepseekBaseUrl(baseUrl),
+    endpointFormat: DEFAULT_MODEL_ENDPOINT_FORMAT,
     models: DEFAULT_COMPOSER_MODEL_IDS.filter((id) => id !== 'auto')
   }
 }
@@ -138,7 +142,7 @@ function defaultModelProviderProfile(apiKey: string, baseUrl: string): ModelProv
 function normalizeModelProviderProfile(
   input: ModelProviderProfilePatchV1 | undefined
 ): ModelProviderProfileV1 | null {
-  const id = normalizeProviderId(input?.id)
+  const id = normalizeModelProviderId(input?.id)
   if (!id) return null
   const name = typeof input?.name === 'string' && input.name.trim() ? input.name.trim() : id
   const baseUrl =
@@ -151,6 +155,7 @@ function normalizeModelProviderProfile(
     name,
     apiKey: typeof input?.apiKey === 'string' ? input.apiKey.trim() : '',
     baseUrl,
+    endpointFormat: normalizeModelEndpointFormat(input?.endpointFormat),
     models
   }
 }
@@ -166,7 +171,7 @@ function normalizeProviderModels(models: unknown): string[] {
   return [...ids].sort((a, b) => a.localeCompare(b))
 }
 
-function normalizeProviderId(value: unknown): string {
+export function normalizeModelProviderId(value: unknown): string {
   return typeof value === 'string'
     ? value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64)
     : ''

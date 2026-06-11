@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
-import type { ChatBlock } from '../../agent/types'
 
 /** Threshold (px) from the top of the scroll container that triggers
  * auto-loading earlier turns. */
@@ -17,7 +16,7 @@ type UseTimelineScrollOptions = {
   totalTurns: number
   busy: boolean
   /** Triggers stick-to-bottom snap scroll. */
-  scrollDeps: { blocks: ChatBlock[]; live: string; liveReasoning: string }
+  scrollDeps: { contentKey: string; streaming: boolean; userTurnKey: string }
 }
 
 export type UseTimelineScrollResult = {
@@ -25,6 +24,27 @@ export type UseTimelineScrollResult = {
   hiddenTurnCount: number
   loadEarlierTurns: (options?: { userInitiated?: boolean }) => void
   collapseEarlierTurns: () => void
+}
+
+export function deriveTimelineVisibleTurnCount({
+  currentVisibleTurnCount,
+  totalTurns,
+  pageSize,
+  shouldCollapseHistory,
+  historyExpansionRequested
+}: {
+  currentVisibleTurnCount: number
+  totalTurns: number
+  pageSize: number
+  shouldCollapseHistory: boolean
+  historyExpansionRequested: boolean
+}): number {
+  const latestPageCount = Math.min(pageSize, totalTurns)
+  if (!shouldCollapseHistory) return totalTurns
+  if (historyExpansionRequested) {
+    return Math.min(totalTurns, Math.max(currentVisibleTurnCount, latestPageCount))
+  }
+  return latestPageCount
 }
 
 /**
@@ -43,14 +63,21 @@ export function useTimelineScroll({
   busy,
   scrollDeps
 }: UseTimelineScrollOptions): UseTimelineScrollResult {
-  const { blocks, live, liveReasoning } = scrollDeps
+  const { contentKey, streaming, userTurnKey } = scrollDeps
   const shouldCollapseHistory = totalTurns > autoCollapseThreshold
   const [visibleTurnCount, setVisibleTurnCount] = useState(() =>
-    shouldCollapseHistory ? pageSize : totalTurns
+    deriveTimelineVisibleTurnCount({
+      currentVisibleTurnCount: 0,
+      totalTurns,
+      pageSize,
+      shouldCollapseHistory,
+      historyExpansionRequested: false
+    })
   )
   const hiddenTurnCount = Math.max(0, totalTurns - visibleTurnCount)
 
   const stickToBottomRef = useRef(true)
+  const lastUserTurnKeyRef = useRef(userTurnKey)
   const historyExpansionRequestedRef = useRef(false)
   const pendingPrependRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null)
   const prependInFlightRef = useRef(false)
@@ -80,6 +107,14 @@ export function useTimelineScroll({
     setVisibleTurnCount(pageSize)
   }, [pageSize])
 
+  // A freshly submitted user turn should become visible even if the user was
+  // reading older history before pressing Enter.
+  useEffect(() => {
+    if (!userTurnKey || lastUserTurnKeyRef.current === userTurnKey) return
+    lastUserTurnKeyRef.current = userTurnKey
+    stickToBottomRef.current = true
+  }, [userTurnKey])
+
   // Scroll listener: tracks stick-to-bottom + triggers lazy load.
   useEffect(() => {
     const el = containerRef.current
@@ -105,11 +140,11 @@ export function useTimelineScroll({
     scrollFrameRef.current = window.requestAnimationFrame(() => {
       scrollFrameRef.current = null
       endRef.current?.scrollIntoView({
-        behavior: live || liveReasoning ? 'auto' : 'smooth',
+        behavior: streaming ? 'auto' : 'smooth',
         block: 'end'
       })
     })
-  }, [blocks, endRef, live, liveReasoning])
+  }, [contentKey, endRef, streaming])
 
   // Hard reset on thread switch.
   useEffect(() => {
@@ -137,15 +172,33 @@ export function useTimelineScroll({
   // Re-derive visible count when the thread / collapse flag / total
   // turns change.
   useEffect(() => {
-    setVisibleTurnCount(shouldCollapseHistory ? pageSize : totalTurns)
+    setVisibleTurnCount((count) =>
+      deriveTimelineVisibleTurnCount({
+        currentVisibleTurnCount: count,
+        totalTurns,
+        pageSize,
+        shouldCollapseHistory,
+        historyExpansionRequested: historyExpansionRequestedRef.current
+      })
+    )
   }, [activeThreadId, pageSize, shouldCollapseHistory, totalTurns])
 
-  // While a turn is running, never auto-collapse the most recent
-  // updates — make sure all current turns are visible.
+  // While a turn is running, keep the latest page visible without
+  // mounting every historical turn. Expanding all history during SSE
+  // streaming can repaint long conversations and make the viewport look
+  // like it scrolled through the whole thread.
   useEffect(() => {
     if (!busy) return
-    setVisibleTurnCount((count) => Math.max(count, totalTurns))
-  }, [busy, totalTurns])
+    setVisibleTurnCount((count) =>
+      deriveTimelineVisibleTurnCount({
+        currentVisibleTurnCount: count,
+        totalTurns,
+        pageSize,
+        shouldCollapseHistory,
+        historyExpansionRequested: historyExpansionRequestedRef.current
+      })
+    )
+  }, [busy, pageSize, shouldCollapseHistory, totalTurns])
 
   // After a prepend, restore scroll position so the user's viewport
   // doesn't jump.

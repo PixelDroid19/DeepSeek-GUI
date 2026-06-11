@@ -106,6 +106,7 @@ export function buildKunServeArgs(input: {
   port: number
   dataDir: string
   baseUrl?: string
+  endpointFormat?: string
   model: string
   approvalPolicy: string
   sandboxMode: string
@@ -121,6 +122,7 @@ export function buildKunServeArgs(input: {
     '--data-dir',
     input.dataDir,
     ...(input.baseUrl ? ['--base-url', input.baseUrl] : []),
+    ...(input.endpointFormat ? ['--endpoint-format', input.endpointFormat] : []),
     '--model',
     input.model,
     '--approval-policy',

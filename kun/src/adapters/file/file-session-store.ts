@@ -51,7 +51,9 @@ export class FileSessionStore implements SessionStore {
     const path = this.eventsPath(threadId)
     await appendFile(path, `${JSON.stringify(event)}\n`, 'utf-8')
     if (event.kind === 'usage') {
-      await this.compactUsageEventsIfLarge(threadId)
+      await this.compactUsageEventsIfLarge(threadId).catch((error) => {
+        warnUsageCompaction(threadId, error)
+      })
     }
   }
 
@@ -238,4 +240,9 @@ function usageCoalescingBucket(event: RuntimeEvent): string {
     ? new Date(event.timestamp).toISOString().slice(0, 10)
     : event.timestamp
   return `${day}:${event.model ?? ''}`
+}
+
+function warnUsageCompaction(threadId: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error)
+  console.warn(`[kun] usage event compaction failed for ${threadId}; keeping append-only log: ${message}`)
 }

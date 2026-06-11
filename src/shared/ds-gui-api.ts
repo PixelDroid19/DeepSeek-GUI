@@ -56,6 +56,24 @@ import type {
 export type RuntimeRequestResult = { ok: boolean; status: number; body: string }
 export type WorkspacePickResult = { canceled: boolean; path: string | null }
 export type PathOpenResult = { ok: boolean; message?: string }
+export const DESKTOP_COMMANDS = [
+  'undo',
+  'redo',
+  'cut',
+  'copy',
+  'paste',
+  'selectAll',
+  'reload',
+  'zoomIn',
+  'zoomOut',
+  'resetZoom',
+  'toggleDevTools',
+  'minimize',
+  'toggleMaximize',
+  'close',
+  'quit'
+] as const
+export type DesktopCommand = typeof DESKTOP_COMMANDS[number]
 export type SkillSaveResult = { ok: true; path: string } | { ok: false; message: string }
 export type SkillListItem = {
   id: string
@@ -190,6 +208,7 @@ export type DsGuiApi = {
     text: string,
     options?: { workspaceRoot?: string; modelHint?: string; mode?: 'agent' | 'plan' }
   ) => Promise<ScheduleTaskFromTextResult>
+  runDesktopCommand: (command: DesktopCommand) => Promise<void>
   openExternal: (url: string) => Promise<void>
   showTurnCompleteNotification: (
     payload: TurnCompleteNotificationPayload
@@ -203,4 +222,5 @@ export type DsGuiApi = {
   logError: (category: string, message: string, detail?: unknown) => Promise<void>
   getLogPath: () => Promise<string>
   openLogDir: () => Promise<{ ok: boolean; message?: string }>
+  getPathForFile: (file: File) => string
 }

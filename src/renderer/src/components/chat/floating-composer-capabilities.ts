@@ -26,6 +26,7 @@ export function resolveComposerCapabilityState(input: {
   hasPlanCommand: boolean
   hasReviewCommand: boolean
 }): {
+  canEditComposer: boolean
   canCompose: boolean
   canChangeModel: boolean
   canSend: boolean
@@ -39,6 +40,11 @@ export function resolveComposerCapabilityState(input: {
   showToolbarStartControls: boolean
   stretchModelPicker: boolean
 } {
+  const canEditComposer = input.runtimeReady && (
+    input.route === 'claw'
+      ? input.clawHasInboundConversation
+      : true
+  )
   const canCompose = input.runtimeReady && (
     input.route === 'claw'
       ? input.clawHasInboundConversation
@@ -52,6 +58,7 @@ export function resolveComposerCapabilityState(input: {
   const canOpenComposerMenu = showComposerMenuButton && (canTogglePlanMode || canOpenGoalPanel || canRunReview)
   const showToolbarStartControls = input.attachmentUploadEnabled || showComposerMenuButton
   return {
+    canEditComposer,
     canCompose,
     canChangeModel: canCompose && !input.busy,
     canSend: canCompose && (

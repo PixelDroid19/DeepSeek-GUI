@@ -8,6 +8,7 @@ import { drawSelection, EditorView, highlightActiveLine, keymap, type ViewUpdate
 import { buildInlineCompletionExtension, buildInlineCompletionPayload } from '../../write/inline-completion'
 import { writeMarkdownLivePreviewExtensions } from '../../write/markdown-live-preview'
 import { createWriteRecentEdit, type WriteRecentEdit } from '../../write/recent-edits'
+import { buildWriteTemplateShortcutExpansion } from '../../write/template-shortcuts'
 import {
   buildWriteCanonicalTermPropagationChanges,
   buildWriteTermPropagationChanges,
@@ -219,8 +220,12 @@ function buildEditorTheme(appearance: 'source' | 'live'): Extension {
     '.cm-cursor, .cm-dropCursor': {
       borderLeftColor: 'var(--ds-text)'
     },
-    '.cm-selectionBackground, ::selection': {
-      backgroundColor: 'var(--ds-selection)'
+    '.cm-selectionBackground': {
+      backgroundColor: 'var(--write-selection-bg, var(--ds-selection))'
+    },
+    '.cm-content::selection, .cm-content *::selection': {
+      backgroundColor: 'var(--write-selection-bg, var(--ds-selection))',
+      color: 'var(--write-selection-text, inherit)'
     },
     '.cm-gutters': {
       display: 'none'
@@ -268,6 +273,28 @@ function buildPastedImageMarkdown(
     text,
     cursor: from + text.length
   }
+}
+
+function expandWriteTemplateShortcut(view: EditorView): boolean {
+  const selection = view.state.selection.main
+  if (!selection.empty) return false
+  const expansion = buildWriteTemplateShortcutExpansion({
+    text: view.state.doc.toString(),
+    cursor: selection.head
+  })
+  if (!expansion) return false
+
+  const nextHead = expansion.from + expansion.insert.length
+  view.dispatch({
+    changes: {
+      from: expansion.from,
+      to: expansion.to,
+      insert: expansion.insert
+    },
+    selection: EditorSelection.cursor(nextHead),
+    scrollIntoView: true
+  })
+  return true
 }
 
 export function WriteMarkdownEditor({
@@ -410,6 +437,13 @@ export function WriteMarkdownEditor({
         keymap.of([
           ...defaultKeymap,
           ...historyKeymap,
+          {
+            key: 'Tab',
+            run: (view) => {
+              if (readOnlyRef.current) return false
+              return expandWriteTemplateShortcut(view)
+            }
+          },
           indentWithTab,
           {
             key: 'Mod-s',

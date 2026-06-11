@@ -351,6 +351,19 @@ export const echoTool: LocalTool = LocalToolHost.defineTool({
 })
 
 function createUserInputTool(name: string): LocalTool {
+  const optionSchema = {
+    anyOf: [
+      { type: 'string' },
+      {
+        type: 'object',
+        properties: {
+          label: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['label']
+      }
+    ]
+  }
   return LocalToolHost.defineTool({
     name,
     description: 'Ask the GUI user a structured question and wait for the answer.',
@@ -360,12 +373,34 @@ function createUserInputTool(name: string): LocalTool {
       properties: {
         prompt: { type: 'string' },
         question: { type: 'string' },
-        message: { type: 'string' }
+        message: { type: 'string' },
+        options: {
+          type: 'array',
+          description: 'Optional answer choices for a single question. Use strings or {label, description} objects.',
+          items: optionSchema
+        },
+        questions: {
+          type: 'array',
+          description: 'One to three structured questions. Each question may include answer options.',
+          items: {
+            type: 'object',
+            properties: {
+              header: { type: 'string' },
+              id: { type: 'string' },
+              question: { type: 'string' },
+              options: {
+                type: 'array',
+                items: optionSchema
+              }
+            },
+            required: ['question']
+          }
+        }
       },
       required: []
     },
     policy: 'auto',
-  execute: async (args, context) => {
+    execute: async (args, context) => {
       if (!context.awaitUserInput) {
         return {
           output: { error: 'GUI user input is not available in this runtime context' },
@@ -412,12 +447,17 @@ function normalizeUserInputQuestions(
       .filter((question) => question !== null)
     if (questions.length > 0) return questions
   }
+  const options = Array.isArray(args.options)
+    ? args.options
+        .map((option) => normalizeUserInputOption(option))
+        .filter((option) => option !== null)
+    : []
   return [
     {
       header: 'Input',
       id: String(args.id ?? fallbackId),
       question: fallbackPrompt,
-      options: []
+      options
     }
   ]
 }
@@ -454,6 +494,12 @@ function normalizeUserInputQuestion(
 function normalizeUserInputOption(
   value: unknown
 ): { label: string; description: string } | null {
+  if (typeof value === 'string' && value.trim()) {
+    return {
+      label: value.trim(),
+      description: ''
+    }
+  }
   if (!value || typeof value !== 'object') return null
   const raw = value as Record<string, unknown>
   const label = typeof raw.label === 'string' && raw.label.trim() ? raw.label.trim() : null

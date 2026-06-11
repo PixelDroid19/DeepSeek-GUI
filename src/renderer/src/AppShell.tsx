@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect } from 'react'
 import { useChatStore } from './store/chat-store'
+import { supportsDesktopTitleBar, WindowsTitleBar } from './components/WindowsTitleBar'
 
 const Workbench = lazy(() =>
   import('./components/Workbench').then((module) => ({ default: module.Workbench }))
@@ -21,6 +22,8 @@ export default function AppShell(): React.ReactElement {
   const route = useChatStore((s) => s.route)
   const boot = useChatStore((s) => s.boot)
   const initialSetupOpen = useChatStore((s) => s.initialSetupOpen)
+  const platform = typeof window !== 'undefined' ? window.dsGui?.platform ?? 'unknown' : 'unknown'
+  const hasDesktopTitleBar = supportsDesktopTitleBar(platform)
 
   useEffect(() => {
     let frame = 0
@@ -36,10 +39,13 @@ export default function AppShell(): React.ReactElement {
   }, [boot])
 
   return (
-    <div className="h-full min-h-0 bg-transparent">
-      <Suspense fallback={<RouteFallback />}>
-        {route === 'settings' ? <SettingsView /> : <Workbench />}
-      </Suspense>
+    <div className={hasDesktopTitleBar ? 'ds-windows-app-frame flex h-full min-h-0 flex-col bg-ds-main' : 'flex h-full min-h-0 flex-col bg-transparent'}>
+      {hasDesktopTitleBar ? <WindowsTitleBar platform={platform} /> : null}
+      <div className="flex min-h-0 flex-1 flex-col">
+        <Suspense fallback={<RouteFallback />}>
+          {route === 'settings' ? <SettingsView /> : <Workbench />}
+        </Suspense>
+      </div>
       {initialSetupOpen ? (
         <Suspense fallback={null}>
           <InitialSetupDialog />

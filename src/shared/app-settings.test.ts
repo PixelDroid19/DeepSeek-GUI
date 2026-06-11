@@ -6,6 +6,7 @@ import {
   DEFAULT_KUN_DATA_DIR,
   DEFAULT_KUN_MODEL,
   DEFAULT_APPROVAL_POLICY,
+  DEFAULT_SANDBOX_MODE,
   DEFAULT_WEIXIN_BRIDGE_RPC_URL,
   DEFAULT_SCHEDULE_INTERNAL_PORT,
   buildClawRuntimePrompt,
@@ -16,11 +17,13 @@ import {
   defaultKunRuntimeSettings,
   defaultScheduleSettings,
   defaultWriteSettings,
+  defaultKeyboardShortcuts,
   isKunRuntimeInsecure,
   migrateLegacyAppSettings,
   normalizeAppSettings,
   parseClawUserPromptForDisplay,
   normalizeScheduleSettings,
+  resolveKunRuntimeSettings,
   resolveWriteInlineCompletionApiKey,
   resolveWriteInlineCompletionBaseUrl,
   resolveWriteInlineCompletionModel,
@@ -42,10 +45,13 @@ function settings(): AppSettingsV1 {
     workspaceRoot: '/tmp/workspace',
     log: { enabled: false, retentionDays: 7 },
     notifications: { turnComplete: true },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
+    keyboardShortcuts: defaultKeyboardShortcuts(),
     write: defaultWriteSettings(),
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
-    guiUpdate: { channel: 'stable' }
+    guiUpdate: { channel: 'stable' },
+    codePromptPrefix: ''
   }
 }
 
@@ -85,6 +91,11 @@ describe('kun defaults', () => {
   it('defaults approval policy to auto', () => {
     expect(defaultKunRuntimeSettings().approvalPolicy).toBe(DEFAULT_APPROVAL_POLICY)
     expect(defaultKunRuntimeSettings().approvalPolicy).toBe('auto')
+  })
+
+  it('defaults sandbox mode to full access', () => {
+    expect(defaultKunRuntimeSettings().sandboxMode).toBe(DEFAULT_SANDBOX_MODE)
+    expect(defaultKunRuntimeSettings().sandboxMode).toBe('danger-full-access')
   })
 
   it('defaults token economy mode to off', () => {
@@ -139,6 +150,51 @@ describe('kun defaults', () => {
           maxStringBytes: 524288
         }
       }
+    })
+  })
+})
+
+describe('app behavior settings', () => {
+  it('defaults desktop behavior to off', () => {
+    const raw = {
+      ...settings(),
+      appBehavior: undefined
+    } as unknown as AppSettingsV1
+
+    expect(normalizeAppSettings(raw).appBehavior).toEqual({
+      openAtLogin: false,
+      startMinimized: false,
+      closeToTray: false
+    })
+  })
+
+  it('only keeps start minimized when open at login is enabled', () => {
+    const normalized = normalizeAppSettings({
+      ...settings(),
+      appBehavior: {
+        openAtLogin: false,
+        startMinimized: true,
+        closeToTray: true
+      }
+    })
+
+    expect(normalized.appBehavior).toEqual({
+      openAtLogin: false,
+      startMinimized: false,
+      closeToTray: true
+    })
+  })
+})
+
+describe('keyboard shortcut settings', () => {
+  it('defaults shortcut overrides to empty', () => {
+    const raw = {
+      ...settings(),
+      keyboardShortcuts: undefined
+    } as unknown as AppSettingsV1
+
+    expect(normalizeAppSettings(raw).keyboardShortcuts).toEqual({
+      bindings: {}
     })
   })
 })
@@ -423,6 +479,56 @@ describe('legacy Kun defaults migration', () => {
       dataDir: '/tmp/custom-kun',
       model: 'deepseek-v4-flash'
     }))
+  })
+
+  it('preserves custom model providers while migrating legacy settings', () => {
+    const migrated = normalizeAppSettings({
+      ...settings(),
+      agentProvider: 'deepseek-runtime',
+      provider: {
+        apiKey: 'sk-default',
+        baseUrl: 'https://api.deepseek.com',
+        providers: [
+          ...defaultModelProviderSettings().providers,
+          {
+            id: 'custom-provider-2',
+            name: 'Custom Provider',
+            apiKey: 'sk-custom',
+            baseUrl: 'https://custom.example/v1',
+            endpointFormat: 'responses',
+            models: ['custom-model']
+          }
+        ]
+      },
+      agents: {
+        kun: {
+          ...defaultKunRuntimeSettings(),
+          providerId: 'custom-provider-2',
+          model: 'custom-model'
+        }
+      }
+    } as unknown as AppSettingsV1)
+
+    expect(migrated.provider.providers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'custom-provider-2',
+          name: 'Custom Provider',
+          apiKey: 'sk-custom',
+          baseUrl: 'https://custom.example/v1',
+          endpointFormat: 'responses',
+          models: ['custom-model']
+        })
+      ])
+    )
+    expect(migrated.agents.kun.providerId).toBe('custom-provider-2')
+    expect(resolveKunRuntimeSettings(migrated)).toEqual(
+      expect.objectContaining({
+        apiKey: 'sk-custom',
+        baseUrl: 'https://custom.example/v1',
+        endpointFormat: 'responses'
+      })
+    )
   })
 })
 

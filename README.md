@@ -20,34 +20,34 @@ DeepSeek GUI 是一个面向开发者和高频 AI 工作者的本地桌面工作
 ---
 
 <p align="center">
-  <video autoplay loop muted playsinline style="width: 49%; max-width: 100%;">
-    <source src="src/asset/img/code.mp4" type="video/mp4">
-  </video>
-  <video autoplay loop muted playsinline style="width: 49%; max-width: 100%;">
-    <source src="src/asset/img/write.mp4" type="video/mp4">
-  </video>
+  <a href="src/asset/img/code.mp4">
+    <img src="src/asset/img/code.gif" width="410" alt="DeepSeek GUI Code 模式演示">
+  </a>
+  <a href="src/asset/img/write.mp4">
+    <img src="src/asset/img/write.gif" width="410" alt="DeepSeek GUI 写作模式演示">
+  </a>
 </p>
 
 ## 更多演示
 
 <p align="center">
-  <video autoplay loop muted playsinline style="width: 860px; max-width: 100%;">
-    <source src="src/asset/img/feishu.mp4" type="video/mp4">
-  </video>
+  <a href="src/asset/img/feishu.mp4">
+    <img src="src/asset/img/feishu.gif" width="680" alt="飞书 / Lark / 微信连接演示">
+  </a>
 </p>
 <p align="center"><em>飞书 / Lark / 微信连接演示。</em></p>
 
 <p align="center">
-  <video autoplay loop muted playsinline style="width: 860px; max-width: 100%;">
-    <source src="src/asset/img/sdd.mp4" type="video/mp4">
-  </video>
+  <a href="src/asset/img/sdd.mp4">
+    <img src="src/asset/img/sdd.gif" width="680" alt="新建需求与计划演示">
+  </a>
 </p>
 <p align="center"><em>新建需求与计划演示。</em></p>
 
 <p align="center">
-  <video autoplay loop muted playsinline style="width: 860px; max-width: 100%;">
-    <source src="src/asset/img/web.mp4" type="video/mp4">
-  </video>
+  <a href="src/asset/img/web.mp4">
+    <img src="src/asset/img/web.gif" width="680" alt="Web 工具演示">
+  </a>
 </p>
 <p align="center"><em>Web 工具演示。</em></p>
 
@@ -375,8 +375,8 @@ npm run build           # 生产构建
 npm run dist:mac        # macOS 安装包
 npm run dist:win        # Windows 安装包（在 Windows 上运行）
 npm run dist:linux      # Linux AppImage
-npm run release:mac     # 在 macOS 上构建并上传 macOS release 资源
-npm run release:win     # 在 Windows 上构建并上传 Windows release 资源
+npm run release:mac     # 手动兜底：构建并上传 macOS release 资源
+npm run release:win     # 手动兜底：构建并上传 Windows release 资源
 ```
 
 更多开发流程请看 [DEVELOPMENT.zh-CN.md](./docs/DEVELOPMENT.zh-CN.md)。
@@ -408,6 +408,10 @@ Kun 的设计站在先行项目的肩膀上：
 - **OpenHanako**：Markdown live 编辑、写作空间、选中文本 inline agent 等 Write 模式交互和实现方案给了本项目重要参考。
 - **[DeepSeek](https://github.com/deepseek-ai)**：提供模型与 API。
 - 所有为 DeepSeek GUI 提交 issue、建议、代码和文档的贡献者。
+
+<a href="https://github.com/XingYu-Zhong/DeepSeek-GUI/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=XingYu-Zhong/DeepSeek-GUI" />
+</a>
 
 > [!NOTE]
 > 本项目与 DeepSeek Inc. 无隶属关系。

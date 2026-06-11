@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { defaultKunRuntimeSettings } from '@shared/app-settings'
-import { AgentsSettingsSection } from './settings-section-agents'
+import {
+  DEFAULT_MODEL_PROVIDER_ID,
+  defaultKunRuntimeSettings,
+  defaultModelProviderSettings,
+  type ModelProviderProfileV1
+} from '@shared/app-settings'
+import { AgentsSettingsSection, modelProvidersSettingsPatch } from './settings-section-agents'
 
 const labels: Record<string, string> = {
   agentsQuickBase: 'Base',
@@ -12,6 +17,10 @@ const labels: Record<string, string> = {
   agents: 'Agents',
   kunProvider: 'Provider',
   kunProviderDesc: 'Provider description',
+  modelProviderEndpointFormat: 'Endpoint format',
+  modelEndpointChatCompletions: '/v1/chat/completions',
+  modelEndpointResponses: '/v1/responses',
+  modelEndpointMessages: '/v1/messages',
   kunApiKey: 'Kun API key',
   kunApiKeyDesc: 'Kun API key description',
   kunApiKeyPlaceholder: 'Inherit API key',
@@ -293,6 +302,85 @@ function baseCtx(): Record<string, unknown> {
 }
 
 describe('AgentsSettingsSection Kun diagnostics smoke', () => {
+  it('builds a single patch when adding and selecting a model provider', () => {
+    const provider = defaultModelProviderSettings()
+    const customProvider = {
+      id: 'custom-provider-2',
+      name: 'Custom Provider',
+      apiKey: '',
+      baseUrl: 'https://api.example.com/v1',
+      endpointFormat: 'responses',
+      models: []
+    } satisfies ModelProviderProfileV1
+
+    const patch = modelProvidersSettingsPatch({
+      provider,
+      providers: [...provider.providers, customProvider],
+      kun: { providerId: customProvider.id }
+    })
+
+    expect(patch.provider?.providers).toEqual([...provider.providers, customProvider])
+    expect(patch.agents?.kun?.providerId).toBe(customProvider.id)
+  })
+
+  it('builds a single patch when removing the active model provider', () => {
+    const provider = defaultModelProviderSettings()
+
+    const patch = modelProvidersSettingsPatch({
+      provider: {
+        ...provider,
+        providers: [
+          ...provider.providers,
+          {
+            id: 'custom-provider-2',
+            name: 'Custom Provider',
+            apiKey: '',
+            baseUrl: 'https://api.example.com/v1',
+            endpointFormat: 'responses',
+            models: []
+          }
+        ]
+      },
+      providers: provider.providers,
+      kun: { providerId: DEFAULT_MODEL_PROVIDER_ID }
+    })
+
+    expect(patch.provider?.providers).toEqual(provider.providers)
+    expect(patch.agents?.kun?.providerId).toBe(DEFAULT_MODEL_PROVIDER_ID)
+  })
+
+  it('renders custom model provider id as editable', () => {
+    const provider = defaultModelProviderSettings()
+    const customProvider = {
+      id: 'custom-provider-2',
+      name: 'Custom Provider',
+      apiKey: '',
+      baseUrl: 'https://api.example.com/v1',
+      endpointFormat: 'messages',
+      models: []
+    } satisfies ModelProviderProfileV1
+    const html = renderToStaticMarkup(createElement(AgentsSettingsSection, {
+      ctx: {
+        ...baseCtx(),
+        provider: {
+          ...provider,
+          providers: [...provider.providers, customProvider]
+        },
+        kun: {
+          ...defaultKunRuntimeSettings(),
+          providerId: customProvider.id
+        }
+      }
+    }))
+    const providerIdInput = html.match(/<input[^>]+value="custom-provider-2"[^>]*>/)?.[0]
+
+    expect(providerIdInput).toBeTruthy()
+    expect(providerIdInput).not.toContain('readOnly')
+    expect(providerIdInput).not.toContain('readonly')
+    expect(html).toContain('Endpoint format')
+    expect(html).toContain('<option value="messages" selected="">/v1/messages</option>')
+  })
+
   it('keeps advanced agent controls behind collapsed disclosures', () => {
     const html = renderToStaticMarkup(createElement(AgentsSettingsSection, { ctx: baseCtx() }))
 

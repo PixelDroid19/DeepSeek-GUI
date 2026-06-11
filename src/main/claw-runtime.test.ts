@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
   defaultClawSettings,
+  defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
@@ -27,6 +28,8 @@ function buildSettings(): AppSettingsV1 {
     workspaceRoot: '/tmp/workspace',
     log: { enabled: true, retentionDays: 7 },
     notifications: { turnComplete: true },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
+    keyboardShortcuts: defaultKeyboardShortcuts(),
     write: defaultWriteSettings(),
     schedule: defaultScheduleSettings(),
     claw: {
@@ -53,7 +56,8 @@ function buildSettings(): AppSettingsV1 {
         }
       ]
     },
-    guiUpdate: { channel: 'stable' }
+    guiUpdate: { channel: 'stable' },
+    codePromptPrefix: ''
   }
 }
 
@@ -568,14 +572,14 @@ describe('ClawRuntime', () => {
       sendFeishuMessage: (
         bridge: { send: typeof send },
         to: string,
-        input: { text: string },
+        input: { markdown: string },
         options: { replyTo?: string; replyInThread?: boolean },
         context: Record<string, unknown>
       ) => Promise<{ messageId: string }>
     }).sendFeishuMessage(
       { send },
       'oc_chat_a',
-      { text: 'agent reply' },
+      { markdown: 'agent reply' },
       { replyTo: 'om_inbound', replyInThread: true },
       { purpose: 'agent-reply', channelId: 'channel_1' }
     )
@@ -584,13 +588,13 @@ describe('ClawRuntime', () => {
     expect(send).toHaveBeenNthCalledWith(
       1,
       'oc_chat_a',
-      { text: 'agent reply' },
+      { markdown: 'agent reply' },
       { replyTo: 'om_inbound', replyInThread: true }
     )
     expect(send).toHaveBeenNthCalledWith(
       2,
       'oc_chat_a',
-      { text: 'agent reply' },
+      { markdown: 'agent reply' },
       { replyTo: undefined, replyInThread: undefined }
     )
     expect(logError).toHaveBeenCalledWith(
@@ -653,7 +657,7 @@ describe('ClawRuntime', () => {
     expect(runtimeRequest).not.toHaveBeenCalled()
     expect(send).toHaveBeenCalledWith(
       'oc_chat_a',
-      { text: 'Started a new topic. The next message will create a fresh local conversation.' },
+      { markdown: 'Started a new topic. The next message will create a fresh local conversation.' },
       { replyTo: 'om_inbound', replyInThread: false }
     )
     expect(current().claw.channels[0].threadId).toBe('')
@@ -707,7 +711,7 @@ describe('ClawRuntime', () => {
     expect(current().claw.channels[0].model).toBe('deepseek-v4-flash')
     expect(send).toHaveBeenCalledWith(
       'oc_chat_a',
-      { text: 'Claw IM model switched to `deepseek-v4-flash`.' },
+      { markdown: 'Claw IM model switched to `deepseek-v4-flash`.' },
       { replyTo: 'om_inbound', replyInThread: false }
     )
   })
@@ -852,6 +856,306 @@ describe('ClawRuntime', () => {
     })
   })
 
+  it('waits for the current WeChat turn to complete before returning the final reply', async () => {
+    const settings = buildSettings()
+    settings.claw.im.enabled = true
+    settings.claw.im.responseTimeoutMs = 2_500
+    settings.claw.channels = [buildChannel({
+      provider: 'weixin' as const,
+      id: 'channel_weixin',
+      label: 'WeChat',
+      threadId: '',
+      conversations: []
+    })]
+    const { store } = mutableSettingsStore(settings)
+    let getCount = 0
+    const runtimeRequest = vi.fn(async (_settings, path, init) => {
+      if (path === '/v1/threads' && init?.method === 'POST') {
+        return { ok: true, status: 201, body: JSON.stringify({ id: 'thr_weixin' }) }
+      }
+      if (path === '/v1/threads/thr_weixin' && init?.method === 'PATCH') {
+        return { ok: true, status: 200, body: '{}' }
+      }
+      if (path === '/v1/threads/thr_weixin/turns' && init?.method === 'POST') {
+        return { ok: true, status: 202, body: JSON.stringify({ turnId: 'turn_weixin' }) }
+      }
+      if (path === '/v1/threads/thr_weixin' && init?.method === 'GET') {
+        getCount += 1
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify(getCount === 1
+            ? {
+                id: 'thr_weixin',
+                status: 'running',
+                turns: [
+                  {
+                    id: 'turn_previous',
+                    status: 'completed',
+                    items: [{ kind: 'assistant_text', text: 'previous reply' }]
+                  },
+                  {
+                    id: 'turn_weixin',
+                    status: 'running',
+                    items: [
+                      { kind: 'assistant_text', text: 'intermediate reply' },
+                      { kind: 'tool_call', detail: 'checking disk usage' }
+                    ]
+                  }
+                ]
+              }
+            : {
+                id: 'thr_weixin',
+                status: 'idle',
+                turns: [
+                  {
+                    id: 'turn_previous',
+                    status: 'completed',
+                    items: [{ kind: 'assistant_text', text: 'previous reply' }]
+                  },
+                  {
+                    id: 'turn_weixin',
+                    status: 'completed',
+                    items: [
+                      { kind: 'assistant_text', text: 'intermediate reply' },
+                      { kind: 'tool_result', detail: 'tool finished' },
+                      { kind: 'assistant_text', text: 'final result' }
+                    ]
+                  }
+                ]
+              })
+        }
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const runtime = createClawRuntime({
+      store: store as never,
+      runtimeRequest: runtimeRequest as never,
+      logError: () => undefined,
+      createScheduledTaskFromText: vi.fn(async () => ({ kind: 'noop' as const }))
+    })
+    const body = JSON.stringify({
+      text: 'clean disk',
+      provider: 'weixin',
+      channelId: 'channel_weixin',
+      chatId: 'wx_user_1',
+      messageId: 'wx_msg_1',
+      senderId: 'wx_user_1',
+      senderName: 'Alice'
+    })
+    const req = {
+      method: 'POST',
+      url: settings.claw.im.path,
+      headers: {},
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.from(body)
+      }
+    }
+    let status = 0
+    let responseBody = ''
+    const res = {
+      writeHead: vi.fn((nextStatus: number) => {
+        status = nextStatus
+      }),
+      end: vi.fn((payload: string) => {
+        responseBody = payload
+      })
+    }
+
+    await (runtime as unknown as {
+      handleWebhook: (request: typeof req, response: typeof res) => Promise<void>
+    }).handleWebhook(req, res)
+
+    expect(status).toBe(200)
+    expect(JSON.parse(responseBody)).toMatchObject({
+      ok: true,
+      reply: 'final result'
+    })
+    expect(getCount).toBe(2)
+  })
+
+  it('does not return a previous WeChat session reply for a new turn', async () => {
+    const settings = buildSettings()
+    settings.claw.im.enabled = true
+    settings.claw.im.responseTimeoutMs = 10
+    settings.claw.channels = [buildChannel({
+      provider: 'weixin' as const,
+      id: 'channel_weixin',
+      label: 'WeChat',
+      threadId: 'thr_weixin',
+      conversations: [buildConversation({
+        chatId: 'wx_user_1',
+        latestMessageId: 'wx_previous',
+        senderId: 'wx_user_1',
+        senderName: 'Alice',
+        localThreadId: 'thr_weixin'
+      })]
+    })]
+    const { store } = mutableSettingsStore(settings)
+    const runtimeRequest = vi.fn(async (_settings, path, init) => {
+      if (path === '/v1/threads/thr_weixin/turns' && init?.method === 'POST') {
+        return { ok: true, status: 202, body: JSON.stringify({ turnId: 'turn_current' }) }
+      }
+      if (path === '/v1/threads/thr_weixin' && init?.method === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify({
+            id: 'thr_weixin',
+            status: 'idle',
+            turns: [
+              {
+                id: 'turn_previous',
+                status: 'completed',
+                items: [{ kind: 'assistant_text', text: 'previous reply' }]
+              },
+              {
+                id: 'turn_current',
+                status: 'completed',
+                items: []
+              }
+            ]
+          })
+        }
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const runtime = createClawRuntime({
+      store: store as never,
+      runtimeRequest: runtimeRequest as never,
+      logError: () => undefined,
+      createScheduledTaskFromText: vi.fn(async () => ({ kind: 'noop' as const }))
+    })
+    const body = JSON.stringify({
+      text: 'new question',
+      provider: 'weixin',
+      channelId: 'channel_weixin',
+      chatId: 'wx_user_1',
+      messageId: 'wx_msg_2',
+      senderId: 'wx_user_1',
+      senderName: 'Alice'
+    })
+    const req = {
+      method: 'POST',
+      url: settings.claw.im.path,
+      headers: {},
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.from(body)
+      }
+    }
+    let status = 0
+    let responseBody = ''
+    const res = {
+      writeHead: vi.fn((nextStatus: number) => {
+        status = nextStatus
+      }),
+      end: vi.fn((payload: string) => {
+        responseBody = payload
+      })
+    }
+
+    await (runtime as unknown as {
+      handleWebhook: (request: typeof req, response: typeof res) => Promise<void>
+    }).handleWebhook(req, res)
+
+    expect(status).toBe(500)
+    expect(JSON.parse(responseBody)).toMatchObject({
+      ok: false,
+      message: 'Timed out waiting for agent response.'
+    })
+  })
+
+  it('does not return historical WeChat text when the current turn fails', async () => {
+    const settings = buildSettings()
+    settings.claw.im.enabled = true
+    settings.claw.im.responseTimeoutMs = 2_000
+    settings.claw.channels = [buildChannel({
+      provider: 'weixin' as const,
+      id: 'channel_weixin',
+      label: 'WeChat',
+      threadId: 'thr_weixin',
+      conversations: [buildConversation({
+        chatId: 'wx_user_1',
+        latestMessageId: 'wx_previous',
+        senderId: 'wx_user_1',
+        senderName: 'Alice',
+        localThreadId: 'thr_weixin'
+      })]
+    })]
+    const { store } = mutableSettingsStore(settings)
+    const runtimeRequest = vi.fn(async (_settings, path, init) => {
+      if (path === '/v1/threads/thr_weixin/turns' && init?.method === 'POST') {
+        return { ok: true, status: 202, body: JSON.stringify({ turnId: 'turn_current' }) }
+      }
+      if (path === '/v1/threads/thr_weixin' && init?.method === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify({
+            id: 'thr_weixin',
+            status: 'idle',
+            turns: [
+              {
+                id: 'turn_previous',
+                status: 'completed',
+                items: [{ kind: 'assistant_text', text: 'previous reply' }]
+              },
+              {
+                id: 'turn_current',
+                status: 'failed',
+                items: []
+              }
+            ]
+          })
+        }
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const runtime = createClawRuntime({
+      store: store as never,
+      runtimeRequest: runtimeRequest as never,
+      logError: () => undefined,
+      createScheduledTaskFromText: vi.fn(async () => ({ kind: 'noop' as const }))
+    })
+    const body = JSON.stringify({
+      text: 'new question',
+      provider: 'weixin',
+      channelId: 'channel_weixin',
+      chatId: 'wx_user_1',
+      messageId: 'wx_msg_2',
+      senderId: 'wx_user_1',
+      senderName: 'Alice'
+    })
+    const req = {
+      method: 'POST',
+      url: settings.claw.im.path,
+      headers: {},
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.from(body)
+      }
+    }
+    let status = 0
+    let responseBody = ''
+    const res = {
+      writeHead: vi.fn((nextStatus: number) => {
+        status = nextStatus
+      }),
+      end: vi.fn((payload: string) => {
+        responseBody = payload
+      })
+    }
+
+    await (runtime as unknown as {
+      handleWebhook: (request: typeof req, response: typeof res) => Promise<void>
+    }).handleWebhook(req, res)
+
+    expect(status).toBe(500)
+    expect(JSON.parse(responseBody)).toMatchObject({
+      ok: false,
+      message: 'Agent turn failed.'
+    })
+  })
+
   it('mirrors local Claw thread messages back to the bundled WeChat bridge', async () => {
     const settings = buildSettings()
     settings.claw.im.enabled = true
@@ -982,14 +1286,15 @@ describe('ClawRuntime', () => {
         throw new Error(`unexpected path ${path}`)
       })
       const send = vi.fn(async () => ({ messageId: 'om_sent' }))
+      const addReaction = vi.fn(async () => 'rc_file_1')
       const runtime = createClawRuntime({
         store: store as never,
         runtimeRequest,
         logError: () => undefined
       })
-      ;(runtime as unknown as { feishuChannels: Map<string, { send: typeof send }> })
+      ;(runtime as unknown as { feishuChannels: Map<string, { send: typeof send, addReaction: typeof addReaction }> })
         .feishuChannels
-        .set('channel_1', { send })
+        .set('channel_1', { send, addReaction })
 
       await (runtime as unknown as {
         handleFeishuMessage: (channelId: string, message: {
@@ -1021,7 +1326,7 @@ describe('ClawRuntime', () => {
       expect(send).toHaveBeenNthCalledWith(
         1,
         'oc_chat_a',
-        { text: '可以，我把 hello.md 作为附件发给你。' },
+        { markdown: '可以，我把 hello.md 作为附件发给你。' },
         { replyTo: 'om_inbound', replyInThread: false }
       )
       expect(send).toHaveBeenNthCalledWith(
@@ -1030,8 +1335,282 @@ describe('ClawRuntime', () => {
         { file: { source: realFilePath, fileName: 'hello.md' } },
         { replyTo: 'om_inbound', replyInThread: false }
       )
+      // The direct-file path is fast (synchronous file lookup + upload) and
+      // The direct-file path is fast (synchronous file lookup + upload) and
+      // must NOT add a pending reaction — that would be visually noisy.
+      const addReactionSpy = (runtime as unknown as { feishuChannels: Map<string, { addReaction: ReturnType<typeof vi.fn> }> })
+        .feishuChannels.get('channel_1')?.addReaction
+      expect(addReactionSpy).not.toHaveBeenCalled()
     } finally {
       await rm(workspaceRoot, { recursive: true, force: true })
     }
+  })
+
+  it('sends agent reply containing markdown as Feishu / Lark markdown', async () => {
+    const settings = buildSettings()
+    settings.claw.im.enabled = true
+    settings.claw.im.responseTimeoutMs = 2_000
+    settings.claw.channels = [buildChannel({ threadId: 'thr_1', conversations: [buildConversation({ localThreadId: 'thr_1' })] })]
+    const store = {
+      load: vi.fn(async () => settings),
+      patch: vi.fn(async () => settings)
+    }
+    const markdownReply = '**bold** `code`\n- item 1\n- item 2'
+    const runtimeRequest = vi.fn(async (_settings, path, init) => {
+      if (path === '/v1/threads/thr_1/turns') {
+        return { ok: true, status: 202, body: JSON.stringify({ threadId: 'thr_1', turnId: 'turn_md' }) }
+      }
+      if (path === '/v1/threads/thr_1' && init?.method === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify({
+            id: 'thr_1',
+            status: 'idle',
+            turns: [
+              {
+                id: 'turn_md',
+                status: 'completed',
+                items: [{ kind: 'assistant_text', text: markdownReply }]
+              }
+            ]
+          })
+        }
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const send = vi.fn(async () => ({ messageId: 'om_md' }))
+    const addReaction = vi.fn(async () => 'rc_test_1')
+    const runtime = createClawRuntime({
+      store: store as never,
+      runtimeRequest,
+      logError: () => undefined
+    })
+    ;(runtime as unknown as { feishuChannels: Map<string, { send: typeof send, addReaction: typeof addReaction }> })
+      .feishuChannels
+      .set('channel_1', { send, addReaction })
+
+    await (runtime as unknown as {
+      handleFeishuMessage: (channelId: string, message: {
+        chatId: string
+        messageId: string
+        threadId?: string
+        senderId: string
+        senderName?: string
+        chatType: 'p2p' | 'group'
+        mentionedBot: boolean
+        mentionAll: boolean
+        content: string
+        rawContentType: string
+        mentions: unknown[]
+      }) => Promise<void>
+    }).handleFeishuMessage('channel_1', {
+      chatId: 'oc_chat_a',
+      messageId: 'om_inbound',
+      senderId: 'ou_1',
+      senderName: 'Alice',
+      chatType: 'p2p',
+      mentionedBot: false,
+      mentionAll: false,
+      content: 'tell me a story',
+      rawContentType: 'text',
+      mentions: []
+    })
+
+    // The pending reaction is added on the user's inbound message BEFORE
+    // the agent reply is sent.
+    expect(addReaction).toHaveBeenCalledWith('om_inbound', 'OnIt')
+    expect(send).toHaveBeenCalledWith(
+      'oc_chat_a',
+      { markdown: markdownReply },
+      { replyTo: 'om_inbound', replyInThread: false }
+    )
+    const textFormCall = (send.mock.calls as unknown as Array<[string, Record<string, unknown>]>)
+      .find(([, input]) => typeof input?.text === 'string')
+    expect(textFormCall).toBeUndefined()
+  })
+
+  it('falls back to markdown form when retrying without replyTo', async () => {
+    const settings = buildSettings()
+    const logError = vi.fn()
+    const send = vi.fn()
+      .mockRejectedValueOnce(new Error('reply permission denied'))
+      .mockResolvedValueOnce({ messageId: 'om_fallback' })
+    const runtime = createClawRuntime({
+      store: { load: vi.fn(async () => settings), patch: vi.fn(async () => settings) } as never,
+      runtimeRequest: vi.fn() as never,
+      logError
+    })
+
+    const result = await (runtime as unknown as {
+      sendFeishuMessage: (
+        bridge: { send: typeof send },
+        to: string,
+        input: { markdown: string },
+        options: { replyTo?: string; replyInThread?: boolean },
+        context: Record<string, unknown>
+      ) => Promise<{ messageId: string }>
+    }).sendFeishuMessage(
+      { send },
+      'oc_chat_a',
+      { markdown: '**hello**' },
+      { replyTo: 'om_inbound', replyInThread: true },
+      { purpose: 'agent-reply', channelId: 'channel_1' }
+    )
+
+    expect(result).toEqual({ messageId: 'om_fallback' })
+    expect(send).toHaveBeenNthCalledWith(
+      1,
+      'oc_chat_a',
+      { markdown: '**hello**' },
+      { replyTo: 'om_inbound', replyInThread: true }
+    )
+    expect(send).toHaveBeenNthCalledWith(
+      2,
+      'oc_chat_a',
+      { markdown: '**hello**' },
+      { replyTo: undefined, replyInThread: undefined }
+    )
+  })
+
+  it('continues agent flow when pending reaction add fails', async () => {
+    const settings = buildSettings()
+    settings.claw.im.enabled = true
+    settings.claw.im.responseTimeoutMs = 2_000
+    settings.claw.channels = [buildChannel({ threadId: 'thr_1', conversations: [buildConversation({ localThreadId: 'thr_1' })] })]
+    const store = {
+      load: vi.fn(async () => settings),
+      patch: vi.fn(async () => settings)
+    }
+    const logError = vi.fn()
+    const agentReply = 'all good'
+    const runtimeRequest = vi.fn(async (_settings, path, init) => {
+      if (path === '/v1/threads/thr_1/turns') {
+        return { ok: true, status: 202, body: JSON.stringify({ threadId: 'thr_1', turnId: 'turn_react_fail' }) }
+      }
+      if (path === '/v1/threads/thr_1' && init?.method === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify({
+            id: 'thr_1',
+            status: 'idle',
+            turns: [
+              {
+                id: 'turn_react_fail',
+                status: 'completed',
+                items: [{ kind: 'assistant_text', text: agentReply }]
+              }
+            ]
+          })
+        }
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const addReaction = vi.fn().mockRejectedValue(new Error('addReaction API error'))
+    const send = vi.fn(async () => ({ messageId: 'om_agent_after_react_fail' }))
+    const runtime = createClawRuntime({
+      store: store as never,
+      runtimeRequest,
+      logError
+    })
+    ;(runtime as unknown as { feishuChannels: Map<string, { send: typeof send, addReaction: typeof addReaction }> })
+      .feishuChannels
+      .set('channel_1', { send, addReaction })
+
+    await (runtime as unknown as {
+      handleFeishuMessage: (channelId: string, message: {
+        chatId: string
+        messageId: string
+        threadId?: string
+        senderId: string
+        senderName?: string
+        chatType: 'p2p' | 'group'
+        mentionedBot: boolean
+        mentionAll: boolean
+        content: string
+        rawContentType: string
+        mentions: unknown[]
+      }) => Promise<void>
+    }).handleFeishuMessage('channel_1', {
+      chatId: 'oc_chat_a',
+      messageId: 'om_inbound_react_fail',
+      senderId: 'ou_1',
+      senderName: 'Alice',
+      chatType: 'p2p',
+      mentionedBot: false,
+      mentionAll: false,
+      content: 'do something',
+      rawContentType: 'text',
+      mentions: []
+    })
+
+    // The pending reaction failure must be logged and swallowed.
+    expect(logError).toHaveBeenCalledWith(
+      'claw-feishu',
+      expect.stringContaining('pending reaction'),
+      expect.objectContaining({
+        message: 'addReaction API error',
+        chatId: 'oc_chat_a',
+        messageId: 'om_inbound_react_fail'
+      })
+    )
+    // The agent reply is still dispatched despite the reaction failure.
+    expect(send).toHaveBeenCalledWith(
+      'oc_chat_a',
+      { markdown: agentReply },
+      { replyTo: 'om_inbound_react_fail', replyInThread: false }
+    )
+  })
+
+  it('does not add a pending reaction for IM commands', async () => {
+    const settings = buildSettings()
+    settings.claw.im.enabled = true
+    settings.claw.channels = [buildChannel()]
+    const store = {
+      load: vi.fn(async () => settings),
+      patch: vi.fn(async () => settings)
+    }
+    const send = vi.fn(async () => ({ messageId: 'om_cmd' }))
+    const addReaction = vi.fn(async () => 'rc_cmd_1')
+    const runtime = createClawRuntime({
+      store: store as never,
+      runtimeRequest: vi.fn() as never,
+      logError: () => undefined
+    })
+    ;(runtime as unknown as { feishuChannels: Map<string, { send: typeof send, addReaction: typeof addReaction }> })
+      .feishuChannels
+      .set('channel_1', { send, addReaction })
+
+    await (runtime as unknown as {
+      handleFeishuMessage: (channelId: string, message: {
+        chatId: string
+        messageId: string
+        threadId?: string
+        senderId: string
+        senderName?: string
+        chatType: 'p2p' | 'group'
+        mentionedBot: boolean
+        mentionAll: boolean
+        content: string
+        rawContentType: string
+        mentions: unknown[]
+      }) => Promise<void>
+    }).handleFeishuMessage('channel_1', {
+      chatId: 'oc_chat_a',
+      messageId: 'om_inbound_cmd',
+      senderId: 'ou_1',
+      senderName: 'Alice',
+      chatType: 'p2p',
+      mentionedBot: false,
+      mentionAll: false,
+      content: '/help',
+      rawContentType: 'text',
+      mentions: []
+    })
+
+    // /help produces a single IM command reply; no pending reaction.
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(addReaction).not.toHaveBeenCalled()
   })
 })

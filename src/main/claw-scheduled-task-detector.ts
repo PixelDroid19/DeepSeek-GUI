@@ -1,7 +1,8 @@
-import type { AppSettingsV1, ScheduleRunMode, ScheduledTaskV1 } from '../shared/app-settings'
+import type { AppSettingsV1, ModelEndpointFormat, ScheduleRunMode, ScheduledTaskV1 } from '../shared/app-settings'
 import {
   DEFAULT_SCHEDULE_MODEL,
   DEFAULT_SCHEDULE_REASONING_EFFORT,
+  modelEndpointPath,
   resolveKunRuntimeSettings
 } from '../shared/app-settings'
 
@@ -16,6 +17,12 @@ type DetectionPayload = {
   scheduleAt?: string
   reminderBody?: string
   taskName?: string
+}
+
+type DetectionRequestPayload = {
+  url: string
+  headers: Record<string, string>
+  body: Record<string, unknown>
 }
 
 export type ParsedClawScheduledTaskRequest = {
@@ -133,15 +140,27 @@ function normalizeDetectedRequest(
   }
 }
 
-function buildChatCompletionsUrl(baseUrl: string): string {
+function buildModelEndpointUrl(baseUrl: string, endpointFormat: ModelEndpointFormat): string {
+  const path = modelEndpointPath(endpointFormat)
   const normalized = baseUrl.replace(/\/+$/, '')
-  if (!normalized) return '/v1/chat/completions'
-  if (normalized.endsWith('/chat/completions')) return normalized
-  if (normalized.endsWith('/v1')) return `${normalized}/chat/completions`
-  if (normalized.endsWith('/beta')) {
-    return `${normalized.slice(0, -5)}/v1/chat/completions`
+  if (!normalized) return `/v1/${path}`
+  if (normalized.endsWith(`/${path}`)) return normalized
+  const base = stripKnownEndpointPath(normalized)
+  if (base.endsWith('/v1')) return `${base}/${path}`
+  if (base.endsWith('/beta')) {
+    return `${base.slice(0, -5)}/v1/${path}`
   }
-  return `${normalized}/v1/chat/completions`
+  return `${base}/v1/${path}`
+}
+
+function stripKnownEndpointPath(baseUrl: string): string {
+  const lower = baseUrl.toLowerCase()
+  for (const path of ['chat/completions', 'responses', 'messages']) {
+    if (lower.endsWith(`/${path}`)) {
+      return baseUrl.slice(0, -path.length).replace(/\/+$/, '')
+    }
+  }
+  return baseUrl
 }
 
 function buildDetectionPrompt(now: Date): string {
@@ -165,6 +184,96 @@ function detectionModel(model: string): string {
   return trimmed && trimmed !== DEFAULT_SCHEDULE_MODEL ? trimmed : 'deepseek-v4-flash'
 }
 
+function buildDetectionRequest(input: {
+  baseUrl: string
+  apiKey: string
+  endpointFormat: ModelEndpointFormat
+  model: string
+  systemPrompt: string
+  sourceText: string
+}): DetectionRequestPayload {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${input.apiKey}`
+  }
+  if (input.endpointFormat === 'messages') {
+    headers['x-api-key'] = input.apiKey
+    headers['anthropic-version'] = '2023-06-01'
+  }
+  if (input.endpointFormat === 'responses') {
+    return {
+      url: buildModelEndpointUrl(input.baseUrl, input.endpointFormat),
+      headers,
+      body: {
+        model: input.model,
+        instructions: input.systemPrompt,
+        input: input.sourceText,
+        max_output_tokens: 300,
+        text: { format: { type: 'json_object' } }
+      }
+    }
+  }
+  if (input.endpointFormat === 'messages') {
+    return {
+      url: buildModelEndpointUrl(input.baseUrl, input.endpointFormat),
+      headers,
+      body: {
+        model: input.model,
+        system: input.systemPrompt,
+        messages: [{ role: 'user', content: input.sourceText }],
+        max_tokens: 300
+      }
+    }
+  }
+  return {
+    url: buildModelEndpointUrl(input.baseUrl, input.endpointFormat),
+    headers,
+    body: {
+      model: input.model,
+      messages: [
+        { role: 'system', content: input.systemPrompt },
+        { role: 'user', content: input.sourceText }
+      ],
+      max_tokens: 300,
+      response_format: { type: 'json_object' }
+    }
+  }
+}
+
+function extractDetectionContent(rawJson: string, endpointFormat: ModelEndpointFormat): string {
+  const parsed = JSON.parse(rawJson) as Record<string, unknown>
+  if (endpointFormat === 'responses') {
+    if (typeof parsed.output_text === 'string') return parsed.output_text.trim()
+    const output = parsed.output
+    if (!Array.isArray(output)) return ''
+    return output.map((item) => {
+      if (!item || typeof item !== 'object') return ''
+      const content = (item as { content?: unknown }).content
+      if (!Array.isArray(content)) return ''
+      return content.map((block) =>
+        block && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string'
+          ? (block as { text: string }).text
+          : ''
+      ).join('')
+    }).join('').trim()
+  }
+  if (endpointFormat === 'messages') {
+    const content = parsed.content
+    if (!Array.isArray(content)) return ''
+    return content.map((block) =>
+      block && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string'
+        ? (block as { text: string }).text
+        : ''
+    ).join('').trim()
+  }
+  const choices = parsed.choices
+  if (!Array.isArray(choices)) return ''
+  const first = choices[0]
+  return first && typeof first === 'object'
+    ? String((first as { message?: { content?: unknown } }).message?.content ?? '').trim()
+    : ''
+}
+
 export function looksLikeClawScheduledTaskCandidate(text: string): boolean {
   return SCHEDULED_TASK_CANDIDATE_RE.test(text.trim())
 }
@@ -179,28 +288,25 @@ export async function detectClawScheduledTaskRequest(
   const runtime = resolveKunRuntimeSettings(settings)
   const apiKey = runtime.apiKey.trim()
   if (!apiKey) return null
-  const response = await fetch(buildChatCompletionsUrl(runtime.baseUrl), {
+  const detectionRequest = buildDetectionRequest({
+    baseUrl: runtime.baseUrl,
+    apiKey,
+    endpointFormat: runtime.endpointFormat,
+    model: detectionModel(modelHint),
+    systemPrompt: buildDetectionPrompt(now),
+    sourceText
+  })
+  const response = await fetch(detectionRequest.url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model: detectionModel(modelHint),
-      messages: [
-        { role: 'system', content: buildDetectionPrompt(now) },
-        { role: 'user', content: sourceText }
-      ],
-      max_tokens: 300
-    }),
+    headers: detectionRequest.headers,
+    body: JSON.stringify(detectionRequest.body),
     signal: AbortSignal.timeout(DETECTOR_TIMEOUT_MS)
   })
   const text = await response.text()
   if (!response.ok) return null
   let content = ''
   try {
-    const parsed = JSON.parse(text) as { choices?: Array<{ message?: { content?: string } }> }
-    content = parsed.choices?.[0]?.message?.content?.trim() ?? ''
+    content = extractDetectionContent(text, runtime.endpointFormat)
   } catch {
     return null
   }

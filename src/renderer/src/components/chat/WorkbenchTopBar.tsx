@@ -15,6 +15,7 @@ import {
   Globe2,
   ListTodo,
   Loader2,
+  MessageCircleMore,
   RefreshCw,
   Terminal
 } from 'lucide-react'
@@ -27,12 +28,22 @@ type Props = {
   rightPanelMode: RightPanelMode
   onToggleRightPanelMode: (mode: Exclude<RightPanelMode, null>) => void
   planPanelEnabled?: boolean
+  sideChatCount?: number
+  sideChatRunningCount?: number
+  sideChatOpen?: boolean
+  sideChatEnabled?: boolean
+  onOpenSideChat?: () => void
 }
 
 export function WorkbenchTopBar({
   rightPanelMode,
   onToggleRightPanelMode,
-  planPanelEnabled = false
+  planPanelEnabled = false,
+  sideChatCount = 0,
+  sideChatRunningCount = 0,
+  sideChatOpen = false,
+  sideChatEnabled = true,
+  onOpenSideChat
 }: Props): ReactElement {
   const { t } = useTranslation(['common', 'settings'])
   const [editors, setEditors] = useState<EditorInfo[]>([])
@@ -300,6 +311,32 @@ export function WorkbenchTopBar({
           </div>
         ) : null}
       </div>
+
+      {onOpenSideChat ? (
+        <button
+          type="button"
+          onClick={onOpenSideChat}
+          disabled={!sideChatEnabled}
+          className={`relative rounded-full border px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition disabled:cursor-not-allowed disabled:opacity-45 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] ${
+            sideChatOpen
+              ? 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
+              : 'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
+          }`}
+          aria-label={t('sidePanelOpen')}
+          aria-pressed={sideChatOpen}
+          title={t('sidePanelOpen')}
+        >
+          <MessageCircleMore className="h-4 w-4" strokeWidth={1.75} />
+          {sideChatCount > 0 ? (
+            <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[10px] font-semibold leading-none text-white">
+              {Math.min(sideChatCount, 9)}
+            </span>
+          ) : null}
+          {sideChatRunningCount > 0 ? (
+            <span className="absolute -bottom-0.5 -right-0.5 h-2 w-2 animate-pulse rounded-full bg-emerald-500 shadow-[0_0_0_2px_rgba(16,185,129,0.18)]" />
+          ) : null}
+        </button>
+      ) : null}
 
       {items.map((item) => {
         const active = rightPanelMode === item.mode

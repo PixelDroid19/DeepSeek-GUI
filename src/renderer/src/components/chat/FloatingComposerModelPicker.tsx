@@ -202,9 +202,9 @@ export function FloatingComposerModelPicker({
     }
     setActiveProviderId((current) => {
       if (current && providerMenuGroups.some((group) => group.providerId === current)) return current
-      return selectedProviderId ?? providerMenuGroups[0].providerId
+      return null
     })
-  }, [menuOpen, providerMenuGroups, selectedProviderId])
+  }, [menuOpen, providerMenuGroups])
 
   useEffect(() => {
     if (!menuOpen || !activeProviderGroup) {
@@ -292,7 +292,10 @@ export function FloatingComposerModelPicker({
                   key={option.id}
                   selected={currentReasoning === option.id}
                   title={t(option.labelKey)}
-                  onClick={() => onComposerReasoningEffortChange?.(option.id)}
+                  onClick={() => {
+                    onComposerReasoningEffortChange?.(option.id)
+                    setMenuOpen(false)
+                  }}
                 />
               ))}
             </div>
@@ -341,7 +344,7 @@ export function FloatingComposerModelPicker({
             className="fixed z-[1001] overflow-y-auto rounded-xl border border-ds-border bg-white p-1.5 text-[13px] text-ds-muted shadow-[0_18px_48px_rgba(15,23,42,0.16)] dark:bg-ds-card"
           >
             <div className="px-2.5 pb-1 pt-1 text-[11px] font-bold uppercase tracking-[0.08em] text-ds-faint">
-              {activeProviderGroup.label}
+              {t('composerModel')}
             </div>
             {activeProviderGroup.modelIds.map((id) => (
               <PickerRow

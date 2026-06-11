@@ -13,7 +13,9 @@ import { ProcessSectionRow, groupProcessSections } from './message-timeline-proc
 import { AnimatedWorkLogo } from './AnimatedWorkLogo'
 import {
   groupTurns,
+  sameTurnContent,
   splitThink,
+  stableTurnKey,
   turnHasPendingRuntimeWork,
   type Turn
 } from './message-timeline-turns'
@@ -28,6 +30,7 @@ type Props = {
   live: string
   activeThreadId: string | null
   runtimeConnection: RuntimeConnectionStatus
+  runtimeError?: string | null
   onRetryConnection: () => void
   onOpenSettings: () => void
   onSelectSuggestion?: (prompt: string) => void
@@ -43,12 +46,34 @@ type Props = {
 const TURN_PAGE_SIZE = 18
 const AUTO_COLLAPSE_THRESHOLD = 24
 
+function blockScrollStamp(block: ChatBlock | undefined): string {
+  if (!block) return ''
+  switch (block.kind) {
+    case 'user':
+    case 'assistant':
+    case 'reasoning':
+    case 'system':
+      return `${block.id}:${block.kind}:${block.text.length}`
+    case 'tool':
+      return `${block.id}:${block.kind}:${block.status}:${block.summary.length}:${block.detail?.length ?? 0}`
+    case 'review':
+      return `${block.id}:${block.kind}:${block.status}:${block.reviewText?.length ?? 0}`
+    case 'approval':
+    case 'user_input':
+    case 'compaction':
+      return `${block.id}:${block.kind}:${block.status}`
+    default:
+      return ''
+  }
+}
+
 export function MessageTimeline({
   blocks,
   liveReasoning,
   live,
   activeThreadId,
   runtimeConnection,
+  runtimeError,
   onRetryConnection,
   onOpenSettings,
   onSelectSuggestion,
@@ -78,6 +103,15 @@ export function MessageTimeline({
   const containerRef = useRef<HTMLDivElement>(null)
 
   const turns = useMemo(() => groupTurns(blocks), [blocks])
+  const latestBlock = blocks[blocks.length - 1]
+  const scrollContentKey = [
+    activeThreadId ?? '',
+    turns.length,
+    blocks.length,
+    blockScrollStamp(latestBlock),
+    live.length,
+    liveReasoning.length
+  ].join(':')
   const {
     visibleTurnCount,
     hiddenTurnCount,
@@ -91,7 +125,11 @@ export function MessageTimeline({
     autoCollapseThreshold: AUTO_COLLAPSE_THRESHOLD,
     totalTurns: turns.length,
     busy,
-    scrollDeps: { blocks, live, liveReasoning }
+    scrollDeps: {
+      contentKey: scrollContentKey,
+      streaming: Boolean(live.trim() || liveReasoning.trim()),
+      userTurnKey: currentTurnUserId ?? ''
+    }
   })
   const visibleTurns = useMemo(
     () => (hiddenTurnCount > 0 ? turns.slice(hiddenTurnCount) : turns),
@@ -120,6 +158,7 @@ export function MessageTimeline({
             route={heroRoute}
             ready={runtimeConnection === 'ready'}
             hasWorkspace={!!workspaceRoot}
+            runtimeError={runtimeError}
             activeClawChannel={activeClawChannel}
             onPickWorkspace={() => void chooseWorkspace()}
             onRetry={onRetryConnection}
@@ -167,7 +206,7 @@ export function MessageTimeline({
           const showForkPoint =
             forkBoundaryTurnCount !== undefined && absoluteTurnIndex === forkBoundaryTurnCount
           return (
-            <Fragment key={userId ?? `turn-${index}`}>
+            <Fragment key={stableTurnKey(turn, absoluteTurnIndex)}>
               {showForkPoint ? <ThreadForkPoint parentTitle={forkedFromTitle} /> : null}
               <MemoMessageTurn
                 turn={turn}
@@ -275,11 +314,8 @@ function MessageTurn({
   }, [turn.blocks, isProcessing])
   const { think: liveThink, content: liveContent } = splitThink(live)
   const liveProcessText = [liveReasoning, liveThink].filter(Boolean).join('\n\n')
-  const [workExpanded, setWorkExpanded] = useState(isProcessing)
-
-  useEffect(() => {
-    setWorkExpanded(isProcessing)
-  }, [isProcessing])
+  const [workExpandedOverride, setWorkExpandedOverride] = useState<boolean | null>(null)
+  const workExpanded = workExpandedOverride ?? isProcessing
 
   const { processBlocks, assistantContentBlocks, turnFileChanges } = useMemo(
     () =>
@@ -298,8 +334,8 @@ function MessageTurn({
   )
 
   const processSections = useMemo(
-    () => (workExpanded || isProcessing ? groupProcessSections(processBlocks) : []),
-    [processBlocks, workExpanded, isProcessing]
+    () => (workExpanded ? groupProcessSections(processBlocks) : []),
+    [processBlocks, workExpanded]
   )
   const reasoningSectionCount = useMemo(
     () => processSections.filter((section) => section.kind === 'reasoning').length,
@@ -307,8 +343,8 @@ function MessageTurn({
   )
   const showLiveAssistant = !isProcessing && !!liveContent.trim()
 
-  // Keep reasoning/tool work as collapsed process status while the assistant
-  // text renders below as the visible message body.
+  // Keep completed reasoning/tool work tucked away, but make the active turn's
+  // work visible unless the user explicitly collapses it.
 
   const hasProcess = isProcessing || processBlocks.length > 0
 
@@ -324,7 +360,7 @@ function MessageTurn({
             durationMs={durationMs}
             reasoningDurationMs={reasoningDurationMs}
             expanded={workExpanded}
-            onToggle={() => setWorkExpanded((value) => !value)}
+            onToggle={() => setWorkExpandedOverride((value) => !(value ?? isProcessing))}
           />
           {workExpanded && processSections.length > 0 ? (
             <div className="flex flex-col gap-1">
@@ -390,7 +426,7 @@ function LiveTurnProgressRow(): ReactElement {
 }
 
 const MemoMessageTurn = memo(MessageTurn, (prev, next) => (
-  prev.turn === next.turn &&
+  sameTurnContent(prev.turn, next.turn) &&
   prev.isProcessing === next.isProcessing &&
   prev.liveReasoning === next.liveReasoning &&
   prev.live === next.live &&

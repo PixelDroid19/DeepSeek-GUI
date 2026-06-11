@@ -1,20 +1,23 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import {
   FloatingComposer,
   formatGoalElapsedSeconds,
-  imageFilesFromTransfer,
-  imageTransferHasImages,
   parseCompactCommand,
   parseGoalCommand,
   parseReviewCommand
 } from './FloatingComposer'
 import {
+  imageFilesFromTransfer,
+  imageTransferHasImages,
+  resolveComposerPasteImageTransfer
+} from './floating-composer-image-transfer'
+import {
   FloatingComposerModelPicker,
   calculateFloatingMenuPlacement,
   calculateFloatingSubmenuPlacement,
-  composerReasoningEffortRequestValue
+  composerReasoningEffortRequestValue,
 } from './FloatingComposerModelPicker'
 import { getGoalPanelDraftObjective } from './floating-composer-commands'
 import { useChatStore } from '../../store/chat-store'
@@ -168,24 +171,28 @@ describe('FloatingComposer model controls', () => {
     expect(placement.top).toBe(633)
   })
 
-  it('keeps the provider submenu inside the viewport', () => {
-    const rightPlacement = calculateFloatingSubmenuPlacement({
-      anchorRect: { top: 640, right: 520, bottom: 676, left: 312 },
-      submenuHeight: 180,
-      viewportHeight: 720,
-      viewportWidth: 900
-    })
-    const leftPlacement = calculateFloatingSubmenuPlacement({
-      anchorRect: { top: 640, right: 880, bottom: 676, left: 672 },
-      submenuHeight: 180,
-      viewportHeight: 720,
-      viewportWidth: 900
+  it('places the model submenu beside the active provider row', () => {
+    const placement = calculateFloatingSubmenuPlacement({
+      anchorRect: { top: 650, right: 700, bottom: 686, left: 492 },
+      submenuHeight: 140,
+      viewportHeight: 900,
+      viewportWidth: 1000
     })
 
-    expect(rightPlacement.left).toBe(526)
-    expect(rightPlacement.top).toBe(528)
-    expect(leftPlacement.left).toBe(434)
-    expect(leftPlacement.top).toBe(528)
+    expect(placement.left).toBe(706)
+    expect(placement.top).toBe(642)
+  })
+
+  it('flips the model submenu left when there is not enough room on the right', () => {
+    const placement = calculateFloatingSubmenuPlacement({
+      anchorRect: { top: 650, right: 920, bottom: 686, left: 712 },
+      submenuHeight: 140,
+      viewportHeight: 900,
+      viewportWidth: 1000
+    })
+
+    expect(placement.left).toBe(474)
+    expect(placement.top).toBe(642)
   })
 
   it('keeps the reasoning strength visible in the model control', () => {
@@ -264,6 +271,77 @@ describe('FloatingComposer image transfer helpers', () => {
     expect(file?.type).toBe('image/png')
     expect(file?.name).toBe('shot')
     expect(imageTransferHasImages(source)).toBe(true)
+  })
+
+  it('handles pasted image files through the attachment picker', () => {
+    const screenshot = new File([new Uint8Array([1])], 'shot.png', { type: 'image/png' })
+    const onPickAttachments = vi.fn()
+    const onPasteClipboardImage = vi.fn()
+    const decision = resolveComposerPasteImageTransfer({
+      canPickAttachment: true,
+      hasPasteClipboardImageHandler: true,
+      hasPickAttachmentHandler: true,
+      plainText: '',
+      source: {
+        items: {
+          length: 1,
+          0: { kind: 'file', type: 'image/png', getAsFile: () => screenshot }
+        }
+      }
+    })
+
+    expect(decision).toEqual({
+      action: 'pick-files',
+      files: [screenshot],
+      preventDefault: true
+    })
+    if (decision.action === 'pick-files') {
+      onPickAttachments(decision.files)
+    }
+    expect(onPickAttachments).toHaveBeenCalledWith([screenshot])
+    expect(onPasteClipboardImage).not.toHaveBeenCalled()
+  })
+
+  it('does not intercept ordinary text paste', () => {
+    const onPasteClipboardImage = vi.fn()
+    const decision = resolveComposerPasteImageTransfer({
+      canPickAttachment: true,
+      hasPasteClipboardImageHandler: true,
+      hasPickAttachmentHandler: true,
+      plainText: 'hello',
+      source: { files: [], items: [] }
+    })
+
+    expect(decision).toEqual({
+      action: 'paste-clipboard-image',
+      preventDefault: false,
+      silentNoImage: true
+    })
+    if (decision.action === 'paste-clipboard-image') {
+      void onPasteClipboardImage({ silentNoImage: decision.silentNoImage })
+    }
+    expect(onPasteClipboardImage).toHaveBeenCalledWith({ silentNoImage: true })
+  })
+
+  it('falls back to the Electron clipboard image bridge when files are unavailable', () => {
+    const onPasteClipboardImage = vi.fn()
+    const decision = resolveComposerPasteImageTransfer({
+      canPickAttachment: true,
+      hasPasteClipboardImageHandler: true,
+      hasPickAttachmentHandler: true,
+      plainText: '',
+      source: {}
+    })
+
+    expect(decision).toEqual({
+      action: 'paste-clipboard-image',
+      preventDefault: false,
+      silentNoImage: false
+    })
+    if (decision.action === 'paste-clipboard-image') {
+      void onPasteClipboardImage({ silentNoImage: decision.silentNoImage })
+    }
+    expect(onPasteClipboardImage).toHaveBeenCalledWith({ silentNoImage: false })
   })
 })
 
@@ -468,7 +546,7 @@ describe('FloatingComposer capability controls', () => {
     expect(html).not.toContain('Image input is unavailable')
   })
 
-  it('renders enabled image attachment state for Kun image send smoke', () => {
+  it('renders the plus trigger alongside uploaded attachments', () => {
     const html = renderToStaticMarkup(
       createElement(FloatingComposer, {
         input: 'describe this',
@@ -492,7 +570,7 @@ describe('FloatingComposer capability controls', () => {
       })
     )
     expect(html).toContain('More actions')
-    expect(html).toContain('Attach image')
+    expect(html).not.toContain('Attach image')
     expect(html).toContain('shot.png')
   })
 
@@ -661,5 +739,149 @@ describe('FloatingComposer capability controls', () => {
     expect(html).toContain('Remove file reference')
     expect(html).toContain('aria-label="Send"')
     expect(html).not.toContain('aria-label="Send" disabled=""')
+  })
+
+  it('hides execution access controls in the composer footer', () => {
+    useChatStore.setState({
+      activeThreadId: 'thr_1',
+      activeThreadGoal: null,
+      route: 'chat',
+      workspaceRoot: '/workspace/deepseek-gui'
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(FloatingComposer, {
+        input: 'hello',
+        setInput: () => undefined,
+        mode: 'agent',
+        setMode: () => undefined,
+        busy: false,
+        runtimeReady: true,
+        hasActiveThread: true,
+        composerModel: '',
+        composerPickList: [],
+        onComposerModelChange: () => undefined,
+        queuedMessages: [],
+        onRemoveQueuedMessage: () => undefined,
+        onSend: () => undefined,
+        onInterrupt: () => undefined,
+        attachmentUploadEnabled: false,
+        webAccessAvailable: false
+      })
+    )
+
+    expect(html).not.toContain('Full access')
+    expect(html).not.toContain('aria-label="Execution"')
+  })
+
+  it('keeps the empty-session composer interactive in the Electron drag shell', () => {
+    useChatStore.setState({
+      activeThreadId: null,
+      activeThreadGoal: null,
+      route: 'chat',
+      workspaceRoot: '/workspace/deepseek-gui',
+      threads: []
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(FloatingComposer, {
+        input: '',
+        setInput: () => undefined,
+        workspaceRootOverride: '/workspace/deepseek-gui',
+        mode: 'agent',
+        setMode: () => undefined,
+        busy: false,
+        runtimeReady: true,
+        hasActiveThread: false,
+        composerModel: '',
+        composerPickList: [],
+        onComposerModelChange: () => undefined,
+        queuedMessages: [],
+        onRemoveQueuedMessage: () => undefined,
+        onSend: () => undefined,
+        onInterrupt: () => undefined,
+        attachmentUploadEnabled: false,
+        webAccessAvailable: false
+      })
+    )
+
+    expect(html).toContain('ds-floating-composer ds-no-drag')
+    expect(html).toContain('ds-composer-shell ds-chat-composer ds-frosted ds-no-drag')
+    const textarea = html.match(/<textarea[^>]*>/)?.[0] ?? ''
+    expect(textarea).toContain('w-full')
+    expect(textarea).not.toContain('disabled=""')
+  })
+
+  it('allows typing while a new chat has no selected runtime thread yet', () => {
+    useChatStore.setState({
+      activeThreadId: null,
+      activeThreadGoal: null,
+      route: 'chat',
+      workspaceRoot: '',
+      threads: []
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(FloatingComposer, {
+        input: 'draft while creating',
+        setInput: () => undefined,
+        mode: 'agent',
+        setMode: () => undefined,
+        busy: false,
+        runtimeReady: true,
+        hasActiveThread: false,
+        composerModel: '',
+        composerPickList: [],
+        onComposerModelChange: () => undefined,
+        queuedMessages: [],
+        onRemoveQueuedMessage: () => undefined,
+        onSend: () => undefined,
+        onInterrupt: () => undefined,
+        attachmentUploadEnabled: false,
+        webAccessAvailable: false
+      })
+    )
+
+    expect(html.match(/<textarea[^>]*>/)?.[0] ?? '').not.toContain('disabled=""')
+    expect(html).toContain('Choose a working directory before creating a thread.')
+    const sendButton = html.match(/<button[^>]*aria-label="Send"[^>]*>/)?.[0] ?? ''
+    expect(sendButton).toContain('disabled=""')
+  })
+
+  it('keeps the draft editable while the runtime is loading and shows send loading', () => {
+    useChatStore.setState({
+      activeThreadId: null,
+      activeThreadGoal: null,
+      route: 'chat',
+      workspaceRoot: '/workspace/deepseek-gui',
+      threads: []
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(FloatingComposer, {
+        input: 'draft during startup',
+        setInput: () => undefined,
+        workspaceRootOverride: '/workspace/deepseek-gui',
+        mode: 'agent',
+        setMode: () => undefined,
+        busy: false,
+        runtimeReady: false,
+        hasActiveThread: false,
+        composerModel: '',
+        composerPickList: [],
+        onComposerModelChange: () => undefined,
+        queuedMessages: [],
+        onRemoveQueuedMessage: () => undefined,
+        onSend: () => undefined,
+        onInterrupt: () => undefined,
+        attachmentUploadEnabled: false,
+        webAccessAvailable: false
+      })
+    )
+
+    expect(html.match(/<textarea[^>]*>/)?.[0] ?? '').not.toContain('disabled=""')
+    const sendButton = html.match(/<button[^>]*aria-label="Send"[^>]*>/)?.[0] ?? ''
+    expect(sendButton).toContain('disabled=""')
+    expect(html).toContain('lucide-loader-circle')
   })
 })

@@ -1,11 +1,10 @@
 import type { ChatBlock, ToolBlock } from '../../agent/types'
 import {
   extractDiffFilePath,
+  extractUnifiedDiffText,
   formatFilePathForDisplay,
-  looksLikeUnifiedDiff
 } from '../../lib/diff-stats'
 import {
-  findTrailingAssistantContentStart,
   isProcessBlock,
   splitThink,
   type Turn
@@ -19,12 +18,44 @@ export type TurnSections = {
   turnFileChanges: ToolBlock[]
 }
 
+type ResolvedFileChangeBlock = ToolBlock & {
+  detail: string
+  filePath: string
+}
+
 type DeriveTurnSectionsInput = {
   turn: Turn
   isProcessing: boolean
   liveProcessText: string
   liveContent: string
   workspaceRoot: string
+}
+
+function fileChangeGroupKey(filePath: string): string {
+  return filePath.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+}
+
+function mergeFileChangeBlocks(changes: ResolvedFileChangeBlock[]): ToolBlock[] {
+  const merged: ResolvedFileChangeBlock[] = []
+  const indexByPath = new Map<string, number>()
+
+  for (const change of changes) {
+    const key = fileChangeGroupKey(change.filePath)
+    const existingIndex = indexByPath.get(key)
+    if (existingIndex === undefined) {
+      indexByPath.set(key, merged.length)
+      merged.push(change)
+      continue
+    }
+
+    const existing = merged[existingIndex]
+    merged[existingIndex] = {
+      ...existing,
+      detail: [existing.detail, change.detail].filter(Boolean).join('\n\n')
+    }
+  }
+
+  return merged
 }
 
 /**
@@ -49,11 +80,8 @@ export function deriveTurnSections({
   const processBlocks: ChatBlock[] = []
   const assistantContentBlocks: TurnAssistantBlock[] = []
   let latestAssistantContentBlock: TurnAssistantBlock | null = null
-  const trailingAssistantContentStart = isProcessing
-    ? turn.blocks.length
-    : findTrailingAssistantContentStart(turn.blocks)
 
-  for (const [index, block] of turn.blocks.entries()) {
+  for (const block of turn.blocks) {
     if (block.kind === 'assistant') {
       const split = splitThink(block.text)
       if (split.think) {
@@ -64,7 +92,7 @@ export function deriveTurnSections({
         latestAssistantContentBlock = contentBlock
         if (isProcessing) {
           processBlocks.push(contentBlock)
-        } else if (index >= trailingAssistantContentStart) {
+        } else {
           assistantContentBlocks.push(contentBlock)
         }
       }
@@ -96,15 +124,15 @@ export function deriveTurnSections({
 
   const turnFileChanges: ToolBlock[] = isProcessing
     ? []
-    : turn.blocks.flatMap((block): ToolBlock[] => {
+    : mergeFileChangeBlocks(turn.blocks.flatMap((block): ResolvedFileChangeBlock[] => {
         if (
           !(block.kind === 'tool' && block.toolKind === 'file_change' && block.status === 'success')
         ) {
           return []
         }
 
-        const detailText = block.detail?.trim() ?? ''
-        if (!looksLikeUnifiedDiff(detailText)) return []
+        const detailText = extractUnifiedDiffText(block.detail)
+        if (!detailText) return []
 
         const resolvedFilePath = formatFilePathForDisplay(
           extractDiffFilePath(detailText, block.filePath),
@@ -112,8 +140,8 @@ export function deriveTurnSections({
         )
         if (!resolvedFilePath) return []
 
-        return [{ ...block, filePath: resolvedFilePath }]
-      })
+        return [{ ...block, detail: detailText, filePath: resolvedFilePath }]
+      }))
 
   return { processBlocks, assistantContentBlocks, turnFileChanges }
 }

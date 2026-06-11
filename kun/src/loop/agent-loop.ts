@@ -32,6 +32,7 @@ import { buildToolCatalogFingerprint } from '../cache/tool-catalog-fingerprint.j
 import {
   makeUserItem,
   makeToolCallItem,
+  makeToolResultItem,
   makeUserInputItem,
   makeErrorItem
 } from '../domain/item.js'
@@ -248,7 +249,26 @@ export class AgentLoop {
       await this.opts.turns.finishTurn({ threadId, turnId, status })
       return status
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const raw = error instanceof Error ? error.message : String(error)
+      // Best-effort enrichment so the renderer can show "what failed where"
+      // instead of the bare "Kun turn failed" string. See issue #26.
+      const modelInfo = this.opts.model && 'config' in this.opts.model
+        ? (this.opts.model as { config: { model?: string; baseUrl?: string } }).config
+        : undefined
+      const modelName = modelInfo?.model ?? 'unknown'
+      const provider = modelInfo?.baseUrl ?? 'unknown'
+      const stack = error instanceof Error
+        ? (error.stack?.split('\n').slice(0, 3).join(' | ') ?? '')
+        : ''
+      const message = [
+        '[Kun turn failed]',
+        `turn=${turnId}`,
+        `thread=${threadId}`,
+        `model=${modelName}`,
+        `provider=${provider}`,
+        `error=${raw}`,
+        stack ? `stack=${stack}` : ''
+      ].filter(Boolean).join(' ')
       await this.failTurn(threadId, turnId, message)
       return 'failed'
     } finally {
@@ -908,14 +928,58 @@ export class AgentLoop {
         turnId: input.turnId,
         callId: input.call.callId
       },
-      () => this.opts.toolHost.execute(input.call, input.context, async (item) =>
-        persistToolExecutionUpdate({
-          threadId: input.threadId,
-          item,
-          updateItem: (threadId, itemId, patch) => this.opts.turns.updateItem(threadId, itemId, patch),
-          applyItem: (threadId, updateItem) => this.opts.turns.applyItem(threadId, updateItem)
-        })
-      )
+      async () => {
+        try {
+          return await this.opts.toolHost.execute(input.call, input.context, async (item) =>
+            persistToolExecutionUpdate({
+              threadId: input.threadId,
+              item,
+              updateItem: (threadId, itemId, patch) => this.opts.turns.updateItem(threadId, itemId, patch),
+              applyItem: (threadId, updateItem) => this.opts.turns.applyItem(threadId, updateItem)
+            })
+          )
+        } catch (error) {
+          if (input.context.abortSignal.aborted || !this.isRecoverableToolDispatchError(error)) {
+            throw error
+          }
+          const message = error instanceof Error ? error.message : String(error)
+          await this.opts.events.record({
+            kind: 'error',
+            threadId: input.threadId,
+            turnId: input.turnId,
+            message: `Tool call ${input.call.toolName} was rejected: ${message}`,
+            code: 'tool_dispatch_rejected',
+            severity: 'warning'
+          })
+          return {
+            item: makeToolResultItem({
+              id: `item_${input.call.callId}`,
+              turnId: input.turnId,
+              threadId: input.threadId,
+              callId: input.call.callId,
+              toolName: input.call.toolName,
+              toolKind: input.call.toolKind ?? 'tool_call',
+              output: {
+                code: 'tool_dispatch_rejected',
+                error: message,
+                guidance: 'Use only tools advertised in the current turn context.'
+              },
+              isError: true
+            }),
+            approved: false
+          }
+        }
+      }
+    )
+  }
+
+  private isRecoverableToolDispatchError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error)
+    return (
+      message.startsWith('unknown tool:') ||
+      message.includes(' is not provided by ') ||
+      message.includes(' is not advertised') ||
+      message.includes(' is disabled by policy')
     )
   }
 
@@ -956,7 +1020,8 @@ export class AgentLoop {
         threadId,
         turnId,
         message: `Failed to sync plan checklist to thread todos: ${message}`,
-        code: 'todo_plan_sync_failed'
+        code: 'todo_plan_sync_failed',
+        severity: 'warning'
       })
     }
   }
@@ -1222,7 +1287,8 @@ export class AgentLoop {
       threadId: input.threadId,
       turnId: input.turnId,
       message: input.message,
-      code: 'tool_catalog_changed'
+      code: 'tool_catalog_changed',
+      severity: 'info'
     }))
     await this.opts.events.record({
       kind: 'tool_catalog_changed',

@@ -1,4 +1,4 @@
-import type { MouseEvent as ReactMouseEvent, ReactElement } from 'react'
+import type { FormEvent, MouseEvent as ReactMouseEvent, ReactElement } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
@@ -23,7 +23,8 @@ import {
   isClawWorkspacePath,
   isInternalDeepSeekGuiWorkspace,
   isInternalTemporaryWorkspace,
-  normalizeWorkspaceRoot
+  normalizeWorkspaceRoot,
+  workspaceRootIdentityKey
 } from '../../lib/workspace-path'
 import {
   SidebarIconButton,
@@ -65,6 +66,12 @@ type ThreadContextMenuState = {
   y: number
 }
 
+export type RenameThreadDialogState = {
+  thread: NormalizedThread
+  value: string
+  submitting: boolean
+}
+
 export function buildSidebarWorkspaceGroups(options: {
   threads: NormalizedThread[]
   searchQuery: string
@@ -72,9 +79,25 @@ export function buildSidebarWorkspaceGroups(options: {
   workspaceRoot: string
   workspaceRoots: string[]
 }): SidebarWorkspaceGroup[] {
-  const map = new Map<string, NormalizedThread[]>()
+  const map = new Map<string, { workspacePath: string, threads: NormalizedThread[] }>()
   const selectedWorkspace = normalizeWorkspaceRoot(options.workspaceRoot)
+  const selectedWorkspaceKey = workspaceRootIdentityKey(selectedWorkspace)
   const query = options.searchQuery.trim().toLowerCase()
+
+  const upsertWorkspace = (workspacePath: string, threads: NormalizedThread[] = []): void => {
+    const normalized = normalizeWorkspaceRoot(workspacePath)
+    const key = workspaceRootIdentityKey(normalized)
+    if (!key) return
+    const existing = map.get(key)
+    if (existing) {
+      existing.threads.push(...threads)
+      if (key === selectedWorkspaceKey && normalized === selectedWorkspace) {
+        existing.workspacePath = normalized
+      }
+      return
+    }
+    map.set(key, { workspacePath: normalized, threads: [...threads] })
+  }
 
   for (const th of options.threads) {
     if (isInternalTemporaryWorkspace(th.workspace)) continue
@@ -90,28 +113,28 @@ export function buildSidebarWorkspaceGroups(options: {
         .toLowerCase()
       if (!haystack.includes(query)) continue
     }
-    const arr = map.get(key) ?? []
-    arr.push(th)
-    map.set(key, arr)
+    upsertWorkspace(key, [th])
   }
 
-  if (selectedWorkspace && !map.has(selectedWorkspace)) {
-    map.set(selectedWorkspace, [])
+  if (selectedWorkspace && !map.has(selectedWorkspaceKey)) {
+    upsertWorkspace(selectedWorkspace)
   }
   if (!query && !options.showArchived) {
     for (const workspacePath of options.workspaceRoots) {
       const key = normalizeWorkspaceRoot(workspacePath)
-      if (!key || map.has(key)) continue
+      if (!key || map.has(workspaceRootIdentityKey(key))) continue
       if (isInternalTemporaryWorkspace(key)) continue
       if (isInternalDeepSeekGuiWorkspace(key)) continue
       if (isClawWorkspacePath(key)) continue
-      map.set(key, [])
+      upsertWorkspace(key)
     }
   }
 
-  return Array.from(map.entries()).sort(([a], [b]) => {
-    if (a === selectedWorkspace && b !== selectedWorkspace) return -1
-    if (b === selectedWorkspace && a !== selectedWorkspace) return 1
+  return Array.from(map.values()).map(({ workspacePath, threads }): SidebarWorkspaceGroup => [workspacePath, threads]).sort(([a], [b]) => {
+    const aKey = workspaceRootIdentityKey(a)
+    const bKey = workspaceRootIdentityKey(b)
+    if (aKey === selectedWorkspaceKey && bKey !== selectedWorkspaceKey) return -1
+    if (bKey === selectedWorkspaceKey && aKey !== selectedWorkspaceKey) return 1
     return a.localeCompare(b)
   })
 }
@@ -146,6 +169,7 @@ export function SidebarProjectsSection({
   const [deletingThreadIds, setDeletingThreadIds] = useState<Record<string, boolean>>({})
   const [searchOpen, setSearchOpen] = useState(false)
   const [threadContextMenu, setThreadContextMenu] = useState<ThreadContextMenuState | null>(null)
+  const [renameThreadDialog, setRenameThreadDialog] = useState<RenameThreadDialogState | null>(null)
 
   const groups = useMemo(() => {
     return buildSidebarWorkspaceGroups({
@@ -234,14 +258,43 @@ export function SidebarProjectsSection({
     }
   }
 
-  const handleRenameThread = async (thread: NormalizedThread): Promise<void> => {
+  const openRenameThreadDialog = (thread: NormalizedThread): void => {
     const threadId = thread.id.trim()
     if (!threadId || deletingThreadIds[threadId]) return
-    const nextTitle = window.prompt(t('sidebarThreadRenamePrompt'), thread.title)?.trim()
-    if (!nextTitle || nextTitle === thread.title) return
+    setRenameThreadDialog({
+      thread,
+      value: thread.title,
+      submitting: false
+    })
+  }
+
+  const closeRenameThreadDialog = (): void => {
+    setRenameThreadDialog((current) => current?.submitting ? current : null)
+  }
+
+  const submitRenameThreadDialog = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault()
+    const dialog = renameThreadDialog
+    if (!dialog || dialog.submitting) return
+    const threadId = dialog.thread.id.trim()
+    const nextTitle = dialog.value.trim()
+    if (!threadId || deletingThreadIds[threadId]) return
+    if (!nextTitle) return
+    if (nextTitle === dialog.thread.title) {
+      setRenameThreadDialog(null)
+      return
+    }
     setDeletingThreadIds((prev) => ({ ...prev, [threadId]: true }))
+    setRenameThreadDialog((current) =>
+      current?.thread.id === threadId ? { ...current, value: nextTitle, submitting: true } : current
+    )
     try {
       await onRenameThread(threadId, nextTitle)
+      setRenameThreadDialog(null)
+    } catch {
+      setRenameThreadDialog((current) =>
+        current?.thread.id === threadId ? { ...current, submitting: false } : current
+      )
     } finally {
       setDeletingThreadIds((prev) => {
         const next = { ...prev }
@@ -437,7 +490,7 @@ export function SidebarProjectsSection({
                         }
                         onSelect={() => onSelectThread(thread.id)}
                         onContextMenu={(event) => openThreadContextMenu(event, thread)}
-                        onRename={() => void handleRenameThread(thread)}
+                        onRename={() => openRenameThreadDialog(thread)}
                         onArchive={() => void handleArchiveThread(thread)}
                         onDelete={() => void handleDeleteThread(thread)}
                         onRestore={() => void handleRestoreThread(thread)}
@@ -474,10 +527,22 @@ export function SidebarProjectsSection({
           state={threadContextMenu}
           busy={deletingThreadIds[threadContextMenu.thread.id] === true}
           onClose={() => setThreadContextMenu(null)}
-          onRename={() => void handleRenameThread(threadContextMenu.thread)}
+          onRename={() => openRenameThreadDialog(threadContextMenu.thread)}
           onArchive={() => void handleArchiveThread(threadContextMenu.thread)}
           onDelete={() => void handleDeleteThread(threadContextMenu.thread)}
           onRestore={() => void handleRestoreThread(threadContextMenu.thread)}
+          t={t}
+        />
+      ) : null}
+
+      {renameThreadDialog ? (
+        <ThreadRenameDialog
+          state={renameThreadDialog}
+          onClose={closeRenameThreadDialog}
+          onValueChange={(value) =>
+            setRenameThreadDialog((current) => current ? { ...current, value } : current)
+          }
+          onSubmit={(event) => void submitRenameThreadDialog(event)}
           t={t}
         />
       ) : null}
@@ -612,6 +677,85 @@ function ThreadRow({
         </span>
       </span>
     </SidebarTreeRow>
+  )
+}
+
+export function ThreadRenameDialog({
+  state,
+  onClose,
+  onValueChange,
+  onSubmit,
+  t
+}: {
+  state: RenameThreadDialogState
+  onClose: () => void
+  onValueChange: (value: string) => void
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void
+  t: (k: string, opts?: Record<string, unknown>) => string
+}): ReactElement {
+  const nextTitle = state.value.trim()
+  const unchanged = nextTitle === state.thread.title
+  const canSubmit = Boolean(nextTitle) && !unchanged && !state.submitting
+
+  useEffect(() => {
+    if (state.submitting) return
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [onClose, state.submitting])
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="thread-rename-dialog-title"
+      className="ds-no-drag fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/18 px-4 backdrop-blur-[2px] dark:bg-black/35"
+      onMouseDown={onClose}
+    >
+      <form
+        onSubmit={onSubmit}
+        onMouseDown={(event) => event.stopPropagation()}
+        className="w-full max-w-sm rounded-[24px] border border-ds-border bg-ds-card p-5 shadow-[0_24px_72px_rgba(15,23,42,0.22)]"
+      >
+        <h2
+          id="thread-rename-dialog-title"
+          className="text-[18px] font-semibold tracking-[-0.035em] text-ds-ink"
+        >
+          {t('sidebarThreadRename')}
+        </h2>
+        <p className="mt-2 text-[13px] leading-6 text-ds-muted">
+          {t('sidebarThreadRenamePrompt')}
+        </p>
+        <input
+          autoFocus
+          aria-label={t('sidebarThreadRenamePrompt')}
+          disabled={state.submitting}
+          value={state.value}
+          onChange={(event) => onValueChange(event.target.value)}
+          onFocus={(event) => event.currentTarget.select()}
+          className="mt-4 w-full rounded-xl border border-ds-border bg-ds-main/65 px-3 py-2 text-[14px] text-ds-ink outline-none transition focus:border-accent/40 focus:ring-1 focus:ring-accent/25 disabled:cursor-wait disabled:opacity-70"
+        />
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            disabled={state.submitting}
+            onClick={onClose}
+            className="rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[13px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-wait disabled:opacity-60"
+          >
+            {t('cancel')}
+          </button>
+          <button
+            type="submit"
+            disabled={!canSubmit}
+            className="rounded-xl bg-accent px-3 py-2 text-[13px] font-semibold text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-55"
+          >
+            {state.submitting ? t('loading') : t('confirm')}
+          </button>
+        </div>
+      </form>
+    </div>
   )
 }
 

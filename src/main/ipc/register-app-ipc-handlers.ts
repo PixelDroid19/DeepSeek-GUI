@@ -1,4 +1,4 @@
-import { dialog, ipcMain, shell, type BrowserWindow, type WebContents } from 'electron'
+import { app, dialog, ipcMain, shell, type BrowserWindow, type WebContents } from 'electron'
 import { watch, type FSWatcher } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
@@ -17,6 +17,7 @@ import {
 import type {
   ClawImInstallPollResult,
   ClawImInstallQrResult,
+  DesktopCommand,
   RuntimeRequestResult,
   SystemNotificationResult,
   TurnCompleteNotificationPayload,
@@ -29,6 +30,7 @@ import {
   clawImInstallPollPayloadSchema,
   clawTaskFromTextPayloadSchema,
   deepseekConfigContentSchema,
+  desktopCommandSchema,
   defaultPathSchema,
   gitBranchPayloadSchema,
   guiUpdateChannelSchema,
@@ -114,6 +116,7 @@ type RegisterAppIpcHandlersOptions = {
   startWeixinInstallQrcode: (weixinBridgeUrl?: string) => Promise<ClawImInstallQrResult>
   pollWeixinInstall: (deviceCode: string, weixinBridgeUrl?: string) => Promise<ClawImInstallPollResult>
   resolveKunConfigPath: () => string
+  onKunMcpConfigWritten?: (path: string, content: string) => Promise<void> | void
   showTurnCompleteNotification: (
     payload: TurnCompleteNotificationPayload
   ) => Promise<SystemNotificationResult>
@@ -131,6 +134,83 @@ function parseIpcPayload<T>(channel: string, schema: z.ZodType<T>, payload: unkn
   throw new Error(`Invalid payload for ${channel}: ${issue?.message ?? 'Bad request.'}`)
 }
 
+function validateMcpConfigContent(content: string): void {
+  const trimmed = content.trim()
+  if (!trimmed) return
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed) as unknown
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`MCP config must be JSON: ${message}`)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('MCP config must be a JSON object.')
+  }
+}
+
+function runDesktopCommand(
+  command: DesktopCommand,
+  sender: WebContents,
+  getMainWindow: () => BrowserWindow | null
+): void {
+  const mainWindow = getMainWindow()
+  const contents = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : sender
+
+  switch (command) {
+    case 'undo':
+      contents.undo()
+      return
+    case 'redo':
+      contents.redo()
+      return
+    case 'cut':
+      contents.cut()
+      return
+    case 'copy':
+      contents.copy()
+      return
+    case 'paste':
+      contents.paste()
+      return
+    case 'selectAll':
+      contents.selectAll()
+      return
+    case 'reload':
+      contents.reload()
+      return
+    case 'zoomIn':
+      contents.setZoomLevel(contents.getZoomLevel() + 1)
+      return
+    case 'zoomOut':
+      contents.setZoomLevel(contents.getZoomLevel() - 1)
+      return
+    case 'resetZoom':
+      contents.setZoomLevel(0)
+      return
+    case 'toggleDevTools':
+      contents.toggleDevTools()
+      return
+    case 'minimize':
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.minimize()
+      return
+    case 'toggleMaximize':
+      if (!mainWindow || mainWindow.isDestroyed()) return
+      if (mainWindow.isMaximized()) {
+        mainWindow.unmaximize()
+      } else {
+        mainWindow.maximize()
+      }
+      return
+    case 'close':
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close()
+      return
+    case 'quit':
+      app.quit()
+      return
+  }
+}
+
 export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): void {
   const {
     store,
@@ -145,6 +225,7 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     startWeixinInstallQrcode,
     pollWeixinInstall,
     resolveKunConfigPath,
+    onKunMcpConfigWritten,
     showTurnCompleteNotification,
     getAppVersion,
     readGuiUpdateState,
@@ -463,8 +544,17 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       content
     )
     const path = resolveKunConfigPath()
+    validateMcpConfigContent(validatedContent)
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, validatedContent, 'utf8')
+    try {
+      await onKunMcpConfigWritten?.(path, validatedContent)
+    } catch (error: unknown) {
+      logError('mcp-config', 'Failed to apply MCP config change after write', {
+        path,
+        message: error instanceof Error ? error.message : String(error)
+      })
+    }
     return { ok: true as const, path }
   })
 
@@ -638,6 +728,13 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
   ipcMain.handle('write:inline-completion-debug:clear', async () => {
     clearWriteInlineCompletionDebugEntries()
     return true
+  })
+  ipcMain.handle('desktop:command', async (event, command: unknown) => {
+    runDesktopCommand(
+      parseIpcPayload('desktop:command', desktopCommandSchema, command),
+      event.sender,
+      getMainWindow
+    )
   })
   ipcMain.handle('shell:open-external', async (_, url: unknown) => {
     const validatedUrl = parseIpcPayload('shell:open-external', shellOpenExternalUrlSchema, url)

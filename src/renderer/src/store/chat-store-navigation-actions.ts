@@ -431,6 +431,35 @@ export function createNavigationActions(
       const next = await rendererRuntimeClient.setSettings({ workspaceRoot: picked.path })
       const workspaceRoot = normalizeWorkspaceRoot(next.workspaceRoot)
       const codeWorkspaceRoots = rememberCodeWorkspaceRoots(get().codeWorkspaceRoots, [workspaceRoot])
+
+      // Update the active thread's workspace so the current session
+      // moves to the newly picked directory instead of creating a
+      // new thread or switching away. Only treat the thread as moved
+      // when the PATCH actually succeeds — otherwise we must fall
+      // through to the fallback selection below, or the global
+      // workspaceRoot and the active thread would diverge.
+      const activeThreadId = get().activeThreadId
+      let movedActiveThread = false
+      if (activeThreadId && workspaceRoot) {
+        const p = getProvider()
+        if (typeof p.updateThreadWorkspace === 'function') {
+          try {
+            await p.updateThreadWorkspace(activeThreadId, workspaceRoot)
+            // Update the local threads list so the sidebar shows the
+            // thread under the new workspace immediately.
+            set((s) => ({
+              threads: s.threads.map((thread) =>
+                thread.id === activeThreadId ? { ...thread, workspace: workspaceRoot } : thread
+              )
+            }))
+            movedActiveThread = true
+          } catch {
+            // PATCH failed — leave movedActiveThread false so we fall
+            // through to the existing fallback selection below.
+          }
+        }
+      }
+
       set({
         workspaceRoot,
         codeWorkspaceRoots,
@@ -444,6 +473,8 @@ export function createNavigationActions(
           await get().openWrite()
           return workspaceRoot
         }
+        // If we successfully moved the active thread, stay on it.
+        if (movedActiveThread) return workspaceRoot
         const workspaceThreads = get().threads
           .filter((thread) => isCodeThread(thread, get().clawChannels))
           .filter((thread) => threadBelongsToWorkspace(thread, workspaceRoot))

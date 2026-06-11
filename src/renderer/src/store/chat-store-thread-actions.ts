@@ -21,7 +21,7 @@ import {
 } from '../lib/thread-fork-registry'
 import { workspaceLabelFromPath } from '../lib/workspace-label'
 import { isInternalTemporaryWorkspace, normalizeWorkspaceRoot } from '../lib/workspace-path'
-import { buildClawRuntimePrompt, getActiveAgentApiKey } from '@shared/app-settings'
+import { buildClawRuntimePrompt, buildCodeRuntimePrompt, getActiveAgentApiKey } from '@shared/app-settings'
 import type { ChatState, ChatStoreGet, ChatStoreSet } from './chat-store-types'
 import {
   activeClawChannel,
@@ -227,7 +227,7 @@ export function createThreadActions(
 
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get, activeThreadId)
+      const sink = buildThreadEventSink(set, get, { threadId: activeThreadId, signal: ac.signal })
       void p.subscribeThreadEvents(activeThreadId, latestSeq, sink, ac.signal)
       if (busy) {
         armBusyWatchdog(set, get)
@@ -313,7 +313,7 @@ export function createThreadActions(
       syncTurnCompletionPoll(set, get)
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get, id)
+      const sink = buildThreadEventSink(set, get, { threadId: id, signal: ac.signal })
       subscribeThreadEventsWithRecovery(p, id, latestSeq, sink, ac.signal, get)
       if (busy) armBusyWatchdog(set, get)
     } catch (e) {
@@ -332,7 +332,11 @@ export function createThreadActions(
     try {
       while (true) {
         const state = get()
-        const next = state.queuedMessages[0]
+        const queuedMessages = state.queuedMessages.filter((message) => !message.guiPlan)
+        if (queuedMessages.length !== state.queuedMessages.length) {
+          set({ queuedMessages })
+        }
+        const next = queuedMessages[0]
         if (!next || state.busy) return
         const started = await get().sendMessage(next.text, next.mode, { queued: next })
         if (!started) return
@@ -361,6 +365,10 @@ export function createThreadActions(
     }
     const hasPendingActiveTurn = get().blocks.some(hasPendingRuntimeWork)
     if (get().busy || hasPendingActiveTurn) {
+      if (overrides?.guiPlan) {
+        set({ error: i18n.t('common:composerQueuePlaceholder') })
+        return false
+      }
       const now = Date.now()
       const activeThreadId = get().activeThreadId
       const threadSnap = activeThreadId
@@ -559,10 +567,14 @@ export function createThreadActions(
     try {
       const seqAtSend = get().lastSeq
       const channel = get().route === 'claw' ? activeClawChannel(get()) : null
-      const runtimeText = channel
-        ? buildClawRuntimePrompt(await rendererRuntimeClient.getSettings(), trimmedText, { channel })
-        : trimmedText
-      const runtimeDisplayText = channel ? displayText : userDisplayText
+      const settings = await rendererRuntimeClient.getSettings()
+      let runtimeText: string
+      if (channel) {
+        runtimeText = buildClawRuntimePrompt(settings, trimmedText, { channel })
+      } else {
+        runtimeText = buildCodeRuntimePrompt(settings, trimmedText)
+      }
+      const runtimeDisplayText = channel ? displayText : (userDisplayText ?? trimmedText)
       const { turnId, userMessageItemId } = await p.sendUserMessage(activeThreadId, runtimeText, {
         mode,
         ...(composerModel ? { model: composerModel } : {}),
@@ -649,7 +661,7 @@ export function createThreadActions(
       set({ currentTurnId: turnId })
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get, activeThreadId)
+      const sink = buildThreadEventSink(set, get, { threadId: activeThreadId, signal: ac.signal })
       subscribeThreadEventsWithRecovery(p, activeThreadId, seqAtSend, sink, ac.signal, get)
       armBusyWatchdog(set, get)
       await get().refreshThreads()
@@ -774,7 +786,7 @@ export function createThreadActions(
       set({ currentTurnId: turnId })
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get, activeThreadId)
+      const sink = buildThreadEventSink(set, get, { threadId: activeThreadId, signal: ac.signal })
       subscribeThreadEventsWithRecovery(p, activeThreadId, seqAtSend, sink, ac.signal, get)
       armBusyWatchdog(set, get)
       await get().refreshThreads()

@@ -11,7 +11,8 @@ import {
   Plus,
   RefreshCw,
   Send,
-  Sparkles
+  Sparkles,
+  X
 } from 'lucide-react'
 import type { ChatBlock } from '../agent/types'
 import {
@@ -398,9 +399,18 @@ export function DevBrowserPanel({
     >
       <div className="shrink-0 border-b border-ds-border-muted bg-white/92 dark:bg-ds-card">
         <div className="flex h-10 min-w-0 items-center gap-2 border-b border-ds-border-muted/70 bg-ds-surface-subtle/55 px-3 dark:bg-white/[0.035]">
-          <div className="flex h-8 min-w-0 max-w-[15rem] items-center gap-2 rounded-[8px] bg-white px-3 text-[12px] font-semibold text-ds-ink shadow-[0_1px_0_rgba(15,23,42,0.04)] dark:bg-white/9">
+          <div className="flex h-8 min-w-0 max-w-[15rem] items-center gap-2 rounded-[8px] bg-white px-2.5 pl-3 text-[12px] font-semibold text-ds-ink shadow-[0_1px_0_rgba(15,23,42,0.04)] dark:bg-white/[0.09]">
             <Globe2 className="h-3.5 w-3.5 shrink-0 text-ds-muted" strokeWidth={1.75} />
-            <span className="truncate">{tabLabel}</span>
+            <span className="min-w-0 flex-1 truncate">{tabLabel}</span>
+            <button
+              type="button"
+              onClick={onCollapse}
+              className="-mr-1 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink dark:hover:bg-white/10"
+              aria-label={t('browserCloseTab')}
+              title={t('browserCloseTab')}
+            >
+              <X className="h-3.5 w-3.5" strokeWidth={1.85} />
+            </button>
           </div>
           <button
             type="button"
@@ -423,7 +433,7 @@ export function DevBrowserPanel({
             <PanelRightClose className="h-4 w-4" strokeWidth={1.85} />
           </button>
 
-          <div className="flex shrink-0 items-center gap-1 rounded-full bg-ds-surface-subtle p-0.5 dark:bg-white/8">
+          <div className="flex shrink-0 items-center gap-1 rounded-full bg-ds-surface-subtle p-0.5 dark:bg-white/[0.08]">
             <button
               type="button"
               onClick={goBack}
@@ -460,7 +470,7 @@ export function DevBrowserPanel({
             </button>
           </div>
 
-          <div className="flex h-8 min-w-[7rem] flex-1 items-center gap-2 rounded-full border border-ds-border-muted bg-ds-surface-subtle px-3 text-ds-muted transition focus-within:border-ds-border-strong focus-within:bg-white dark:bg-white/7 dark:focus-within:bg-white/10">
+          <div className="flex h-8 min-w-[7rem] flex-1 items-center gap-2 rounded-full border border-ds-border-muted bg-ds-surface-subtle px-3 text-ds-muted transition focus-within:border-ds-border-strong focus-within:bg-white dark:bg-white/[0.07] dark:focus-within:bg-white/10">
             <Globe2 className="h-3.5 w-3.5 shrink-0" strokeWidth={1.75} />
             <input
               value={draftUrl}
@@ -527,7 +537,7 @@ export function DevBrowserPanel({
                 key={url}
                 type="button"
                 onClick={() => loadUrl(url, { keepAutoFollow: url === latestDetectedUrl })}
-                className="shrink-0 rounded-full border border-ds-border-muted bg-ds-surface-subtle px-2.5 py-1 text-[10.5px] font-medium text-ds-muted transition hover:border-ds-border-strong hover:text-ds-ink dark:bg-white/6"
+                className="shrink-0 rounded-full border border-ds-border-muted bg-ds-surface-subtle px-2.5 py-1 text-[10.5px] font-medium text-ds-muted transition hover:border-ds-border-strong hover:text-ds-ink dark:bg-white/[0.06]"
                 title={url}
               >
                 {formatDevPreviewUrlLabel(url)}
@@ -562,7 +572,7 @@ export function DevBrowserPanel({
                 }
                 setAutoFollow(true)
               }}
-              className="mt-6 inline-flex h-8 items-center justify-center rounded-full bg-ds-surface-subtle px-3 text-[12px] font-semibold text-ds-ink transition hover:bg-ds-hover dark:bg-white/8 dark:hover:bg-white/12"
+              className="mt-6 inline-flex h-8 items-center justify-center rounded-full bg-ds-surface-subtle px-3 text-[12px] font-semibold text-ds-ink transition hover:bg-ds-hover dark:bg-white/[0.08] dark:hover:bg-white/[0.12]"
             >
               {t('browserShowAll')}
             </button>

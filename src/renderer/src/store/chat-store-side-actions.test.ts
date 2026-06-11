@@ -194,6 +194,7 @@ function buildHarness(overrides: Partial<ChatState> = {}): Harness {
     compactActiveThread: async () => undefined,
     forkActiveThread: async () => undefined,
     spawnSideConversation: async () => null,
+    openSideConversationDraft: () => undefined,
     sendSideMessage: async () => false,
     interruptSide: async () => undefined,
     setSideInput: () => undefined,
@@ -257,9 +258,20 @@ describe('chat-store-side-actions', () => {
     expect(state.sideConversations[id!].parentThreadId).toBe('thr_main')
     expect(state.sidePanel.open).toBe(true)
     expect(state.sidePanel.activeSideId).toBe(id)
-    expect(provider.forkMock).toHaveBeenCalledWith('thr_main', { relation: 'side', title: 'Parent · side' })
+    expect(provider.forkMock).toHaveBeenCalledWith('thr_main', { relation: 'side', title: 'Paren · side' })
     // A dedicated subscription was started for the side thread.
     expect(provider.subscribeMock).toHaveBeenCalledWith('side_thr_main', 0, expect.anything(), expect.anything())
+  })
+
+  it('openSideConversationDraft opens the side surface without forking a thread', () => {
+    const { actions, state, provider } = buildHarness()
+
+    actions.openSideConversationDraft()
+
+    expect(state.sidePanel.open).toBe(true)
+    expect(state.sidePanel.activeSideId).toBeNull()
+    expect(state.sideConversations).toEqual({})
+    expect(provider.forkMock).not.toHaveBeenCalled()
   })
 
   it('spawnSideConversation with seedText immediately sends the first turn', async () => {

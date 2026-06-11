@@ -68,13 +68,25 @@ function ClawEmptyHero({
 }
 
 function RuntimeWakeHero({
+  runtimeError,
   onRetry,
   onOpenSettings
 }: {
+  runtimeError?: string | null
   onRetry: () => void
   onOpenSettings: () => void
 }): ReactElement {
   const { t } = useTranslation('common')
+  // When the runtime probe has surfaced a specific error (e.g. port conflict,
+  // missing API key, or unhealthy runtime), prefer a clear "cannot connect"
+  // title and show the localized error message as the body. Otherwise fall
+  // back to the generic "waking" hero. This addresses issue #78, where users
+  // saw the "正在唤醒" title and assumed the app was still loading, never
+  // noticing the port-conflict detail text below it.
+  const trimmedError = runtimeError?.trim() ?? ''
+  const hasError = trimmedError.length > 0
+  const title = hasError ? t('runtimeErrorHeroTitle') : t('runtimeOfflineHeroTitle')
+  const detail = hasError ? trimmedError : t('runtimeOfflineHeroSub')
 
   return (
     <div className="ds-runtime-wake-hero ds-no-drag px-6 pb-8 pt-12 text-center md:pt-16">
@@ -84,10 +96,10 @@ function RuntimeWakeHero({
         {t('runtimeOfflineHeroKicker')}
       </p>
       <h1 className="mt-2 max-w-[620px] text-[26px] font-semibold leading-tight tracking-[0] text-ds-ink md:text-[32px]">
-        {t('runtimeOfflineHeroTitle')}
+        {title}
       </h1>
       <p className="mt-3 max-w-[620px] text-[15px] leading-7 text-ds-muted">
-        {t('runtimeOfflineHeroSub')}
+        {detail}
       </p>
       <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
         <button
@@ -115,6 +127,7 @@ export function MessageTimelineEmptyHero({
   route,
   ready,
   hasWorkspace,
+  runtimeError,
   activeClawChannel,
   onPickWorkspace,
   onRetry,
@@ -124,6 +137,7 @@ export function MessageTimelineEmptyHero({
   route: 'chat' | 'claw'
   ready: boolean
   hasWorkspace: boolean
+  runtimeError?: string | null
   activeClawChannel: ClawImChannelV1 | null
   onPickWorkspace: () => void
   onRetry: () => void
@@ -133,7 +147,7 @@ export function MessageTimelineEmptyHero({
   const { t } = useTranslation('common')
 
   if (!ready) {
-    return <RuntimeWakeHero onRetry={onRetry} onOpenSettings={onOpenSettings} />
+    return <RuntimeWakeHero runtimeError={runtimeError} onRetry={onRetry} onOpenSettings={onOpenSettings} />
   }
 
   if (!hasWorkspace) {

@@ -28,11 +28,14 @@ import {
 } from '../../shared/kun-endpoints'
 import {
   CLAW_MODEL_IDS,
+  MODEL_ENDPOINT_FORMATS,
   SCHEDULE_MODEL_IDS,
   SCHEDULE_REASONING_EFFORT_IDS,
   WRITE_INLINE_COMPLETION_MODEL_IDS
 } from '../../shared/app-settings'
+import { DESKTOP_COMMANDS } from '../../shared/ds-gui-api'
 import { GUI_UPDATE_CHANNELS } from '../../shared/gui-update'
+import { KEYBOARD_SHORTCUT_COMMANDS } from '../../shared/keyboard-shortcuts'
 import { WRITE_EXPORT_FORMATS } from '../../shared/write-export'
 
 const MAX_BODY_BYTES = 2_000_000
@@ -167,16 +170,18 @@ const writeInlineCompletionModelSchema = z.union([
   z.enum(WRITE_INLINE_COMPLETION_MODEL_IDS),
   trimmedString(128)
 ])
+const modelEndpointFormatSchema = z.enum(MODEL_ENDPOINT_FORMATS)
 
 const modelProviderPatchSchema = z.object({
   apiKey: z.string().max(MAX_BODY_BYTES).optional(),
   baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
   providers: z.array(z.object({
-    id: z.string().trim().min(1).max(64),
-    name: z.string().trim().min(1).max(80),
-    apiKey: z.string().max(MAX_BODY_BYTES),
-    baseUrl: z.string().trim().max(MAX_URL_LENGTH),
-    models: z.array(z.string().trim().min(1).max(128)).max(200)
+    id: z.string().trim().min(1).max(64).optional(),
+    name: z.string().trim().min(1).max(80).optional(),
+    apiKey: z.string().max(MAX_BODY_BYTES).optional(),
+    baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
+    endpointFormat: modelEndpointFormatSchema.optional(),
+    models: z.array(z.string().trim().min(1).max(128)).max(200).optional()
   }).strict()).max(50).optional()
 }).strict()
 
@@ -187,6 +192,7 @@ const kunRuntimePatchSchema = z.object({
   apiKey: z.string().max(MAX_BODY_BYTES).optional(),
   baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
   providerId: z.string().trim().max(64).optional(),
+  endpointFormat: modelEndpointFormatSchema.optional(),
   runtimeToken: z.string().max(MAX_BODY_BYTES).optional(),
   dataDir: defaultPathSchema,
   model: z.string().trim().min(1).max(128).optional(),
@@ -247,6 +253,24 @@ const logPatchSchema = z.object({
 
 const notificationsPatchSchema = z.object({
   turnComplete: z.boolean().optional()
+}).strict()
+
+const appBehaviorPatchSchema = z.object({
+  openAtLogin: z.boolean().optional(),
+  startMinimized: z.boolean().optional(),
+  closeToTray: z.boolean().optional()
+}).strict()
+
+const keyboardShortcutCommandIds = KEYBOARD_SHORTCUT_COMMANDS.map((command) => command.id) as [
+  typeof KEYBOARD_SHORTCUT_COMMANDS[number]['id'],
+  ...Array<typeof KEYBOARD_SHORTCUT_COMMANDS[number]['id']>
+]
+
+const keyboardShortcutsPatchSchema = z.object({
+  bindings: z.partialRecord(
+    z.enum(keyboardShortcutCommandIds),
+    z.array(z.string().trim().max(64)).max(4)
+  ).optional()
 }).strict()
 
 const writeInlineCompletionPatchSchema = z.object({
@@ -470,12 +494,15 @@ const settingsPatchObjectSchema = z.object({
   workspaceRoot: defaultPathSchema,
   log: logPatchSchema.optional(),
   notifications: notificationsPatchSchema.optional(),
+  appBehavior: appBehaviorPatchSchema.optional(),
+  keyboardShortcuts: keyboardShortcutsPatchSchema.optional(),
   write: writeSettingsPatchSchema.optional(),
   claw: clawSettingsPatchSchema.optional(),
   schedule: scheduleSettingsPatchSchema.optional(),
   guiUpdate: z.object({
     channel: z.enum(GUI_UPDATE_CHANNELS).optional()
-  }).strict().optional()
+  }).strict().optional(),
+  codePromptPrefix: z.string().max(MAX_CHANNEL_TEXT_LENGTH).optional()
 }).strict()
 
 export const settingsPatchSchema = z.preprocess(stripLegacySettingsPatchKeys, settingsPatchObjectSchema)
@@ -708,6 +735,9 @@ export const notificationPayloadSchema = z
   .strict()
 
 export const guiUpdateChannelSchema = z.enum(GUI_UPDATE_CHANNELS).optional()
+
+export const desktopCommandSchema = z.enum(DESKTOP_COMMANDS)
+
 
 export const logErrorPayloadSchema = z
   .object({

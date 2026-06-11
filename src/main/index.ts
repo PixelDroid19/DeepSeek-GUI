@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, Notification, powerSaveBlocker } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Notification, powerSaveBlocker, Tray } from 'electron'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -6,7 +6,11 @@ import {
   JsonSettingsStore,
   devServerHintUrl
 } from './settings-store'
-import deepseekLogoPng from '../asset/img/deepseek.png'
+import deepseekLogoPng from '../asset/img/deepseek.png?url'
+import deepseekTrayPng from '../asset/img/deepseek_gui_tray.png?url'
+import { createAppIcon, pickTrayIcon } from './app-icon'
+import { configureLinuxWaylandImeSwitches } from './app-command-line'
+import { configureAppIdentity } from './app-identity'
 import {
   applyKunRuntimePatch,
   kunSettingsEnvelope,
@@ -18,7 +22,10 @@ import {
   mergeScheduleSettings,
   mergeWriteSettings,
   normalizeAppSettings,
+  normalizeAppBehaviorSettings,
+  normalizeKeyboardShortcuts,
   resolveKunRuntimeSettings,
+  type AppBehaviorConfigV1,
   type AppSettingsPatch,
   type AppSettingsV1
 } from '../shared/app-settings'
@@ -32,6 +39,7 @@ import {
   runtimeAuthHeaders,
   runtimeRequestViaHost
 } from './runtime/kun-adapter'
+import { waitForRuntimeTurnsIdle } from './runtime/managed-runtime-idle'
 import { configureLogger, logError, logWarn, pruneOnStartup } from './logger'
 import { createClawRuntime, type ClawRuntime } from './claw-runtime'
 import { createScheduleRuntime, type ScheduleRuntime } from './schedule-runtime'
@@ -62,6 +70,7 @@ import { isKunHealthResponseBody } from './kun-health'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const APP_USER_MODEL_ID = 'com.xingyuzhong.deepseekgui'
+const HIDDEN_START_ARG = '--hidden'
 const startupTraceEnabled = process.env.DEEPSEEK_GUI_STARTUP_TRACE === '1'
 const startupTraceStart = Date.now()
 
@@ -115,11 +124,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function runtimeFailure(code: string, message: string, status = 0) {
+function runtimeFailure(code: string, message: string, status = 0, details?: unknown) {
   return {
     ok: false as const,
     status,
-    body: JSON.stringify({ code, message })
+    body: JSON.stringify({ code, message, ...(details !== undefined ? { details } : {}) })
   }
 }
 
@@ -139,6 +148,14 @@ if (runningClawScheduleMcpServer && process.platform === 'darwin') {
   app.dock.hide()
 }
 
+// 在最早的阶段把 app 名称、AppUserModelId 都设好。
+// Windows 任务栏 / 系统托盘 / 通知中心看到的应用名都来自这里;
+// 设得太晚的话 BrowserWindow title、托盘、IPC 启动时拿到的还是旧的。
+// 抽到 app-identity.ts 是为了让测试可以直接 import,不被 main 的
+// whenReady 副作用污染。
+configureAppIdentity()
+configureLinuxWaylandImeSwitches()
+
 if (!runningClawScheduleMcpServer && process.platform === 'win32') {
   app.setAppUserModelId(APP_USER_MODEL_ID)
 }
@@ -150,6 +167,9 @@ let clawRuntime: ClawRuntime | null = null
 let scheduleRuntime: ScheduleRuntime | null = null
 let managedRuntimesStoppedForQuit = false
 let managedRuntimesStopPromise: Promise<void> | null = null
+let appBehavior: AppBehaviorConfigV1 = normalizeAppBehaviorSettings()
+let tray: Tray | null = null
+let isQuitting = false
 
 type GuiUpdaterModule = typeof import('./gui-updater')
 
@@ -249,19 +269,102 @@ function installDevPreviewWebviewGuards(): void {
 }
 
 
-function createAppIcon(source: string): Electron.NativeImage {
-  return source.startsWith('data:')
-    ? nativeImage.createFromDataURL(source)
-    : nativeImage.createFromPath(source)
-}
-
 const appIcon = createAppIcon(deepseekLogoPng)
+const trayIcon = createAppIcon(deepseekTrayPng)
 traceStartup('app icon loaded', { source: deepseekLogoPng.startsWith('data:') ? 'data-url' : 'path' })
 const gotSingleInstanceLock = runningClawScheduleMcpServer || app.requestSingleInstanceLock()
 traceStartup('single instance lock checked', {
   gotSingleInstanceLock,
   skippedForClawScheduleMcpServer: runningClawScheduleMcpServer
 })
+
+function trayLabels(locale: AppSettingsV1['locale']): { show: string; quit: string; tooltip: string } {
+  if (locale === 'zh') {
+    return {
+      show: '显示 DeepSeek GUI',
+      quit: '退出',
+      tooltip: 'DeepSeek GUI'
+    }
+  }
+  return {
+    show: 'Show DeepSeek GUI',
+    quit: 'Quit',
+    tooltip: 'DeepSeek GUI'
+  }
+}
+
+function shouldStartHidden(settings: AppSettingsV1): boolean {
+  return (
+    process.platform === 'win32' &&
+    settings.appBehavior.openAtLogin &&
+    settings.appBehavior.startMinimized &&
+    process.argv.includes(HIDDEN_START_ARG)
+  )
+}
+
+function syncLoginItemSettings(settings: AppSettingsV1): void {
+  if (process.platform !== 'win32' && process.platform !== 'darwin') return
+  const behavior = settings.appBehavior
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: behavior.openAtLogin,
+      args:
+        process.platform === 'win32' && behavior.openAtLogin && behavior.startMinimized
+          ? [HIDDEN_START_ARG]
+          : []
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.warn('[deepseek-gui] failed to update login item settings:', error)
+    logWarn('desktop-behavior', 'Failed to update login item settings.', { message })
+  }
+}
+
+function revealMainWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+    return
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function syncTray(settings: AppSettingsV1): void {
+  appBehavior = settings.appBehavior
+  if (!appBehavior.closeToTray) {
+    if (tray) {
+      tray.destroy()
+      tray = null
+    }
+    return
+  }
+
+  if (!tray) {
+    // Tray 优先用专门的托盘图(在 16x16/24x24 任务栏尺寸下更清晰的剪影);
+    // 托盘图加载失败时回退到主应用图,这样不会看到 electron 默认占位。
+    const traySource = pickTrayIcon(trayIcon, appIcon)
+    tray = new Tray(traySource.isEmpty() ? nativeImage.createEmpty() : traySource)
+    tray.on('click', revealMainWindow)
+    tray.on('double-click', revealMainWindow)
+  }
+
+  const labels = trayLabels(settings.locale)
+  tray.setToolTip(labels.tooltip)
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: labels.show, click: revealMainWindow },
+      { type: 'separator' },
+      {
+        label: labels.quit,
+        click: () => {
+          isQuitting = true
+          app.quit()
+        }
+      }
+    ])
+  )
+}
 
 function normalizeNotificationText(raw: string | undefined, fallback: string, maxLength: number): string {
   const value = typeof raw === 'string' && raw.trim() ? raw.trim() : fallback
@@ -272,16 +375,6 @@ type TurnCompleteNotificationPayload = {
   threadId?: string
   title?: string
   body?: string
-}
-
-function revealMainWindow(): void {
-  if (!mainWindow) {
-    createWindow()
-  }
-  if (!mainWindow) return
-  if (mainWindow.isMinimized()) mainWindow.restore()
-  mainWindow.show()
-  mainWindow.focus()
 }
 
 async function showTurnCompleteNotification(
@@ -430,6 +523,30 @@ function queueRuntimeSettingsApply(prev: AppSettingsV1, next: AppSettingsV1): vo
   runtimeSettingsApplyPromise = task
 }
 
+function queueRuntimeMcpConfigApply(settings: AppSettingsV1): void {
+  lastAppliedSettings = settings
+
+  const previousTask = runtimeSettingsApplyPromise ?? Promise.resolve()
+  const task = previousTask
+    .catch(() => undefined)
+    .then(async () => {
+      const current = lastAppliedSettings ?? settings
+      await restartManagedRuntimeForMcpConfigChange(current)
+    })
+    .catch((error: unknown) => {
+      logWarn('mcp-config', 'Failed to apply Kun MCP config change in background', {
+        message: error instanceof Error ? error.message : String(error)
+      })
+    })
+    .finally(() => {
+      if (runtimeSettingsApplyPromise === task) {
+        runtimeSettingsApplyPromise = null
+      }
+    })
+
+  runtimeSettingsApplyPromise = task
+}
+
 async function waitForQueuedRuntimeSettingsApply(): Promise<void> {
   if (!runtimeSettingsApplyPromise) return
   await runtimeSettingsApplyPromise
@@ -528,17 +645,19 @@ async function ensureKunRuntime(settings: AppSettingsV1): Promise<void> {
   }
 }
 
-function createWindow(): void {
+function createWindow(options: { suppressInitialShow?: boolean } = {}): void {
   traceStartup('createWindow:start')
   const preloadPath = resolvePreloadPath()
+  const usesDesktopTitleBar = process.platform === 'win32' || process.platform === 'linux'
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 840,
     minWidth: 960,
     minHeight: 640,
     icon: appIcon.isEmpty() ? undefined : appIcon,
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : usesDesktopTitleBar ? 'hidden' : 'default',
     trafficLightPosition: process.platform === 'darwin' ? { x: 31, y: 22 } : undefined,
+    autoHideMenuBar: usesDesktopTitleBar,
     show: false,
     webPreferences: {
       preload: preloadPath,
@@ -547,15 +666,25 @@ function createWindow(): void {
       webviewTag: true
     }
   })
+  if (usesDesktopTitleBar) {
+    mainWindow.setMenu(null)
+    mainWindow.setMenuBarVisibility(false)
+  }
   mainWindow.webContents.on('preload-error', (_event, preloadPath, error) => {
     const message = error instanceof Error ? error.message : String(error)
     console.error(`[deepseek-gui] failed to load preload ${preloadPath}:`, error)
     logError('preload', 'Failed to load preload script', { preloadPath, message })
   })
   const showWindow = (): void => {
+    if (options.suppressInitialShow) return
     if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isVisible()) return
     mainWindow.show()
   }
+  mainWindow.on('close', (event) => {
+    if (isQuitting || !appBehavior.closeToTray) return
+    event.preventDefault()
+    mainWindow?.hide()
+  })
   mainWindow.on('closed', () => {
     mainWindow = null
   })
@@ -630,6 +759,7 @@ async function restartManagedRuntimeForSettingsChange(
 
   if (!wasRunning) return
   if (wasRunning) {
+    await waitForManagedRuntimeReadyBeforeStop(prev, 'settings-apply')
     await adapter.stopAndWait()
   }
   if (!resolveConfiguredApiKey(next) || !runtime.autoStart) return
@@ -645,6 +775,44 @@ async function restartManagedRuntimeForSettingsChange(
   }
 }
 
+async function restartManagedRuntimeForMcpConfigChange(settings: AppSettingsV1): Promise<void> {
+  const runtime = resolveKunRuntimeSettings(settings)
+  const adapter = kunRuntimeAdapter
+  const wasRunning = adapter.isChildRunning()
+
+  if (!wasRunning) return
+  await waitForManagedRuntimeReadyBeforeStop(settings, 'mcp-config')
+  await adapter.stopAndWait()
+  if (!resolveConfiguredApiKey(settings) || !runtime.autoStart) return
+
+  try {
+    await adapter.ensureRunning(settings)
+    const healthy = await waitForKunHealth(settings, 20_000)
+    if (!healthy) {
+      console.warn('[deepseek-gui] Kun restart did not become healthy after MCP config change')
+    }
+  } catch (e) {
+    console.warn('[deepseek-gui] Kun restart failed after MCP config change:', e)
+  }
+}
+
+async function waitForManagedRuntimeReadyBeforeStop(
+  settings: AppSettingsV1,
+  source: string
+): Promise<void> {
+  const healthy = await waitForKunHealth(settings, 20_000)
+  if (!healthy) {
+    logWarn(source, 'Kun did not become healthy before a managed restart; stopping it anyway')
+    return
+  }
+  const idle = await waitForRuntimeTurnsIdle({ settings })
+  if (idle === 'timeout') {
+    logWarn(source, 'Kun still has running turns after waiting; stopping it anyway')
+  } else if (idle === 'unavailable') {
+    logWarn(source, 'Could not verify Kun turn idleness before a managed restart; stopping it anyway')
+  }
+}
+
 async function runtimeRequest(
   settings: AppSettingsV1,
   pathAndQuery: string,
@@ -657,7 +825,7 @@ async function runtimeRequest(
     logError('runtime-request', `HTTP request to ${pathAndQuery} failed`, { message })
     const parsed = parseRuntimeErrorBody(message, message)
     if (parsed.code !== 'unknown' || parsed.message !== message) {
-      return runtimeFailure(parsed.code, parsed.message)
+      return runtimeFailure(parsed.code, parsed.message, 0, parsed.details)
     }
     return runtimeFailure('fetch_failed', message)
   }
@@ -685,6 +853,9 @@ app.whenReady().then(async () => {
   traceStartup('settings load:start')
   const initial = await store.load()
   traceStartup('settings load:done')
+  appBehavior = initial.appBehavior
+  syncLoginItemSettings(initial)
+  syncTray(initial)
   await syncClawScheduleMcpConfig(initial, getClawScheduleMcpLaunchConfig()).catch((error) => {
     console.error('[claw-schedule-mcp] failed to sync config on startup:', error)
   })
@@ -730,6 +901,16 @@ app.whenReady().then(async () => {
       provider: mergeModelProviderSettings(prev.provider, providerPatch),
       log: { ...prev.log, ...(partial.log ?? {}) },
       notifications: { ...prev.notifications, ...(partial.notifications ?? {}) },
+      appBehavior: normalizeAppBehaviorSettings({
+        ...prev.appBehavior,
+        ...(partial.appBehavior ?? {})
+      }),
+      keyboardShortcuts: normalizeKeyboardShortcuts({
+        bindings: {
+          ...prev.keyboardShortcuts.bindings,
+          ...(partial.keyboardShortcuts?.bindings ?? {})
+        }
+      }),
       write: mergeWriteSettings(prev.write, partial.write),
       claw: mergeClawSettings(prev.claw, partial.claw),
       schedule: mergeScheduleSettings(prev.schedule, partial.schedule),
@@ -749,6 +930,8 @@ app.whenReady().then(async () => {
     scheduleRuntime?.sync(saved)
     clawRuntime?.sync(saved)
     syncWeixinBridgeRuntime(saved)
+    syncLoginItemSettings(saved)
+    syncTray(saved)
     return saved
   }
 
@@ -774,6 +957,10 @@ app.whenReady().then(async () => {
     startWeixinInstallQrcode,
     pollWeixinInstall,
     resolveKunConfigPath: resolveKunMcpJsonPath,
+    onKunMcpConfigWritten: async () => {
+      const settings = await store.load()
+      queueRuntimeMcpConfigApply(settings)
+    },
     showTurnCompleteNotification,
     getAppVersion: () => app.getVersion(),
     readGuiUpdateState,
@@ -789,7 +976,7 @@ app.whenReady().then(async () => {
   registerRuntimeSseIpc({ ipcMain, store, ensureRuntime, logError })
   traceStartup('ipc registration:done')
 
-  createWindow()
+  createWindow({ suppressInitialShow: shouldStartHidden(initial) })
   traceStartup('createWindow:returned')
 
   void pruneOnStartup().catch((err) => {
@@ -805,14 +992,12 @@ app.whenReady().then(async () => {
   }
 
   app.on('second-instance', () => {
-    if (!mainWindow) return
-    if (mainWindow.isMinimized()) mainWindow.restore()
-    mainWindow.show()
-    mainWindow.focus()
+    revealMainWindow()
   })
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    else revealMainWindow()
   })
 }).catch((error) => {
   const message = error instanceof Error ? error.message : String(error)
@@ -832,6 +1017,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', (event) => {
+  isQuitting = true
   if (managedRuntimesStoppedForQuit) return
   event.preventDefault()
   void stopManagedRuntimesForQuit()

@@ -18,6 +18,11 @@ import {
   DEFAULT_KUN_CAPABILITIES_CONFIG,
   KunCapabilitiesConfig
 } from '../contracts/capabilities.js'
+import {
+  DEFAULT_MODEL_ENDPOINT_FORMAT,
+  MODEL_ENDPOINT_FORMATS,
+  normalizeModelEndpointFormat
+} from '../contracts/model-endpoint-format.js'
 
 export const DEFAULT_SERVE_PORT = 8899
 export const DEFAULT_SERVE_MODEL = DEFAULT_KUN_MODEL
@@ -38,6 +43,7 @@ export const ServeOptionsSchema = z.object({
   runtimeToken: z.string().default(''),
   apiKey: z.string().default(''),
   baseUrl: z.string().default('https://api.deepseek.com/beta'),
+  endpointFormat: z.preprocess(normalizeModelEndpointFormat, z.enum(MODEL_ENDPOINT_FORMATS)).default(DEFAULT_MODEL_ENDPOINT_FORMAT),
   model: z.string().default(DEFAULT_SERVE_MODEL),
   approvalPolicy: ApprovalPolicySchema.default(DEFAULT_APPROVAL_POLICY),
   sandboxMode: SandboxModeSchema.default(DEFAULT_SANDBOX_MODE),
@@ -59,6 +65,7 @@ export const DEFAULT_SERVE_OPTIONS: ServeOptions = {
   runtimeToken: '',
   apiKey: '',
   baseUrl: 'https://api.deepseek.com/beta',
+  endpointFormat: DEFAULT_MODEL_ENDPOINT_FORMAT,
   model: DEFAULT_SERVE_MODEL,
   approvalPolicy: DEFAULT_APPROVAL_POLICY,
   sandboxMode: DEFAULT_SANDBOX_MODE,

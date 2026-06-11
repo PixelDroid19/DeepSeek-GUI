@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { describe, expect, it, vi } from 'vitest'
 import type { NormalizedThread } from '../../agent/types'
-import { buildSidebarWorkspaceGroups } from './SidebarProjectsSection'
+import { buildSidebarWorkspaceGroups, ThreadRenameDialog } from './SidebarProjectsSection'
 
 function thread(overrides: Partial<NormalizedThread> & Pick<NormalizedThread, 'id' | 'workspace'>): NormalizedThread {
   return {
@@ -84,5 +86,52 @@ describe('SidebarProjectsSection groups', () => {
       '/Users/zxy/.deepseekgui/default_workspace'
     ])
     expect(groups[1]?.[1].map((item) => item.id)).toEqual(['default-code'])
+  })
+
+  it('merges default workspace aliases into one sidebar group', () => {
+    const groups = buildSidebarWorkspaceGroups({
+      threads: [
+        thread({ id: 'default-short', workspace: '~/.deepseekgui/default_workspace' }),
+        thread({ id: 'default-absolute', workspace: 'C:\\Users\\zxy\\.deepseekgui\\default_workspace' })
+      ],
+      searchQuery: '',
+      showArchived: false,
+      workspaceRoot: 'C:\\Users\\zxy\\.deepseekgui\\default_workspace',
+      workspaceRoots: [
+        '~/.deepseekgui/default_workspace',
+        'C:\\Users\\zxy\\.deepseekgui\\default_workspace'
+      ]
+    })
+
+    expect(groups).toHaveLength(1)
+    expect(groups[0]?.[0]).toBe('C:\\Users\\zxy\\.deepseekgui\\default_workspace')
+    expect(groups[0]?.[1].map((item) => item.id)).toEqual(['default-short', 'default-absolute'])
+  })
+})
+
+describe('ThreadRenameDialog', () => {
+  it('renders an in-app rename form with the current thread title prefilled', () => {
+    const html = renderToStaticMarkup(
+      createElement(ThreadRenameDialog, {
+        state: {
+          thread: thread({
+            id: 'thr_rename',
+            title: 'Build rename dialog',
+            workspace: '/Users/zxy/project-a'
+          }),
+          value: 'Build rename dialog',
+          submitting: false
+        },
+        onClose: vi.fn(),
+        onValueChange: vi.fn(),
+        onSubmit: vi.fn(),
+        t: (key: string) => key
+      })
+    )
+
+    expect(html).toContain('role="dialog"')
+    expect(html).toContain('sidebarThreadRename')
+    expect(html).toContain('value="Build rename dialog"')
+    expect(html).toContain('type="submit" disabled=""')
   })
 })

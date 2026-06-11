@@ -52,6 +52,10 @@ import { TurnService } from '../services/turn-service.js'
 import { ReviewService } from '../services/review-service.js'
 import { UsageService } from '../services/usage-service.js'
 import type { UsageEvent } from '../contracts/events.js'
+import {
+  DEFAULT_MODEL_ENDPOINT_FORMAT,
+  type ModelEndpointFormat
+} from '../contracts/model-endpoint-format.js'
 import { SkillRuntime } from '../skills/skill-runtime.js'
 import { FileMemoryStore } from '../memory/memory-store.js'
 import { DelegationRuntime, FileDelegationStore } from '../delegation/delegation-runtime.js'
@@ -65,6 +69,7 @@ export type KunServeRuntimeOptions = {
   runtimeToken: string
   apiKey: string
   baseUrl: string
+  endpointFormat?: ModelEndpointFormat
   model: string
   approvalPolicy: ApprovalPolicy
   sandboxMode: SandboxMode
@@ -138,6 +143,7 @@ export async function createKunServeRuntime(
   const modelClient = new DeepseekCompatModelClient({
     baseUrl: options.baseUrl,
     apiKey: options.apiKey,
+    endpointFormat: options.endpointFormat ?? DEFAULT_MODEL_ENDPOINT_FORMAT,
     model: options.model
   })
   const modelProfiles = modelContextProfilesFromConfig({
@@ -332,6 +338,7 @@ export async function createKunServeRuntime(
       configPath: options.configPath,
       dataDir: options.dataDir,
       model: options.model,
+      endpointFormat: options.endpointFormat ?? DEFAULT_MODEL_ENDPOINT_FORMAT,
       approvalPolicy: options.approvalPolicy,
       sandboxMode: options.sandboxMode,
       tokenEconomyMode: options.tokenEconomyMode,

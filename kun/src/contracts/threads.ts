@@ -1,6 +1,11 @@
 import { z } from 'zod'
 import { TurnSchema } from './turns.js'
-import { ApprovalPolicySchema, DEFAULT_APPROVAL_POLICY, SandboxModeSchema } from './policy.js'
+import {
+  ApprovalPolicySchema,
+  DEFAULT_APPROVAL_POLICY,
+  DEFAULT_SANDBOX_MODE,
+  SandboxModeSchema
+} from './policy.js'
 
 export const ThreadStatus = z.enum(['idle', 'running', 'archived', 'deleted'])
 export type ThreadStatus = z.infer<typeof ThreadStatus>
@@ -93,7 +98,7 @@ export const ThreadSchema = z.object({
   mode: ThreadMode,
   status: ThreadStatus,
   approvalPolicy: ApprovalPolicySchema.default(DEFAULT_APPROVAL_POLICY),
-  sandboxMode: SandboxModeSchema.default('workspace-write'),
+  sandboxMode: SandboxModeSchema.default(DEFAULT_SANDBOX_MODE),
   costBudgetUsd: z.number().positive().optional(),
   costBudgetWarningSent: z.boolean().optional(),
   relation: ThreadRelation.default('primary'),
@@ -219,6 +224,7 @@ export type ClearThreadTodosResponse = z.infer<typeof ClearThreadTodosResponse>
 export const UpdateThreadRequest = z
   .object({
     title: z.string().optional(),
+    workspace: z.string().min(1).optional(),
     status: ThreadStatus.optional(),
     approvalPolicy: ApprovalPolicySchema.optional(),
     sandboxMode: SandboxModeSchema.optional(),
@@ -229,6 +235,7 @@ export const UpdateThreadRequest = z
   .refine(
     (value) =>
       value.title !== undefined ||
+      value.workspace !== undefined ||
       value.status !== undefined ||
       value.approvalPolicy !== undefined ||
       value.sandboxMode !== undefined ||

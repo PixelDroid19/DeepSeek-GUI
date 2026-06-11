@@ -335,6 +335,17 @@ export class KunRuntimeProvider implements AgentProvider {
     }
   }
 
+  async updateThreadWorkspace(threadId: string, workspace: string): Promise<void> {
+    const response = await rendererRuntimeClient.runtimeRequest(
+      kunThreadPath(threadId),
+      'PATCH',
+      JSON.stringify({ workspace })
+    )
+    if (!response.ok) {
+      throw runtimeErrorToError(readRuntimeError(response.body, 'update thread workspace failed'))
+    }
+  }
+
   async archiveThread(threadId: string, archived: boolean): Promise<void> {
     const response = await window.dsGui.runtimeRequest(
       kunThreadPath(threadId),

@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import type { ChatBlock, ToolBlock } from '../../agent/types'
-import { summarizeToolBlock } from './MessageTimeline'
+import type { ChatBlock, NormalizedThread, ToolBlock } from '../../agent/types'
+import { useChatStore } from '../../store/chat-store'
+import { MessageTimeline, summarizeToolBlock } from './MessageTimeline'
 import { MessageBubble } from './message-timeline-bubbles'
 import { ProcessSectionRow } from './message-timeline-process'
 
@@ -18,6 +19,15 @@ const labels: Record<string, string> = {
 }
 
 const t = (key: string) => labels[key] ?? (key === 'toolActionCommand' ? 'Ran command' : key)
+
+const activeThread: NormalizedThread = {
+  id: 'thr_1',
+  title: 'Thread',
+  updatedAt: '2026-06-07T00:00:00.000Z',
+  model: 'deepseek-chat',
+  mode: 'code',
+  workspace: '/tmp/project'
+}
 
 function toolBlock(overrides: Partial<ToolBlock>): ToolBlock {
   return {
@@ -113,6 +123,23 @@ describe('MessageTimeline tool summaries', () => {
 })
 
 describe('MessageTimeline Kun runtime metadata smoke', () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      route: 'chat',
+      workspaceRoot: '/tmp/project',
+      activeThreadId: 'thr_1',
+      threads: [activeThread],
+      busy: false,
+      currentTurnUserId: null,
+      turnStartedAtByUserId: {},
+      turnDurationByUserId: {},
+      turnReasoningFirstAtByUserId: {},
+      turnReasoningLastAtByUserId: {},
+      clawChannels: [],
+      activeClawChannelId: ''
+    })
+  })
+
   it('renders user image attachments as thumbnails instead of attachment chips', () => {
     const block: ChatBlock = {
       kind: 'user',
@@ -235,7 +262,7 @@ describe('MessageTimeline Kun runtime metadata smoke', () => {
     expect(html).toContain('Sources 1')
   })
 
-  it('expands running tool calls so partial details stay visible', () => {
+  it('keeps running tool calls collapsed by default while showing active status', () => {
     const block: ChatBlock = toolBlock({
       summary: 'read: file',
       status: 'running',
@@ -257,7 +284,7 @@ describe('MessageTimeline Kun runtime metadata smoke', () => {
     expect(html).toContain('/tmp/readme.md')
     expect(html).not.toContain('ds-work-logo')
     expect(html).toContain('ds-shiny-text')
-    expect(html).toContain('partial tool output while running')
+    expect(html).not.toContain('partial tool output while running')
     expect(html).toContain('ds-process-file-reference')
   })
 
@@ -313,5 +340,118 @@ describe('MessageTimeline Kun runtime metadata smoke', () => {
     expect(html).not.toContain('needle')
     expect(html).not.toContain('read detail should stay tucked away')
     expect(html).not.toContain('grep detail should stay tucked away')
+  })
+
+  it('auto-expands pending request_user_input while keeping other tool details tucked away', () => {
+    const readBlock: ChatBlock = toolBlock({
+      id: 'tool_read',
+      summary: 'read: file',
+      detail: 'read detail should stay tucked away',
+      meta: { toolName: 'read' },
+      filePath: '/tmp/readme.md'
+    })
+    const inputBlock: ChatBlock = {
+      kind: 'user_input',
+      id: 'ui_1',
+      requestId: 'input_1',
+      status: 'pending',
+      questions: [
+        {
+          header: 'Dinner',
+          id: 'dinner',
+          question: 'What should we eat tonight?',
+          options: [
+            {
+              label: 'Noodles',
+              description: 'Fast and warm'
+            }
+          ]
+        }
+      ]
+    }
+
+    const html = renderToStaticMarkup(
+      createElement(ProcessSectionRow, {
+        section: { id: 'execution-batch', kind: 'execution', blocks: [readBlock, inputBlock] },
+        processing: true,
+        singleReasoningSection: false,
+        viewportRef: { current: null }
+      })
+    )
+
+    expect(html).toContain('ds-work-stack')
+    expect(html).toContain('What should we eat tonight?')
+    expect(html).toContain('Noodles')
+    expect(html).not.toContain('read detail should stay tucked away')
+  })
+
+  it('renders request_user_input without options as a freeform answer field', () => {
+    const inputBlock: ChatBlock = {
+      kind: 'user_input',
+      id: 'ui_freeform',
+      requestId: 'input_freeform',
+      status: 'pending',
+      questions: [
+        {
+          header: 'Input',
+          id: 'direction',
+          question: '你更想去南方还是北方？',
+          options: []
+        }
+      ]
+    }
+
+    const html = renderToStaticMarkup(
+      createElement(ProcessSectionRow, {
+        section: { id: 'execution-input', kind: 'execution', blocks: [inputBlock] },
+        processing: true,
+        singleReasoningSection: false,
+        viewportRef: { current: null }
+      })
+    )
+
+    expect(html).toContain('你更想去南方还是北方？')
+    expect(html).toContain('<textarea')
+    expect(html).not.toContain('userInputOther')
+    expect(html).not.toContain('其他')
+  })
+
+  it('expands the live work timeline by default while keeping tool details collapsed', () => {
+    const blocks: ChatBlock[] = [
+      {
+        kind: 'user',
+        id: 'user_1',
+        text: 'inspect this file'
+      },
+      toolBlock({
+        summary: 'read: file',
+        status: 'running',
+        detail: 'running timeline detail should stay collapsed',
+        meta: { toolName: 'read' },
+        filePath: '/tmp/project/src/app.ts'
+      })
+    ]
+    useChatStore.setState({
+      busy: true,
+      currentTurnUserId: 'user_1',
+      turnStartedAtByUserId: { user_1: Date.now() }
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(MessageTimeline, {
+        blocks,
+        liveReasoning: '',
+        live: '',
+        activeThreadId: 'thr_1',
+        runtimeConnection: 'ready',
+        onRetryConnection: () => undefined,
+        onOpenSettings: () => undefined
+      })
+    )
+
+    expect(html).toContain('aria-expanded="true"')
+    expect(html).toContain('Read')
+    expect(html).toContain('/tmp/project/src/app.ts')
+    expect(html).not.toContain('running timeline detail should stay collapsed')
   })
 })

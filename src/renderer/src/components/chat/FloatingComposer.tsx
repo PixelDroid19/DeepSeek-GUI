@@ -218,6 +218,7 @@ export function FloatingComposer({
   )
 
   const {
+    canEditComposer,
     canCompose,
     canChangeModel,
     canSend,
@@ -248,7 +249,7 @@ export function FloatingComposer({
     hasPlanCommand: Boolean(onPlanCommand),
     hasReviewCommand: Boolean(onReviewCommand)
   })
-  const draft = useComposerDraft({ input, canCompose })
+  const draft = useComposerDraft({ input, canCompose: canEditComposer })
   const slashQuery = getSlashQuery(input)
   const [composerCursor, setComposerCursor] = useState(() => input.length)
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0)
@@ -905,11 +906,11 @@ export function FloatingComposer({
             ref={draft.textareaRef}
             rows={1}
             className={`ds-no-drag block min-w-0 resize-none break-words bg-transparent px-1 py-0.5 text-[15px] leading-[1.45] text-ds-ink placeholder:text-ds-faint focus:outline-none [overflow-wrap:anywhere] ${
-              canCompose ? '' : 'opacity-80'
+              canEditComposer ? '' : 'opacity-80'
             } ${compact ? 'text-[14px]' : 'min-h-[40px]'}`}
             placeholder={placeholder}
             value={input}
-            disabled={!canCompose}
+            disabled={!canEditComposer}
             onChange={(e) => {
               setInput(e.target.value)
               setComposerCursor(e.target.selectionStart ?? e.target.value.length)

@@ -1,5 +1,13 @@
 import type { GuiUpdateChannel } from './gui-update'
+import type { KeyboardShortcutsConfigV1 } from './keyboard-shortcuts'
 import type { ApprovalPolicy, SandboxMode } from '../../kun/src/contracts/policy.js'
+import type { ModelEndpointFormat } from '../../kun/src/contracts/model-endpoint-format.js'
+export {
+  DEFAULT_MODEL_ENDPOINT_FORMAT,
+  MODEL_ENDPOINT_FORMATS,
+  modelEndpointPath,
+  normalizeModelEndpointFormat
+} from '../../kun/src/contracts/model-endpoint-format.js'
 export { DEFAULT_GUI_UPDATE_CHANNEL, normalizeGuiUpdateChannel, type GuiUpdateChannel } from './gui-update'
 export {
   DEFAULT_APPROVAL_POLICY,
@@ -19,7 +27,7 @@ export type ClawScheduleKind = ScheduleKind
 export type ClawTaskStatus = ScheduleTaskStatus
 export type ClawModel = ScheduleModel
 
-export const DEFAULT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com/beta'
+export const DEFAULT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
 export const DEFAULT_CLAW_MODEL = 'auto'
 export const CLAW_MODEL_IDS = ['auto', 'deepseek-v4-pro', 'deepseek-v4-flash'] as const
 export const DEFAULT_SCHEDULE_MODEL = DEFAULT_CLAW_MODEL
@@ -42,11 +50,13 @@ export const DEFAULT_WRITE_INLINE_LONG_COMPLETION_MAX_TOKENS = 256
 export const DEFAULT_KUN_PORT = 8899
 export const DEFAULT_WEIXIN_BRIDGE_RPC_URL = 'http://127.0.0.1:18790/api/v1/admin/rpc'
 export const DEFAULT_MODEL_PROVIDER_ID = 'deepseek'
+export type { ModelEndpointFormat }
 export type ModelProviderProfileV1 = {
   id: string
   name: string
   apiKey: string
   baseUrl: string
+  endpointFormat: ModelEndpointFormat
   models: string[]
 }
 export type ModelProviderSettingsV1 = {
@@ -72,6 +82,8 @@ export type KunRuntimeSettingsV1 = {
   baseUrl: string
   /** Selected General model provider profile. Empty or missing means the default provider. */
   providerId: string
+  /** Effective model request format. Resolved from the selected model provider. */
+  endpointFormat: ModelEndpointFormat
   runtimeToken: string
   dataDir: string
   model: string
@@ -201,6 +213,12 @@ export type LogConfigV1 = {
 
 export type NotificationConfigV1 = {
   turnComplete: boolean
+}
+
+export type AppBehaviorConfigV1 = {
+  openAtLogin: boolean
+  startMinimized: boolean
+  closeToTray: boolean
 }
 
 export type ScheduleSkillSettingsV1 = {
@@ -444,19 +462,24 @@ export type AppSettingsV1 = {
   workspaceRoot: string
   log: LogConfigV1
   notifications: NotificationConfigV1
+  appBehavior: AppBehaviorConfigV1
+  keyboardShortcuts: KeyboardShortcutsConfigV1
   write: WriteSettingsV1
   claw: ClawSettingsV1
   schedule: ScheduleSettingsV1
   guiUpdate: GuiUpdateConfigV1
+  codePromptPrefix: string
 }
 
 export type AppSettingsPatch = Partial<
-  Omit<AppSettingsV1, 'provider' | 'agents' | 'log' | 'notifications' | 'write' | 'claw' | 'schedule' | 'guiUpdate'>
+  Omit<AppSettingsV1, 'provider' | 'agents' | 'log' | 'notifications' | 'appBehavior' | 'keyboardShortcuts' | 'write' | 'claw' | 'schedule' | 'guiUpdate'>
 > & {
   provider?: ModelProviderSettingsPatchV1
   agents?: KunSettingsEnvelopePatchV1
   log?: Partial<LogConfigV1>
   notifications?: Partial<NotificationConfigV1>
+  appBehavior?: Partial<AppBehaviorConfigV1>
+  keyboardShortcuts?: Partial<KeyboardShortcutsConfigV1>
   write?: WriteSettingsPatchV1
   claw?: ClawSettingsPatchV1
   schedule?: ScheduleSettingsPatchV1

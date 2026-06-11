@@ -3,7 +3,7 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { ChevronDown, ChevronRight, Minimize2 } from 'lucide-react'
 import type { ChatBlock, ToolBlock } from '../../agent/types'
-import { looksLikeUnifiedDiff } from '../../lib/diff-stats'
+import { extractUnifiedDiffText } from '../../lib/diff-stats'
 import { useDeferredRender } from '../../hooks/use-deferred-render'
 import { openWorkspacePathInEditor } from '../../lib/open-workspace-path'
 import { previewWorkspaceFile } from '../../lib/workspace-file-preview'
@@ -86,6 +86,18 @@ function isProcessSectionActive(section: ProcessSection, processing: boolean): b
   )
 }
 
+function isRequestUserInputTool(block: ChatBlock): boolean {
+  if (block.kind === 'user_input' && block.status === 'pending') return true
+  if (block.kind !== 'tool' || block.status !== 'running') return false
+  const toolName = typeof block.meta?.toolName === 'string' ? block.meta.toolName.trim() : ''
+  if (toolName === 'request_user_input' || toolName === 'user_input') return true
+  return /^request_user_input\s*:/i.test(block.summary.trim())
+}
+
+function sectionHasRequestUserInput(section: ProcessSection): boolean {
+  return section.blocks.some(isRequestUserInputTool)
+}
+
 export function ProcessSectionRow({
   section,
   processing,
@@ -113,9 +125,13 @@ export function ProcessSectionRow({
     (block) =>
       (block.kind === 'tool' && block.status === 'error') ||
       (block.kind === 'approval' && block.status === 'error') ||
-      (block.kind === 'user_input' && block.status === 'error')
+      (block.kind === 'user_input' && block.status === 'error') ||
+      (block.kind === 'system' && block.severity === 'error')
   )
-  const defaultExpanded = active || hasError
+  const defaultExpanded =
+    hasError ||
+    (active && section.kind === 'reasoning') ||
+    (processing && section.kind === 'execution' && sectionHasRequestUserInput(section))
   const expanded = hasDetails && (userExpanded ?? defaultExpanded)
   const title = describeProcessSection(section, t, {
     processing,
@@ -241,7 +257,8 @@ function processBlockHasError(block: ChatBlock): boolean {
     (block.kind === 'tool' && block.status === 'error') ||
     (block.kind === 'compaction' && block.status === 'error') ||
     (block.kind === 'approval' && block.status === 'error') ||
-    (block.kind === 'user_input' && block.status === 'error')
+    (block.kind === 'user_input' && block.status === 'error') ||
+    (block.kind === 'system' && block.severity === 'error')
   )
 }
 
@@ -262,10 +279,11 @@ function ProcessStackRows({
         const detail = getProcessDetail(block, summary)
         const isRunningTool = processBlockIsRunningTool(block, processing)
         const canExpand = detail.kind !== 'none'
-        const open = canExpand && (isRunningTool || processBlockHasError(block) || openBlockId === block.id)
+        const autoOpenRequestInput = processing && isRequestUserInputTool(block)
+        const open = canExpand && (processBlockHasError(block) || autoOpenRequestInput || openBlockId === block.id)
         const rowActive = processBlockIsActive(block, processing)
         const isError = processBlockHasError(block)
-        const canToggle = canExpand && !isRunningTool
+        const canToggle = canExpand && !autoOpenRequestInput
         const handleToggle = (): void => {
           if (!canToggle) return
           setOpenBlockId((id) => (id === block.id ? null : block.id))
@@ -293,7 +311,7 @@ function ProcessStackRows({
               <span className={`min-w-0 flex-1 truncate ${rowActive && !isError ? 'ds-shiny-text' : ''}`}>
                 <ProcessSummaryText block={block} summary={summary} />
               </span>
-              {canExpand && !isRunningTool ? (
+              {canExpand ? (
                 open ? (
                   <ChevronDown className="h-3 w-3 shrink-0 opacity-35" strokeWidth={2} />
                 ) : (
@@ -339,12 +357,12 @@ function ProcessEntryRow({
   const isError = processBlockHasError(block)
   const open =
     canExpand &&
-    (isRunningTool || isError || isAssistantProcessText || isAutoOpenPending || isStreamingAssistant || userOpen)
+    (isError || isAssistantProcessText || isAutoOpenPending || isStreamingAssistant || userOpen)
 
   const { verb, rest } = splitVerb(summary)
   const rowActive = isRunningTool || isAutoOpenPending || isStreamingAssistant
   const wrapSummary = (block.kind === 'system' && !canExpand) || isAssistantProcessText
-  const canToggle = canExpand && !isRunningTool && !isAutoOpenPending && !isAssistantProcessText
+  const canToggle = canExpand && !isAutoOpenPending && !isAssistantProcessText
   const handleToggle = (): void => {
     if (!canToggle) return
     setUserOpen((v) => !v)
@@ -392,7 +410,7 @@ function ProcessEntryRow({
             </span>
           ) : null}
         </span>
-        {canExpand && !isRunningTool ? (
+        {canExpand ? (
           open ? (
             <ChevronDown className="mt-1 h-3 w-3 shrink-0 opacity-40" strokeWidth={2} />
           ) : (
@@ -823,12 +841,14 @@ function getProcessDetail(block: ChatBlock, summaryText?: string): ProcessDetail
       return { kind: 'none' }
     }
     const isError = block.status === 'error'
-    const isPatch =
-      block.toolKind === 'file_change' && !isError && looksLikeUnifiedDiff(detailText)
+    const patchText =
+      block.toolKind === 'file_change' && !isError
+        ? extractUnifiedDiffText(detailText)
+        : undefined
     return {
       kind: 'tool',
-      text: block.detail!,
-      isPatch,
+      text: patchText ?? block.detail!,
+      isPatch: patchText !== undefined,
       isError,
       filePath: block.filePath
     }
@@ -844,6 +864,7 @@ function getProcessDetail(block: ChatBlock, summaryText?: string): ProcessDetail
   if (block.kind === 'approval') return { kind: 'approval' }
   if (block.kind === 'user_input') return { kind: 'user_input' }
   if (block.kind === 'system' && block.text.trim()) {
+    if (block.detail?.trim()) return { kind: 'text', text: block.detail }
     // Short system messages already fit in the summary line — skip the
     // expand affordance so we don't duplicate the same string.
     if (block.text.length <= 140) return { kind: 'none' }

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   defaultClawSettings,
+  defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
@@ -42,6 +43,8 @@ function createSettings(patch: Partial<AppSettingsV1['write']['inlineCompletion'
     notifications: {
       turnComplete: true
     },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
+    keyboardShortcuts: defaultKeyboardShortcuts(),
     write: {
       ...write,
       inlineCompletion: {
@@ -53,6 +56,7 @@ function createSettings(patch: Partial<AppSettingsV1['write']['inlineCompletion'
     guiUpdate: {
       channel: 'stable'
     },
+    codePromptPrefix: '',
     claw: defaultClawSettings()
   }
 }

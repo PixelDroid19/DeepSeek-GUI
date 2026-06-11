@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   defaultClawSettings,
+  defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
@@ -24,6 +25,7 @@ function settings(): AppSettingsV1 {
           name: 'Custom Provider',
           apiKey: 'sk-custom',
           baseUrl: 'https://custom.example/v1',
+          endpointFormat: 'messages',
           models: ['custom-model']
         }
       ]
@@ -38,10 +40,13 @@ function settings(): AppSettingsV1 {
     workspaceRoot: '/tmp/workspace',
     log: { enabled: false, retentionDays: 7 },
     notifications: { turnComplete: true },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
+    keyboardShortcuts: defaultKeyboardShortcuts(),
     write: defaultWriteSettings(),
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
-    guiUpdate: { channel: 'stable' }
+    guiUpdate: { channel: 'stable' },
+    codePromptPrefix: ''
   }
 }
 
@@ -51,5 +56,6 @@ describe('model provider settings', () => {
 
     expect(runtime.apiKey).toBe('sk-custom')
     expect(runtime.baseUrl).toBe('https://custom.example/v1')
+    expect(runtime.endpointFormat).toBe('messages')
   })
 })

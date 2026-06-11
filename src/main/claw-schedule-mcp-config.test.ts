@@ -16,6 +16,7 @@ import {
 } from './claw-schedule-mcp-config'
 import {
   defaultClawSettings,
+  defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
@@ -43,6 +44,8 @@ function createSettings(patch: Partial<AppSettingsV1['schedule']['internal']> = 
     notifications: {
       turnComplete: true
     },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
+    keyboardShortcuts: defaultKeyboardShortcuts(),
     write: defaultWriteSettings(),
     schedule: {
       ...schedule,
@@ -54,6 +57,7 @@ function createSettings(patch: Partial<AppSettingsV1['schedule']['internal']> = 
     guiUpdate: {
       channel: 'stable'
     },
+    codePromptPrefix: '',
     claw: {
       ...claw,
       enabled: true,

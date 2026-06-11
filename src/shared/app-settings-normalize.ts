@@ -1,6 +1,7 @@
 import {
   DEFAULT_GUI_UPDATE_CHANNEL,
   normalizeGuiUpdateChannel,
+  type AppBehaviorConfigV1,
   type AppSettingsV1,
   type ClawSettingsPatchV1,
   type GuiUpdateConfigV1,
@@ -8,6 +9,7 @@ import {
   type ScheduleSettingsPatchV1,
   type WriteSettingsPatchV1
 } from './app-settings-types'
+import { normalizeKeyboardShortcuts, type KeyboardShortcutsConfigV1 } from './keyboard-shortcuts'
 import {
   defaultKunRuntimeSettings,
   getKunRuntimeSettings,
@@ -26,6 +28,8 @@ export function normalizeAppSettings(settings: AppSettingsV1): AppSettingsV1 {
     ? migrateLegacyAppSettings(settings as Parameters<typeof migrateLegacyAppSettings>[0])
     : settings
   const maybeSettings = migrated as AppSettingsV1 & {
+    appBehavior?: Partial<AppBehaviorConfigV1>
+    keyboardShortcuts?: Partial<KeyboardShortcutsConfigV1>
     notifications?: Partial<NotificationConfigV1>
     provider?: Parameters<typeof normalizeModelProviderSettings>[0]
     write?: WriteSettingsPatchV1
@@ -61,6 +65,8 @@ export function normalizeAppSettings(settings: AppSettingsV1): AppSettingsV1 {
     notifications: {
       turnComplete: maybeSettings.notifications?.turnComplete !== false
     },
+    appBehavior: normalizeAppBehaviorSettings(maybeSettings.appBehavior),
+    keyboardShortcuts: normalizeKeyboardShortcuts(maybeSettings.keyboardShortcuts),
     write: normalizeWriteSettings(maybeSettings.write),
     claw: normalizeClawSettings(maybeSettings.claw),
     schedule: normalizeScheduleSettings(maybeSettings.schedule),
@@ -68,7 +74,19 @@ export function normalizeAppSettings(settings: AppSettingsV1): AppSettingsV1 {
       channel: normalizeGuiUpdateChannel(
         maybeSettings.guiUpdate?.channel ?? DEFAULT_GUI_UPDATE_CHANNEL
       )
-    }
+    },
+    codePromptPrefix: typeof maybeSettings.codePromptPrefix === 'string' ? maybeSettings.codePromptPrefix : ''
+  }
+}
+
+export function normalizeAppBehaviorSettings(
+  settings?: Partial<AppBehaviorConfigV1>
+): AppBehaviorConfigV1 {
+  const openAtLogin = settings?.openAtLogin === true
+  return {
+    openAtLogin,
+    startMinimized: openAtLogin && settings?.startMinimized === true,
+    closeToTray: settings?.closeToTray === true
   }
 }
 

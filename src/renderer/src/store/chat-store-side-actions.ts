@@ -27,9 +27,13 @@ type ActiveSideAbort = {
 
 const sideAbortControllers = new Map<string, AbortController>()
 
+function compactTitlePrefix(value: string): string {
+  return Array.from(value.trim()).slice(0, 5).join('')
+}
+
 function defaultSideTitle(parentTitle: string, parentThreadId: string): string {
   const trimmed = parentTitle.trim()
-  if (trimmed) return `${trimmed} · side`
+  if (trimmed) return `${compactTitlePrefix(trimmed)} · side`
   return `${parentThreadId.slice(0, 8)} · side`
 }
 
@@ -298,6 +302,7 @@ function startSideSubscription(sideId: string, sinceSeq: number, ctx: SideContex
 export function createSideActions(ctx: SideContext): Pick<
   ChatState,
   | 'spawnSideConversation'
+  | 'openSideConversationDraft'
   | 'sendSideMessage'
   | 'interruptSide'
   | 'setSideInput'
@@ -312,6 +317,7 @@ export function createSideActions(ctx: SideContext): Pick<
   const actions: Pick<
     ChatState,
     | 'spawnSideConversation'
+    | 'openSideConversationDraft'
     | 'sendSideMessage'
     | 'interruptSide'
     | 'setSideInput'
@@ -388,6 +394,12 @@ export function createSideActions(ctx: SideContext): Pick<
         if (!started) return forked.id
       }
       return forked.id
+    },
+
+    openSideConversationDraft: () => {
+      ctx.set((s) => ({
+        sidePanel: setSidePanel(s.sidePanel, { open: true, activeSideId: null })
+      }))
     },
 
     sendSideMessage: async (sideId, text) => {
@@ -471,16 +483,19 @@ export function createSideActions(ctx: SideContext): Pick<
     },
 
     closeSideConversation: async (sideId) => {
+      const state = ctx.get()
+      const closingSide = state.sideConversations[sideId] ?? null
       teardownSideSubscription(sideId)
       ctx.set((s) => {
         const next = { ...s.sideConversations }
         delete next[sideId]
+        const nextActiveId =
+          s.sidePanel.activeSideId === sideId && closingSide
+            ? Object.values(next).find((side) => side.parentThreadId === closingSide.parentThreadId)?.threadId ?? null
+            : s.sidePanel.activeSideId
         const nextPanel: SidePanelState = {
-          open: Object.keys(next).length > 0 ? s.sidePanel.open : false,
-          activeSideId:
-            s.sidePanel.activeSideId === sideId
-              ? Object.keys(next)[0] ?? null
-              : s.sidePanel.activeSideId
+          open: nextActiveId ? s.sidePanel.open : false,
+          activeSideId: nextActiveId
         }
         return { sideConversations: next, sidePanel: nextPanel }
       })
@@ -493,12 +508,13 @@ export function createSideActions(ctx: SideContext): Pick<
       ctx.set((s) => {
         const next = { ...s.sideConversations }
         delete next[sideId]
+        const nextActiveId =
+          s.sidePanel.activeSideId === sideId && side
+            ? Object.values(next).find((candidate) => candidate.parentThreadId === side.parentThreadId)?.threadId ?? null
+            : s.sidePanel.activeSideId
         const nextPanel: SidePanelState = {
-          open: Object.keys(next).length > 0 ? s.sidePanel.open : false,
-          activeSideId:
-            s.sidePanel.activeSideId === sideId
-              ? Object.keys(next)[0] ?? null
-              : s.sidePanel.activeSideId
+          open: nextActiveId ? s.sidePanel.open : false,
+          activeSideId: nextActiveId
         }
         return { sideConversations: next, sidePanel: nextPanel }
       })
