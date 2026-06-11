@@ -1,5 +1,5 @@
 import type { ReactElement } from 'react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
 import {
   AlertCircle,
@@ -160,7 +160,7 @@ export function ClawAddImDialog({
     setAgentProfile((profile) => ({ ...profile, ...patch }))
   }
 
-  const clearInstallTimers = (): void => {
+  const clearInstallTimers = useCallback((): void => {
     if (installPollTimerRef.current) {
       window.clearInterval(installPollTimerRef.current)
       installPollTimerRef.current = null
@@ -169,12 +169,12 @@ export function ClawAddImDialog({
       window.clearInterval(installCountdownTimerRef.current)
       installCountdownTimerRef.current = null
     }
-  }
+  }, [])
 
-  const cancelInstallAttempt = (): void => {
+  const cancelInstallAttempt = useCallback((): void => {
     installAttemptRef.current += 1
     clearInstallTimers()
-  }
+  }, [clearInstallTimers])
 
   useEffect(() => {
     cancelInstallAttempt()
@@ -218,7 +218,7 @@ export function ClawAddImDialog({
       setPlatformCredential(undefined)
     }
     return cancelInstallAttempt
-  }, [existingChannel, provider])
+  }, [existingChannel, provider, cancelInstallAttempt])
 
   useEffect(() => {
     let cancelled = false

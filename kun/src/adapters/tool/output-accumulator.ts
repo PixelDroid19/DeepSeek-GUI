@@ -176,19 +176,36 @@ export class OutputAccumulator {
   }
 
   snapshot(options: { persistIfTruncated?: boolean } = {}): OutputAccumulatorSnapshot {
-    const tailTruncation = truncateTail(this.getSnapshotText(), {
+    const provisionalText = this.provisionalDecodedText()
+    let snapshotText = this.getSnapshotText()
+    let totalLines = this.totalLines
+    let totalDecodedBytes = this.totalDecodedBytes
+    if (provisionalText !== null) {
+      snapshotText = provisionalText
+      totalDecodedBytes = byteLength(provisionalText)
+      let newlines = 0
+      for (
+        let index = provisionalText.indexOf('\n');
+        index !== -1;
+        index = provisionalText.indexOf('\n', index + 1)
+      ) {
+        newlines += 1
+      }
+      totalLines = newlines + (provisionalText.length > 0 && !provisionalText.endsWith('\n') ? 1 : 0)
+    }
+    const tailTruncation = truncateTail(snapshotText, {
       maxLines: this.maxLines,
       maxBytes: this.maxBytes
     })
-    const truncated = this.totalLines > this.maxLines || this.totalDecodedBytes > this.maxBytes
+    const truncated = totalLines > this.maxLines || totalDecodedBytes > this.maxBytes
     const truncation: OutputAccumulatorTruncation = {
       ...tailTruncation,
       truncated,
       truncatedBy: truncated
-        ? (tailTruncation.truncatedBy ?? (this.totalDecodedBytes > this.maxBytes ? 'bytes' : 'lines'))
+        ? (tailTruncation.truncatedBy ?? (totalDecodedBytes > this.maxBytes ? 'bytes' : 'lines'))
         : null,
-      totalLines: this.totalLines,
-      totalBytes: this.totalDecodedBytes,
+      totalLines,
+      totalBytes: totalDecodedBytes,
       maxLines: this.maxLines,
       maxBytes: this.maxBytes
     }
@@ -279,6 +296,15 @@ export class OutputAccumulator {
     this.tailStartsAtLineBoundary = start === 0 ? this.tailStartsAtLineBoundary : buffer[start - 1] === 0x0a
     this.tailText = buffer.subarray(start).toString('utf8')
     this.tailBytes = byteLength(this.tailText)
+  }
+
+  // Output shorter than the encoding-sniff threshold has not been decoded yet
+  // (chooseOutputEncoding waits for more bytes). Decode a copy for snapshots so
+  // live sessions surface early output without committing the encoding choice.
+  private provisionalDecodedText(): string | null {
+    if (this.decoder || this.decodeBuffer.length === 0) return null
+    const encoding = chooseOutputEncoding(this.decodeBuffer, true) ?? 'utf-8'
+    return new TextDecoder(encoding).decode(stripKnownBom(this.decodeBuffer, encoding))
   }
 
   private getSnapshotText(): string {
