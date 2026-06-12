@@ -559,6 +559,9 @@ export function buildThreadEventSink(
           busy: true,
           currentTurnId: ev.turnId ?? s.currentTurnId,
           currentTurnUserId: ev.itemId,
+          ...(ev.turnId && ev.turnId !== s.currentTurnId
+            ? { pipelineStages: [], activeAgentState: null }
+            : {}),
           turnStartedAtByUserId: {
             ...s.turnStartedAtByUserId,
             [ev.itemId]: s.turnStartedAtByUserId[ev.itemId] ?? startedAt
@@ -1064,6 +1067,41 @@ export function buildThreadEventSink(
     onUsage: () => {
       if (!isCurrentStream()) return
       set((s) => ({ usageRefreshKey: s.usageRefreshKey + 1 }))
+    },
+    onAgentState: (state) => {
+      if (!isCurrentStream()) return
+      set((s) => {
+        if (!state.threadId || s.activeThreadId !== state.threadId) return {}
+        return { activeAgentState: state }
+      })
+    },
+    onPipelineStage: (stage) => {
+      if (!isCurrentStream()) return
+      set((s) => {
+        if (!stage.threadId || s.activeThreadId !== stage.threadId) return {}
+        // Update the LAST entry for the role (fix rounds repeat roles).
+        // A 'running' stage only replaces a still-running last entry;
+        // otherwise it starts a new round and appends.
+        const lastIndex = s.pipelineStages.reduce(
+          (found, entry, index) => (entry.role === stage.role ? index : found),
+          -1
+        )
+        const last = lastIndex >= 0 ? s.pipelineStages[lastIndex] : null
+        const replace = last !== null && (stage.status !== 'running' ? last.status === 'running' : false)
+        if (replace) {
+          const next = [...s.pipelineStages]
+          next[lastIndex] = stage
+          return { pipelineStages: next }
+        }
+        // Terminal status without a running entry (e.g. missed start
+        // event): replace the last terminal entry instead of duplicating.
+        if (last !== null && stage.status !== 'running' && last.status !== 'running') {
+          const next = [...s.pipelineStages]
+          next[lastIndex] = stage
+          return { pipelineStages: next }
+        }
+        return { pipelineStages: [...s.pipelineStages, stage] }
+      })
     }
   }
 }

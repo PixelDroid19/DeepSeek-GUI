@@ -17,8 +17,13 @@ import { ThreadService } from '../src/services/thread-service.js'
 import { TurnService } from '../src/services/turn-service.js'
 import { UsageService } from '../src/services/usage-service.js'
 import { RigorousPipeline } from '../src/orchestration/rigorous-pipeline.js'
+import { EvalSuiteStore } from '../src/evals/eval-suite-store.js'
+import { LocalToolHost } from '../src/adapters/tool/local-tool-host.js'
 
-function makeRuntime(childExecutor: ChildRunExecutor) {
+function makeRuntime(
+  childExecutor: ChildRunExecutor,
+  evals?: ConstructorParameters<typeof RigorousPipeline>[0]['evals']
+) {
   const eventBus = new InMemoryEventBus()
   const sessionStore = new InMemorySessionStore()
   const threadStore = new InMemoryThreadStore()
@@ -64,7 +69,8 @@ function makeRuntime(childExecutor: ChildRunExecutor) {
     childExecutor,
     roles: { enabled: true },
     defaultModel: 'thread-model',
-    nowIso
+    nowIso,
+    ...(evals ? { evals } : {})
   })
   return { eventBus, sessionStore, threadStore, threads, turns, approvalGate, usage, pipeline }
 }
@@ -495,6 +501,146 @@ describe('rigorous pipeline', () => {
       })
     ]))
     await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('runs the eval suite mechanically and reports results and tamper hashes', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-evals-'))
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-rigorous-evals-data-'))
+    const store = new EvalSuiteStore({ dir: join(dataDir, 'evals') })
+    await store.addCheck(workspace, {
+      name: 'smoke',
+      command: 'echo ok',
+      expect: { kind: 'contains', text: 'ok' },
+      addedAt: '2026-06-11T00:00:00.000Z',
+      source: 'user'
+    })
+    const evalToolHost = new LocalToolHost({
+      tools: [
+        LocalToolHost.defineTool({
+          name: 'bash',
+          toolKind: 'command_execution',
+          policy: 'auto',
+          inputSchema: { type: 'object', properties: {} },
+          description: 'fake bash',
+          execute: async () => ({ output: 'ok' })
+        })
+      ],
+      actionLevels: { enabled: false }
+    })
+    let verifierPromptSeen = ''
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'plan') {
+        return {
+          summary: 'plan', rawText: 'plan',
+          artifact: { intent: 'x', risks: [], steps: [], verificationCriteria: ['c'] }
+        }
+      }
+      if (input.artifactKind === 'execution') {
+        return {
+          summary: 'exec', rawText: 'exec',
+          artifact: { summary: 'done', filesChanged: [], deviationsFromPlan: [] }
+        }
+      }
+      if (input.artifactKind === 'verification') {
+        verifierPromptSeen = input.prompt
+        // Tamper with the suite during the turn.
+        await store.removeCheck(workspace, 'smoke').catch(() => undefined)
+        await store.addCheck(workspace, {
+          name: 'weakened',
+          command: 'echo ok',
+          expect: { kind: 'exit-zero' },
+          addedAt: '2026-06-11T00:01:00.000Z',
+          source: 'model'
+        })
+        return {
+          summary: 'verify', rawText: 'verify',
+          artifact: { findings: [], criteriaResults: [], commandsRun: [] }
+        }
+      }
+      return {
+        summary: 'verdict', rawText: 'verdict',
+        artifact: { verdict: 'ship', reasons: ['ok'] }
+      }
+    }
+    const runtime = makeRuntime(child, {
+      enabled: true,
+      store,
+      toolHost: evalToolHost,
+      approvalPolicy: 'auto'
+    })
+    const thread = await runtime.threads.create({
+      title: 'Rigorous evals', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: { prompt: 'do work', mode: 'rigorous' }
+    })
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+    expect(status).toBe('completed')
+    expect(verifierPromptSeen).toContain('Workspace eval suite')
+    expect(verifierPromptSeen).toContain('smoke')
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    const report = items.find(
+      (item) => item.kind === 'review' && 'roleName' in item && item.roleName === 'verifier'
+    )
+    expect(report?.kind).toBe('review')
+    const reviewText = report?.kind === 'review' ? report.reviewText ?? '' : ''
+    expect(reviewText).toContain('Eval suite (mechanical run): 1 passed, 0 failed')
+    expect(reviewText).toContain('PASS weakened')
+    expect(reviewText).toContain('SUITE CHANGED DURING TURN')
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dataDir, { recursive: true, force: true })
+  })
+
+  it('still reports tamper hashes when the suite is emptied during the turn', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-evals2-'))
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-rigorous-evals2-data-'))
+    const store = new EvalSuiteStore({ dir: join(dataDir, 'evals') })
+    await store.addCheck(workspace, {
+      name: 'smoke',
+      command: 'echo ok',
+      expect: { kind: 'exit-zero' },
+      addedAt: '2026-06-11T00:00:00.000Z',
+      source: 'user'
+    })
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'plan') {
+        return { summary: 'plan', rawText: 'plan', artifact: { intent: 'x', risks: [], steps: [], verificationCriteria: [] } }
+      }
+      if (input.artifactKind === 'execution') {
+        // Executor deletes the whole suite to dodge verification.
+        await store.removeCheck(workspace, 'smoke').catch(() => undefined)
+        return { summary: 'exec', rawText: 'exec', artifact: { summary: 'done', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return { summary: 'verify', rawText: 'verify', artifact: { findings: [], criteriaResults: [], commandsRun: [] } }
+      }
+      return { summary: 'verdict', rawText: 'verdict', artifact: { verdict: 'ship', reasons: ['ok'] } }
+    }
+    const runtime = makeRuntime(child, {
+      enabled: true,
+      store,
+      toolHost: new LocalToolHost({ tools: [], actionLevels: { enabled: false } }),
+      approvalPolicy: 'auto'
+    })
+    const thread = await runtime.threads.create({
+      title: 'Rigorous emptied evals', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: { prompt: 'do work', mode: 'rigorous' }
+    })
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+    expect(status).toBe('completed')
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    const report = items.find(
+      (item) => item.kind === 'review' && 'roleName' in item && item.roleName === 'verifier'
+    )
+    const reviewText = report?.kind === 'review' ? report.reviewText ?? '' : ''
+    expect(reviewText).toContain('Eval suite (mechanical run): 0 passed, 0 failed')
+    expect(reviewText).toContain('SUITE CHANGED DURING TURN')
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dataDir, { recursive: true, force: true })
   })
 
   it('bridges child approvals onto the parent turn', async () => {

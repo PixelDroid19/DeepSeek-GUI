@@ -153,6 +153,8 @@ export function clearedThreadSelection(): Pick<
   | 'activeThreadId'
   | 'activeThreadGoal'
   | 'activeThreadTodos'
+  | 'activeAgentState'
+  | 'pipelineStages'
   | 'blocks'
   | 'lastSeq'
   | 'liveReasoning'
@@ -171,6 +173,8 @@ export function clearedThreadSelection(): Pick<
     activeThreadId: null,
     activeThreadGoal: null,
     activeThreadTodos: null,
+    activeAgentState: null,
+    pipelineStages: [],
     blocks: [],
     lastSeq: 0,
     liveReasoning: '',

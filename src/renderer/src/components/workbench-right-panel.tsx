@@ -34,6 +34,9 @@ const PlanPanel = lazy(() =>
 const TodoPanel = lazy(() =>
   import('./todo/TodoPanel').then((module) => ({ default: module.TodoPanel }))
 )
+const AgentStatePanel = lazy(() =>
+  import('./agent-state/AgentStatePanel').then((module) => ({ default: module.AgentStatePanel }))
+)
 
 export type WorkbenchRightPanelContent =
   | 'write-assistant'
@@ -42,6 +45,7 @@ export type WorkbenchRightPanelContent =
   | 'todo'
   | 'browser'
   | 'plan'
+  | 'agent-state'
   | 'file-preview'
 
 export function resolveWorkbenchRightPanelContent({
@@ -62,6 +66,7 @@ export function resolveWorkbenchRightPanelContent({
   if (rightPanelMode === 'todo') return 'todo'
   if (rightPanelMode === 'browser') return 'browser'
   if (rightPanelMode === 'plan') return 'plan'
+  if (rightPanelMode === 'agent-state') return 'agent-state'
   return 'file-preview'
 }
 
@@ -241,6 +246,11 @@ export function WorkbenchRightPanel({
           blocks={devPreviewBlocks}
           preferredUrl={latestDevPreviewUrl}
           className="h-full max-h-full w-full flex-col"
+          onCollapse={onCollapse}
+        />
+      ) : content === 'agent-state' ? (
+        <AgentStatePanel
+          className="h-full max-h-full w-full"
           onCollapse={onCollapse}
         />
       ) : content === 'plan' ? (

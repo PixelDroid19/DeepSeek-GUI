@@ -31,7 +31,9 @@ import type { TokenEconomyConfig } from '../loop/token-economy.js'
 import {
   DEFAULT_ACTION_LEVELS_CONFIG,
   DEFAULT_CONTEXT_ENGINE_CONFIG,
+  DEFAULT_EVALS_CONFIG,
   DEFAULT_MEMORY_CONFIG,
+  type EvalsConfig,
   DEFAULT_ROLES_CONFIG,
   DEFAULT_TELEMETRY_CONFIG,
   type ActionLevelsConfig,
@@ -76,6 +78,8 @@ import { FileMemoryStore } from '../memory/memory-store.js'
 import { DelegationRuntime, FileDelegationStore } from '../delegation/delegation-runtime.js'
 import { createChildAgentExecutor } from '../delegation/child-agent-executor.js'
 import { RigorousPipeline } from '../orchestration/rigorous-pipeline.js'
+import { EvalSuiteStore } from '../evals/eval-suite-store.js'
+import { buildEvalToolProviders } from '../evals/eval-tool-provider.js'
 
 export type KunServeRuntimeOptions = {
   host: string
@@ -99,6 +103,7 @@ export type KunServeRuntimeOptions = {
   memory?: MemoryConfig
   actionLevels?: ActionLevelsConfig
   roles?: RolesConfig
+  evals?: EvalsConfig
   runtime?: RuntimeTuningConfig
   storage?: StorageConfig
   capabilities?: KunCapabilitiesConfig
@@ -204,6 +209,11 @@ export async function createKunServeRuntime(
     : undefined
   const actionLevelsConfig = { ...DEFAULT_ACTION_LEVELS_CONFIG, ...(options.actionLevels ?? {}) }
   const memoryConfig = { ...DEFAULT_MEMORY_CONFIG, ...(options.memory ?? {}) }
+  const evalsConfig = { ...DEFAULT_EVALS_CONFIG, ...(options.evals ?? {}) }
+  const evalSuiteStore = new EvalSuiteStore({
+    dir: join(options.dataDir, 'evals'),
+    onWarning: (message) => console.warn(`[kun] ${message}`)
+  })
   const workspaceAllowlist = new WorkspaceAllowlistStore({
     dir: join(options.dataDir, 'allowlist'),
     nowIso,
@@ -219,7 +229,8 @@ export async function createKunServeRuntime(
     },
     ...mcpProviders.providers,
     ...webProviders.providers,
-    ...buildMemoryToolProviders(memoryStore)
+    ...buildMemoryToolProviders(memoryStore),
+    ...buildEvalToolProviders({ store: evalSuiteStore, enabled: evalsConfig.enabled, nowIso })
   ]
   const childRegistry = new CapabilityRegistry(baseToolProviders)
   const childToolHost = new LocalToolHost({
@@ -372,7 +383,13 @@ export async function createKunServeRuntime(
     childExecutor: childAgentExecutor,
     roles: rolesConfig,
     defaultModel: options.model,
-    nowIso
+    nowIso,
+    evals: {
+      enabled: evalsConfig.enabled,
+      store: evalSuiteStore,
+      toolHost,
+      approvalPolicy: options.approvalPolicy
+    }
   })
   const startedAt = options.startedAt ?? nowIso()
   return {

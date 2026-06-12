@@ -171,16 +171,24 @@ export const DEFAULT_TELEMETRY_CONFIG: TelemetryConfig = {
   keepFiles: 3
 }
 
+export const ContextEnginePlaybookConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true)
+  })
+  .strict()
+
 export const ContextEngineConfigSchema = z
   .object({
     enabled: z.boolean().default(true),
-    injectionTokenBudget: PositiveInt.default(2000)
+    injectionTokenBudget: PositiveInt.default(2000),
+    playbook: ContextEnginePlaybookConfigSchema.default({ enabled: true })
   })
   .strict()
 
 export const DEFAULT_CONTEXT_ENGINE_CONFIG: ContextEngineConfig = {
   enabled: true,
-  injectionTokenBudget: 2000
+  injectionTokenBudget: 2000,
+  playbook: { enabled: true }
 }
 
 export const MemoryConfigSchema = z
@@ -200,6 +208,16 @@ export const ActionLevelsConfigSchema = z
   .strict()
 
 export const DEFAULT_ACTION_LEVELS_CONFIG: ActionLevelsConfig = {
+  enabled: true
+}
+
+export const EvalsConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true)
+  })
+  .strict()
+
+export const DEFAULT_EVALS_CONFIG: EvalsConfig = {
   enabled: true
 }
 
@@ -270,6 +288,7 @@ export const KunConfigSchema = z
     memory: MemoryConfigSchema.optional(),
     actionLevels: ActionLevelsConfigSchema.optional(),
     roles: RolesConfigSchema.optional(),
+    evals: EvalsConfigSchema.optional(),
     capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG)
   })
   .strict()
@@ -285,6 +304,7 @@ export type TelemetryConfig = z.infer<typeof TelemetryConfigSchema>
 export type ContextEngineConfig = z.infer<typeof ContextEngineConfigSchema>
 export type MemoryConfig = z.infer<typeof MemoryConfigSchema>
 export type ActionLevelsConfig = z.infer<typeof ActionLevelsConfigSchema>
+export type EvalsConfig = z.infer<typeof EvalsConfigSchema>
 export type RoleOverrideConfig = z.infer<typeof RoleOverrideConfigSchema>
 export type RolesConfig = z.infer<typeof RolesConfigSchema>
 export type RoleConfigKey = z.infer<typeof RoleIdSchema>

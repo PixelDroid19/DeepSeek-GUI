@@ -93,9 +93,9 @@ describe('kun defaults', () => {
     expect(defaultKunRuntimeSettings().approvalPolicy).toBe('auto')
   })
 
-  it('defaults sandbox mode to full access', () => {
+  it('defaults sandbox mode to workspace-write', () => {
     expect(defaultKunRuntimeSettings().sandboxMode).toBe(DEFAULT_SANDBOX_MODE)
-    expect(defaultKunRuntimeSettings().sandboxMode).toBe('danger-full-access')
+    expect(defaultKunRuntimeSettings().sandboxMode).toBe('workspace-write')
   })
 
   it('defaults token economy mode to off', () => {

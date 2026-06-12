@@ -128,6 +128,56 @@ describe('Kun agent CLI commands', () => {
     await rm(dataDir, { recursive: true, force: true })
   })
 
+  it('runs the workspace eval suite via kun eval and exits non-zero on failure', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-cli-eval-ws-'))
+    const { EvalSuiteStore } = await import('../src/evals/eval-suite-store.js')
+    const store = new EvalSuiteStore({ dir: join(dataDir, 'evals') })
+    await store.addCheck(workspace, {
+      name: 'passes', command: 'ok-command', expect: { kind: 'exit-zero' },
+      addedAt: 'now', source: 'user'
+    })
+    await store.addCheck(workspace, {
+      name: 'fails', command: 'bad-command', expect: { kind: 'contains', text: 'absent' },
+      addedAt: 'now', source: 'user'
+    })
+    const toolHost = new LocalToolHost({
+      tools: [
+        LocalToolHost.defineTool({
+          name: 'bash',
+          toolKind: 'command_execution',
+          policy: 'auto',
+          inputSchema: { type: 'object', properties: {} },
+          description: 'fake bash',
+          execute: async (args) => ({ output: String(args.command) })
+        })
+      ],
+      actionLevels: { enabled: false }
+    })
+    const c = capture({ createRuntime: fakeRuntime({ toolHost }), cwd: () => workspace })
+    const code = await runAgentCommand('eval', ['--data-dir', dataDir, '--workspace', workspace, '--json'], c.io)
+    expect(code).toBe(ServeExitCode.runtime)
+    const parsed = JSON.parse(c.stdout) as { passed: number; failed: number; results: Array<{ name: string; pass: boolean }> }
+    expect(parsed.passed).toBe(1)
+    expect(parsed.failed).toBe(1)
+    expect(parsed.results.find((r) => r.name === 'fails')?.pass).toBe(false)
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('reports empty suites and respects evals.enabled=false in kun eval', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-cli-eval-ws-'))
+    const empty = capture({ createRuntime: fakeRuntime({}), cwd: () => workspace })
+    const okCode = await runAgentCommand('eval', ['--data-dir', dataDir, '--workspace', workspace], empty.io)
+    expect(okCode).toBe(ServeExitCode.ok)
+    expect(empty.stdout).toContain('No eval checks')
+
+    await writeFile(join(dataDir, 'config.json'), JSON.stringify({ evals: { enabled: false } }))
+    const disabled = capture({ createRuntime: fakeRuntime({}), cwd: () => workspace })
+    const disabledCode = await runAgentCommand('eval', ['--data-dir', dataDir, '--workspace', workspace], disabled.io)
+    expect(disabledCode).toBe(ServeExitCode.config)
+    expect(disabled.stderr).toContain('disabled')
+    await rm(workspace, { recursive: true, force: true })
+  })
+
   it('splits explicit commands and keeps legacy serve flags compatible', () => {
     expect(splitKunCliCommand(['run', 'hello'])).toEqual({ command: 'run', args: ['hello'] })
     expect(splitKunCliCommand(['--port', '9999'])).toEqual({

@@ -8,6 +8,9 @@ import {
 } from '../loop/model-context-profile.js'
 import type { ToolHostContext } from '../ports/tool-host.js'
 import { createKunServeRuntime } from '../server/runtime-factory.js'
+import { join } from 'node:path'
+import { EvalSuiteStore } from '../evals/eval-suite-store.js'
+import { runEvalSuite } from '../evals/eval-runner.js'
 import type { ServerRuntime } from '../server/routes/server-runtime.js'
 import {
   parseServeOptionsSafe,
@@ -35,6 +38,7 @@ Commands:
   run [options] <prompt>     Run one agent turn without the GUI
   chat [options]             Start a line-oriented terminal chat
   exec [options] <tool>      List or invoke tools directly
+  eval [options]             Run the workspace eval suite (--json; non-zero exit on failure)
 
 Common options:
   --config <path>            JSON config file
@@ -74,7 +78,7 @@ const VALUE_FLAGS = new Set([
   'title'
 ])
 
-export type KunCliCommand = 'serve' | 'run' | 'chat' | 'exec' | 'help'
+export type KunCliCommand = 'serve' | 'run' | 'chat' | 'exec' | 'eval' | 'help'
 
 export function splitKunCliCommand(argv: readonly string[]): {
   command: KunCliCommand
@@ -85,7 +89,7 @@ export function splitKunCliCommand(argv: readonly string[]): {
   if (!first || first === '--help' || first === '-h' || first === 'help') {
     return { command: 'help', args: [] }
   }
-  if (first === 'serve' || first === 'run' || first === 'chat' || first === 'exec') {
+  if (first === 'serve' || first === 'run' || first === 'chat' || first === 'exec' || first === 'eval') {
     return { command: first, args: [...argv.slice(1)] }
   }
   if (first.startsWith('--')) {
@@ -106,6 +110,8 @@ export async function runAgentCommand(
       return runChat(argv, io)
     case 'exec':
       return runExec(argv, io)
+    case 'eval':
+      return runEval(argv, io)
   }
 }
 
@@ -307,6 +313,53 @@ async function runExec(argv: readonly string[], io: CliIo): Promise<number> {
     return ServeExitCode.runtime
   } finally {
     await shutdownRuntime(runtime, io, 'kun exec')
+  }
+}
+
+async function runEval(argv: readonly string[], io: CliIo): Promise<number> {
+  const parsed = parseSharedOptions(argv, io)
+  if (!parsed.ok) return writeParseError(parsed, io, 'kun eval')
+  let runtime: ServerRuntime | undefined
+  try {
+    runtime = await createRuntime(parsed.options, io)
+  } catch (error) {
+    io.stderr.write(`kun eval: ${errorMessage(error)}\n`)
+    return ServeExitCode.runtime
+  }
+  try {
+    if (parsed.options.evals?.enabled === false) {
+      io.stderr.write('kun eval: evals are disabled by config (evals.enabled=false)\n')
+      return ServeExitCode.config
+    }
+    const store = new EvalSuiteStore({
+      dir: join(parsed.options.dataDir, 'evals'),
+      onWarning: (message) => io.stderr.write(`kun eval: ${message}\n`)
+    })
+    const suite = await store.load(parsed.workspace)
+    if (!suite.checks.length) {
+      io.stdout.write(parsed.json ? '{"results":[],"passed":0,"failed":0}\n' : 'No eval checks defined for this workspace.\n')
+      return ServeExitCode.ok
+    }
+    const host = runtime.toolHost ?? new LocalToolHost({ tools: buildDefaultLocalTools() })
+    const context = buildExecContext(parsed.options, parsed.workspace, {
+      allowRiskyActions: hasFlag(argv, 'allow-risky-actions')
+    })
+    const outcome = await runEvalSuite(suite, host, context)
+    if (parsed.json) {
+      io.stdout.write(`${JSON.stringify(outcome)}\n`)
+    } else {
+      for (const result of outcome.results) {
+        io.stdout.write(`${result.pass ? 'PASS' : 'FAIL'} ${result.name} (${result.expectation}): ${result.command}\n`)
+        if (!result.pass && result.output) io.stdout.write(`  ${result.output.slice(0, 200)}\n`)
+      }
+      io.stdout.write(`${outcome.passed} passed, ${outcome.failed} failed\n`)
+    }
+    return outcome.failed > 0 ? ServeExitCode.runtime : ServeExitCode.ok
+  } catch (error) {
+    io.stderr.write(`kun eval: ${errorMessage(error)}\n`)
+    return ServeExitCode.runtime
+  } finally {
+    await shutdownRuntime(runtime, io, 'kun eval')
   }
 }
 

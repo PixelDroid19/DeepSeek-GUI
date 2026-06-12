@@ -528,6 +528,16 @@ export type CoreRuntimeEventJson = {
   code?: string
   severity?: 'info' | 'warning' | 'error'
   child?: CoreChildRuntimeMetadataJson
+  // agent_state / pipeline_stage_* (Phase 4)
+  role?: string
+  model?: string
+  reasoningEffort?: string
+  promptTokensEstimated?: number
+  compactionSoftThreshold?: number
+  contextPressure?: number
+  injection?: { included?: string[]; droppedByBudget?: string[] }
+  memories?: { factIds?: string[]; hypothesisIds?: string[] }
+  artifactSummary?: string
 }
 
 export type RuntimeErrorJson = {

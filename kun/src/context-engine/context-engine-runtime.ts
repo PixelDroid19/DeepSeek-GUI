@@ -13,7 +13,8 @@ import type {
   ToolExecutionObservation,
   ToolExecutionObserver
 } from '../telemetry/telemetry-tool-host.js'
-import { renderWorkspaceStateBlock } from './context-budgeter.js'
+import { renderWorkspaceState, type WorkspaceStateBlockResult } from './context-budgeter.js'
+import { PlaybookCache, emptyPlaybook, type Playbook } from './playbook.js'
 import { WorkspaceLedgerStore, workspaceHash } from './workspace-ledger.js'
 import { redactSensitiveText } from '../telemetry/target-normalization.js'
 import type { MemoryStore } from '../memory/memory-store.js'
@@ -56,6 +57,7 @@ export class ContextEngineRuntime implements ToolExecutionObserver {
   private readonly gitBaselines = new Map<string, string>()
   private readonly pendingLedgerApplies = new Set<Promise<unknown>>()
   private readonly staleness?: MemoryStalenessMonitor
+  private readonly playbooks = new PlaybookCache()
 
   constructor(opts: ContextEngineRuntimeOptions) {
     this.opts = opts
@@ -158,15 +160,34 @@ export class ContextEngineRuntime implements ToolExecutionObserver {
 
   /** Renders the workspace-state injection block, or null when disabled/empty. */
   async renderInjection(workspace: string): Promise<string | null> {
+    return (await this.renderInjectionDetailed(workspace))?.block ?? null
+  }
+
+  /** Renders the injection block plus included/dropped section names. */
+  async renderInjectionDetailed(workspace: string): Promise<WorkspaceStateBlockResult | null> {
     try {
       if (!hasWorkspace(workspace)) return null
       if (!this.opts.contextEngine.enabled) return null
       const ledger = await this.ledgerFor(workspace).load()
-      return await renderWorkspaceStateBlock(ledger, {
-        tokenBudget: this.opts.contextEngine.injectionTokenBudget
+      return await renderWorkspaceState(ledger, {
+        tokenBudget: this.opts.contextEngine.injectionTokenBudget,
+        playbook: await this.playbookFor(workspace)
       })
     } catch {
       return null
+    }
+  }
+
+  private async playbookFor(workspace: string): Promise<Playbook> {
+    try {
+      if (this.opts.contextEngine.playbook?.enabled === false) return emptyPlaybook()
+      if (!this.opts.telemetry.enabled) return emptyPlaybook()
+      const dir = this.opts.telemetry.dir ?? join(this.opts.dataDir, 'telemetry')
+      // Ensure queued telemetry writes are visible before reading.
+      await this.writers.get(workspace)?.flush()
+      return await this.playbooks.playbookFor(telemetryFilePath(dir, workspaceHash(workspace)))
+    } catch {
+      return emptyPlaybook()
     }
   }
 

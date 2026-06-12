@@ -41,6 +41,7 @@ export const RuntimeEventKind = z.enum([
   'pipeline_stage',
   'pipeline_stage_started',
   'pipeline_stage_finished',
+  'agent_state',
   'usage',
   'error',
   'heartbeat'
@@ -239,6 +240,29 @@ export const RolePipelineStageFinishedEvent = RuntimeEventBase.extend({
 })
 export type RolePipelineStageFinishedEvent = z.infer<typeof RolePipelineStageFinishedEvent>
 
+export const AgentStateEvent = RuntimeEventBase.extend({
+  kind: z.literal('agent_state'),
+  model: z.string().min(1),
+  reasoningEffort: z.string().optional(),
+  promptTokensEstimated: z.number().int().nonnegative(),
+  compactionSoftThreshold: z.number().int().positive(),
+  /** promptTokensEstimated / compactionSoftThreshold, clamped to [0, 1]. */
+  contextPressure: z.number().min(0).max(1),
+  injection: z
+    .object({
+      included: z.array(z.string()),
+      droppedByBudget: z.array(z.string())
+    })
+    .optional(),
+  memories: z
+    .object({
+      factIds: z.array(z.string()),
+      hypothesisIds: z.array(z.string())
+    })
+    .optional()
+})
+export type AgentStateEvent = z.infer<typeof AgentStateEvent>
+
 export const ErrorEvent = RuntimeEventBase.extend({
   kind: z.literal('error'),
   message: z.string(),
@@ -269,6 +293,7 @@ export const RuntimeEvent = z.discriminatedUnion('kind', [
   PipelineStageEvent,
   RolePipelineStageStartedEvent,
   RolePipelineStageFinishedEvent,
+  AgentStateEvent,
   UsageEvent,
   ErrorEvent,
   HeartbeatEvent

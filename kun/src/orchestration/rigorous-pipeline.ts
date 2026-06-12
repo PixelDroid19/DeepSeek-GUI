@@ -10,6 +10,10 @@ import type { TurnService } from '../services/turn-service.js'
 import type { UsageService } from '../services/usage-service.js'
 import type { UsageSnapshot } from '../contracts/usage.js'
 import type { RolesConfig } from '../config/kun-config.js'
+import type { ToolHost, ToolHostContext } from '../ports/tool-host.js'
+import type { EvalSuite } from '../contracts/evals.js'
+import { EvalSuiteStore, evalSuiteHash } from '../evals/eval-suite-store.js'
+import { runEvalSuite, type EvalRunOutcome } from '../evals/eval-runner.js'
 import {
   ExecutionArtifactSchema,
   PlannerArtifactSchema,
@@ -40,6 +44,13 @@ export type RigorousPipelineDeps = {
   roles: RolesConfig
   defaultModel: string
   nowIso: () => string
+  /** Optional workspace eval integration: suite store + the tool host used to run checks. */
+  evals?: {
+    enabled: boolean
+    store: EvalSuiteStore
+    toolHost: ToolHost
+    approvalPolicy: ToolHostContext['approvalPolicy']
+  }
 }
 
 export class RigorousPipeline {
@@ -89,6 +100,9 @@ export class RigorousPipeline {
         plan = PlannerArtifactSchema.parse(planned.artifact)
       }
 
+      // Snapshot the eval suite BEFORE any role can mutate it, so the
+      // before/after hash exposes tampering by executor or verifier.
+      const suiteBefore = await this.loadEvalSuite(workspace)
       const firstExecution = await this.runExecutor({
         threadId,
         turnId,
@@ -112,13 +126,15 @@ export class RigorousPipeline {
         plan,
         execution: firstExecution.artifact,
         diff: firstDiff,
+        evalSuite: suiteBefore?.suite,
         signal
       })
       if (firstVerification.status === 'aborted') {
         await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
         return 'aborted'
       }
-      await this.persistVerification(threadId, turnId, firstVerification.artifact, firstVerification.rawText)
+      const firstEvalRun = await this.runEvalsMechanically(threadId, turnId, workspace, suiteBefore, signal)
+      await this.persistVerification(threadId, turnId, firstVerification.artifact, firstVerification.rawText, 'initial', firstEvalRun)
       let review = await this.runReviewer({
         threadId,
         turnId,
@@ -160,13 +176,15 @@ export class RigorousPipeline {
           plan,
           execution: fixedExecution.artifact,
           diff: finalDiff,
+          evalSuite: suiteBefore?.suite,
           signal
         })
         if (finalVerification.status === 'aborted') {
           await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
           return 'aborted'
         }
-        await this.persistVerification(threadId, turnId, finalVerification.artifact, finalVerification.rawText, 'final')
+        const finalEvalRun = await this.runEvalsMechanically(threadId, turnId, workspace, suiteBefore, signal)
+        await this.persistVerification(threadId, turnId, finalVerification.artifact, finalVerification.rawText, 'final', finalEvalRun)
         review = await this.runReviewer({
           threadId,
           turnId,
@@ -244,12 +262,13 @@ export class RigorousPipeline {
     plan: PlannerArtifact
     execution: ExecutionArtifact
     diff: string
+    evalSuite?: EvalSuite
     signal: AbortSignal
   }): Promise<{ status: 'completed' | 'aborted'; artifact: VerificationArtifact; rawText: string }> {
     const result = await this.runRole({
       role: 'verifier',
       kind: 'verification',
-      prompt: verifierPrompt(input.request, input.plan, input.execution.filesChanged, input.diff),
+      prompt: verifierPrompt(input.request, input.plan, input.execution.filesChanged, input.diff, input.evalSuite),
       threadModel: input.threadModel,
       threadId: input.threadId,
       turnId: input.turnId,
@@ -427,12 +446,67 @@ export class RigorousPipeline {
     })
   }
 
+  private async loadEvalSuite(
+    workspace: string
+  ): Promise<{ suite: EvalSuite; hash: string } | null> {
+    if (!this.deps.evals?.enabled) return null
+    try {
+      const suite = await this.deps.evals.store.load(workspace)
+      return { suite, hash: evalSuiteHash(suite) }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Mechanical eval pass: ground truth independent of the verifier's
+   * narrative. Re-loads the suite to expose tampering during the turn
+   * (hash before vs after).
+   */
+  private async runEvalsMechanically(
+    threadId: string,
+    turnId: string,
+    workspace: string,
+    suiteBefore: { suite: EvalSuite; hash: string } | null,
+    signal: AbortSignal
+  ): Promise<{ outcome: EvalRunOutcome; hashBefore: string; hashAfter: string } | null> {
+    const evals = this.deps.evals
+    if (!evals?.enabled || !suiteBefore) return null
+    try {
+      const current = await evals.store.load(workspace)
+      // Only skip when there was nothing to run before AND after the
+      // turn. A suite emptied mid-turn must still surface its tamper
+      // hashes rather than silently vanish.
+      if (!current.checks.length && !suiteBefore.suite.checks.length) return null
+      const context: ToolHostContext = {
+        threadId,
+        turnId,
+        workspace,
+        threadMode: 'agent',
+        approvalPolicy: evals.approvalPolicy,
+        abortSignal: signal,
+        awaitApproval: (approval) => this.approvalBridge(threadId, turnId, 'verifier')(approval)
+          .then((resolution) => (typeof resolution === 'string' ? resolution : resolution.decision))
+      }
+      const outcome = await runEvalSuite(current, evals.toolHost, context)
+      return { outcome, hashBefore: suiteBefore.hash, hashAfter: evalSuiteHash(current) }
+    } catch (error) {
+      await this.recordWarning(
+        threadId,
+        turnId,
+        `Eval suite run failed: ${error instanceof Error ? error.message : String(error)}`
+      )
+      return null
+    }
+  }
+
   private async persistVerification(
     threadId: string,
     turnId: string,
     artifact: VerificationArtifact,
     rawText: string,
-    suffix = 'initial'
+    suffix = 'initial',
+    evalRun?: { outcome: EvalRunOutcome; hashBefore: string; hashAfter: string } | null
   ): Promise<void> {
     await this.deps.turns.applyItem(threadId, makeReviewItem({
       id: `item_${turnId}_verification_${suffix}`,
@@ -442,7 +516,10 @@ export class RigorousPipeline {
       target: { kind: 'custom', instructions: 'rigorous verifier report' },
       title: suffix === 'final' ? 'Rigorous verifier report (final)' : 'Rigorous verifier report',
       status: 'completed',
-      reviewText: renderVerificationReport(artifact, rawText),
+      reviewText: [
+        renderVerificationReport(artifact, rawText),
+        ...(evalRun ? ['', renderEvalRun(evalRun)] : [])
+      ].join('\n'),
       finishedAt: this.deps.nowIso()
     }))
   }
@@ -529,9 +606,17 @@ export function verifierPrompt(
   request: string,
   plan: PlannerArtifact,
   filesChanged: readonly string[],
-  diff: string
+  diff: string,
+  evalSuite?: EvalSuite
 ): string {
   return [
+    ...(evalSuite?.checks.length
+      ? [
+          'Workspace eval suite (run these checks and account for them):',
+          JSON.stringify(evalSuite.checks.map(({ name, command, expect }) => ({ name, command, expect })), null, 2),
+          ''
+        ]
+      : []),
     'User request:',
     request,
     '',
@@ -615,6 +700,18 @@ function renderVerificationReport(artifact: VerificationArtifact, rawText: strin
   }
   if (rawText.trim()) lines.push('', 'Raw verifier text:', rawText.trim())
   return lines.join('\n').trim()
+}
+
+function renderEvalRun(evalRun: { outcome: EvalRunOutcome; hashBefore: string; hashAfter: string }): string {
+  const lines = [
+    `Eval suite (mechanical run): ${evalRun.outcome.passed} passed, ${evalRun.outcome.failed} failed`,
+    `Suite hash before/after turn: ${evalRun.hashBefore} / ${evalRun.hashAfter}${evalRun.hashBefore !== evalRun.hashAfter ? ' (SUITE CHANGED DURING TURN)' : ''}`
+  ]
+  for (const result of evalRun.outcome.results) {
+    lines.push(`- ${result.pass ? 'PASS' : 'FAIL'} ${result.name} (${result.expectation}): \`${result.command}\``)
+    if (!result.pass && result.output) lines.push(`  output: ${result.output.slice(0, 200)}`)
+  }
+  return lines.join('\n')
 }
 
 function renderVerdict(artifact: VerdictArtifact): string {

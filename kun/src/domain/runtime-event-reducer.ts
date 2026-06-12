@@ -149,6 +149,7 @@ export function applyRuntimeEvent(
     case 'pipeline_stage':
     case 'pipeline_stage_started':
     case 'pipeline_stage_finished':
+    case 'agent_state':
     case 'heartbeat':
     case 'goal_updated':
     case 'goal_cleared':

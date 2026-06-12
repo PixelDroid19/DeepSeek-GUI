@@ -9,6 +9,7 @@ import {
   ActionLevelsConfigSchema,
   ContextCompactionConfigSchema,
   ContextEngineConfigSchema,
+  EvalsConfigSchema,
   MemoryConfigSchema,
   DEFAULT_ROLES_CONFIG,
   TelemetryConfigSchema,
@@ -64,6 +65,7 @@ export const ServeOptionsSchema = z.object({
   memory: MemoryConfigSchema.optional(),
   actionLevels: ActionLevelsConfigSchema.optional(),
   roles: RolesConfigSchema.optional(),
+  evals: EvalsConfigSchema.optional(),
   runtime: RuntimeTuningConfigSchema.optional(),
   capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG)
 })

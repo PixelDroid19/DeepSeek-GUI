@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { EditorInfo } from '@shared/editor'
 import type { GuiUpdateState } from '@shared/gui-update'
 import {
+  Activity,
   ArrowUpCircle,
   Check,
   ChevronDown,
@@ -22,7 +23,7 @@ import {
 import { useTranslation } from 'react-i18next'
 import { readPreferredEditorId, writePreferredEditorId } from '../../lib/editor-preferences'
 
-export type RightPanelMode = 'todo' | 'changes' | 'browser' | 'file' | 'plan' | 'sdd-ai' | null
+export type RightPanelMode = 'todo' | 'changes' | 'browser' | 'file' | 'plan' | 'sdd-ai' | 'agent-state' | null
 
 type Props = {
   rightPanelMode: RightPanelMode
@@ -57,7 +58,8 @@ export function WorkbenchTopBar({
     { mode: 'todo' as const, label: t('rightPanelTodo'), icon: ListTodo },
     ...(planPanelEnabled ? [{ mode: 'plan' as const, label: t('rightPanelPlan'), icon: ClipboardList }] : []),
     { mode: 'changes' as const, label: t('rightPanelChanges'), icon: FileEdit },
-    { mode: 'browser' as const, label: t('rightPanelBrowser'), icon: Globe2 }
+    { mode: 'browser' as const, label: t('rightPanelBrowser'), icon: Globe2 },
+    { mode: 'agent-state' as const, label: t('rightPanelAgentState', 'Agent State'), icon: Activity }
   ]
   const selectedEditor = useMemo(
     () => editors.find((editor) => editor.id === selectedEditorId) ?? editors[0],

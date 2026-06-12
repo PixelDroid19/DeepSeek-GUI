@@ -361,6 +361,30 @@ export type ThreadUsageSnapshot = {
   turns: number
 }
 
+/** Per-model-step working state of the agent (mirrors kun's agent_state event). */
+export type AgentStatePayload = {
+  threadId: string
+  model: string
+  reasoningEffort?: string
+  promptTokensEstimated: number
+  compactionSoftThreshold: number
+  /** promptTokensEstimated / compactionSoftThreshold, clamped to [0, 1]. */
+  contextPressure: number
+  injection?: { included: string[]; droppedByBudget: string[] }
+  memories?: { factIds: string[]; hypothesisIds: string[] }
+  createdAt?: string
+}
+
+/** Rigorous pipeline stage progress (mirrors kun's pipeline_stage_* events). */
+export type PipelineStageInfo = {
+  threadId: string
+  role: string
+  status: 'running' | 'completed' | 'failed' | 'aborted' | 'degraded' | 'skipped'
+  model?: string
+  artifactSummary?: string
+  createdAt?: string
+}
+
 export type ThreadEventSink = {
   onSeq(seq: number): void
   onDeltas(deltas: ThreadDeltaEvent[]): void
@@ -379,6 +403,10 @@ export type ThreadEventSink = {
   onError(err: Error): void
   /** Optional: cumulative usage update for the thread. */
   onUsage?(usage: ThreadUsageSnapshot): void
+  /** Optional: per-model-step agent working state. */
+  onAgentState?(state: AgentStatePayload): void
+  /** Optional: rigorous pipeline stage progress. */
+  onPipelineStage?(stage: PipelineStageInfo): void
 }
 
 export interface AgentProvider {

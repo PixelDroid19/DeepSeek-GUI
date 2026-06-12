@@ -57,7 +57,7 @@ function makeEngine(dataDir: string, enabled: boolean): ContextEngineRuntime {
   return new ContextEngineRuntime({
     dataDir,
     telemetry: { enabled: true, rotateBytes: 10 * 1024 * 1024, keepFiles: 3 },
-    contextEngine: { enabled, injectionTokenBudget: 2000 }
+    contextEngine: { enabled, injectionTokenBudget: 2000, playbook: { enabled: true } }
   })
 }
 
@@ -130,6 +130,45 @@ describe('context engine loop integration', () => {
     // onTurnStart registered stats and git observation; the ledger file exists.
     const ledgerText = readFileSync(ledgerFilePath(join(dataDir, 'ledger'), workspace), 'utf8')
     expect(JSON.parse(ledgerText).version).toBe(1)
+  })
+
+  it('emits an agent_state event per model step with pressure and injection summary', async () => {
+    const workspace = tempDir()
+    const dataDir = tempDir()
+    const engine = makeEngine(dataDir, true)
+    mkdirSync(join(workspace, 'src'), { recursive: true })
+    writeFileSync(join(workspace, 'src', 'a.ts'), 'export {}')
+    engine.onToolExecution({
+      record: {
+        type: 'tool-execution', tool: 'read', target: 'src/a.ts',
+        threadId: 'thr_1', turnId: 'seed', startedAt: '2026-06-11T00:00:00.000Z',
+        durationMs: 1, isError: false
+      },
+      workspace
+    })
+    await engine.flush()
+    const h = makeHarness(capturingModel([]), { contextEngine: engine })
+    await bootstrapThread(h, { workspace })
+    await h.loop.runTurn(h.threadId, h.turnId)
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    const agentState = events.find((event) => event.kind === 'agent_state')
+    expect(agentState).toBeDefined()
+    if (agentState?.kind !== 'agent_state') throw new Error('unreachable')
+    expect(agentState.promptTokensEstimated).toBeGreaterThan(0)
+    expect(agentState.contextPressure).toBeGreaterThanOrEqual(0)
+    expect(agentState.contextPressure).toBeLessThanOrEqual(1)
+    expect(agentState.injection?.included).toContain('hot-files')
+  })
+
+  it('emits agent_state without injection when the engine is absent', async () => {
+    const h = makeHarness(capturingModel([]))
+    await bootstrapThread(h, { workspace: tempDir() })
+    await h.loop.runTurn(h.threadId, h.turnId)
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    const agentState = events.find((event) => event.kind === 'agent_state')
+    expect(agentState).toBeDefined()
+    if (agentState?.kind !== 'agent_state') throw new Error('unreachable')
+    expect(agentState.injection).toBeUndefined()
   })
 
   it('writes provider token usage into the turn-outcome record', async () => {

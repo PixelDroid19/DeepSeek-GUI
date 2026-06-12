@@ -210,7 +210,11 @@ Shape:
   },
   "contextEngine": {
     "enabled": true,
-    "injectionTokenBudget": 2000
+    "injectionTokenBudget": 2000,
+    "playbook": { "enabled": true }
+  },
+  "evals": {
+    "enabled": true
   },
   "memory": {
     "autoFormation": true
@@ -354,6 +358,7 @@ Settings page reads both routes.
   ledger/          # Per-workspace context-engine ledger ({workspaceHash}.json)
   telemetry/       # Per-workspace tool/turn telemetry (JSONL, size-rotated)
   allowlist/       # Per-workspace remembered L2/L3 command patterns
+  evals/           # Per-workspace eval suites ({workspaceHash}.json)
   threads/
     index.json
     {threadId}/
@@ -380,6 +385,28 @@ and telemetry is expendable. Set `telemetry.enabled: false` to stop
 JSONL telemetry writes. Set `contextEngine.enabled: false` to skip
 `<workspace-state>` injection while continuing to project the ledger,
 which supports A/B measurement with the same runtime observations.
+
+When `contextEngine.playbook.enabled` is true (default), the
+`<workspace-state>` block also carries a workspace playbook computed
+from telemetry: commands run at least twice with their success rate and
+typical duration, hot search roots, and warnings for repeatedly failing
+commands. The playbook is recomputed lazily when the telemetry file
+grows and degrades to empty on unreadable telemetry.
+
+`evals/` holds per-workspace eval suites (capped at 20 checks of
+command + expectation: `exit-zero` or `contains`). The model evolves
+the suite through the `eval_suite_update` tool; the rigorous verifier
+stage runs the suite mechanically (results and a before/after suite
+hash land in the verification report, so weakening checks mid-turn is
+visible to the reviewer); and `kun eval --workspace <path>` runs it
+standalone (`--json` for machine output, non-zero exit on any failing
+check). Deleting `evals/` is safe: suites are advisory state.
+
+The loop also emits an additive `agent_state` runtime event per model
+step (estimated prompt tokens vs the compaction threshold, injected
+workspace-state sections, and injected memory ids split into verified
+facts vs unverified hypotheses). The GUI's Agent State panel renders
+this live alongside rigorous pipeline stage progress.
 
 Memory records may include provenance and freshness metadata:
 `provenance.kind` is `verified-by-command`, `observed-in-file`,

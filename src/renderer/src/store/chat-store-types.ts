@@ -1,4 +1,5 @@
 import type {
+  AgentStatePayload,
   AttachmentReference,
   ChatBlock,
   NormalizedThread,
@@ -6,6 +7,7 @@ import type {
   ReviewTarget,
   ThreadGoal,
   ThreadGoalStatus,
+  PipelineStageInfo,
   ThreadTodoList,
   ThreadTodoStatus,
   UserInputAnswer
@@ -127,6 +129,8 @@ export type ChatState = {
   activeThreadId: string | null
   activeThreadGoal: ThreadGoal | null
   activeThreadTodos: ThreadTodoList | null
+  activeAgentState: AgentStatePayload | null
+  pipelineStages: PipelineStageInfo[]
   blocks: ChatBlock[]
   liveReasoning: string
   liveAssistant: string

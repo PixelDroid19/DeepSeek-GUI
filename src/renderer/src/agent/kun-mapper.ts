@@ -1030,6 +1030,46 @@ export async function dispatchKunRuntimeEvent(
     case 'usage':
       if (event.usage) sink.onUsage?.(usageFromCore(event.usage))
       return
+    case 'agent_state':
+      sink.onAgentState?.({
+        threadId: event.threadId ?? '',
+        model: event.model ?? '',
+        ...(event.reasoningEffort ? { reasoningEffort: event.reasoningEffort } : {}),
+        promptTokensEstimated: event.promptTokensEstimated ?? 0,
+        compactionSoftThreshold: event.compactionSoftThreshold ?? 1,
+        contextPressure: Math.min(1, Math.max(0, event.contextPressure ?? 0)),
+        ...(event.injection
+          ? {
+              injection: {
+                included: event.injection.included ?? [],
+                droppedByBudget: event.injection.droppedByBudget ?? []
+              }
+            }
+          : {}),
+        ...(event.memories
+          ? {
+              memories: {
+                factIds: event.memories.factIds ?? [],
+                hypothesisIds: event.memories.hypothesisIds ?? []
+              }
+            }
+          : {}),
+        ...(event.timestamp ? { createdAt: event.timestamp } : {})
+      })
+      return
+    case 'pipeline_stage_started':
+    case 'pipeline_stage_finished':
+      if (event.role) {
+        sink.onPipelineStage?.({
+          threadId: event.threadId ?? '',
+          role: event.role,
+          status: normalizePipelineStageStatus(event.status, event.kind === 'pipeline_stage_started'),
+          ...(event.model ? { model: event.model } : {}),
+          ...(event.artifactSummary ? { artifactSummary: event.artifactSummary } : {}),
+          ...(event.timestamp ? { createdAt: event.timestamp } : {})
+        })
+      }
+      return
     case 'turn_completed':
     case 'turn_aborted':
       sink.onTurnComplete()
@@ -1050,5 +1090,22 @@ export async function dispatchKunRuntimeEvent(
       return
     default:
       return
+  }
+}
+
+function normalizePipelineStageStatus(
+  status: string | undefined,
+  started: boolean
+): 'running' | 'completed' | 'failed' | 'aborted' | 'degraded' | 'skipped' {
+  if (started) return 'running'
+  switch (status) {
+    case 'completed':
+    case 'failed':
+    case 'aborted':
+    case 'degraded':
+    case 'skipped':
+      return status
+    default:
+      return 'completed'
   }
 }

@@ -103,6 +103,96 @@ describe('thread event sink binding', () => {
   })
 })
 
+describe('agent state and pipeline stage sink handlers', () => {
+  const agentState = {
+    threadId: 'thread-current',
+    model: 'deepseek-v4-pro',
+    promptTokensEstimated: 1200,
+    compactionSoftThreshold: 16_000,
+    contextPressure: 0.075,
+    injection: { included: ['git', 'hot-files'], droppedByBudget: ['pending'] },
+    memories: { factIds: ['mem_a'], hypothesisIds: ['mem_b'] }
+  }
+
+  it('stores the latest agent state for the active thread', () => {
+    const { getState, set, get } = makeSinkHarness({
+      activeThreadId: 'thread-current',
+      activeAgentState: null,
+      pipelineStages: []
+    })
+    const controller = new AbortController()
+    const sink = buildThreadEventSink(set, get, {
+      threadId: 'thread-current',
+      signal: controller.signal
+    })
+    sink.onAgentState?.(agentState)
+    expect(getState().activeAgentState).toEqual(agentState)
+  })
+
+  it('ignores agent state for non-active threads', () => {
+    const { getState, set, get } = makeSinkHarness({
+      activeThreadId: 'thread-current',
+      activeAgentState: null,
+      pipelineStages: []
+    })
+    const controller = new AbortController()
+    const sink = buildThreadEventSink(set, get, {
+      threadId: 'thread-current',
+      signal: controller.signal
+    })
+    sink.onAgentState?.({ ...agentState, threadId: 'thread-other' })
+    expect(getState().activeAgentState).toBeNull()
+  })
+
+  it('appends a new round when a role re-runs after completing (fix round)', () => {
+    const { getState, set, get } = makeSinkHarness({
+      activeThreadId: 'thread-current',
+      activeAgentState: null,
+      pipelineStages: []
+    })
+    const controller = new AbortController()
+    const sink = buildThreadEventSink(set, get, {
+      threadId: 'thread-current',
+      signal: controller.signal
+    })
+    const send = (role: string, status: 'running' | 'completed'): void =>
+      sink.onPipelineStage?.({ threadId: 'thread-current', role, status })
+    send('executor', 'running')
+    send('executor', 'completed')
+    send('verifier', 'running')
+    send('verifier', 'completed')
+    // Fix round: executor runs again.
+    send('executor', 'running')
+    send('executor', 'completed')
+    const stages = getState().pipelineStages
+    expect(stages.map((s2) => `${s2.role}:${s2.status}`)).toEqual([
+      'executor:completed',
+      'verifier:completed',
+      'executor:completed'
+    ])
+  })
+
+  it('tracks pipeline stages, replacing a role on status change', () => {
+    const { getState, set, get } = makeSinkHarness({
+      activeThreadId: 'thread-current',
+      activeAgentState: null,
+      pipelineStages: []
+    })
+    const controller = new AbortController()
+    const sink = buildThreadEventSink(set, get, {
+      threadId: 'thread-current',
+      signal: controller.signal
+    })
+    sink.onPipelineStage?.({ threadId: 'thread-current', role: 'planner', status: 'running' })
+    sink.onPipelineStage?.({ threadId: 'thread-current', role: 'planner', status: 'completed', model: 'deepseek-v4-pro' })
+    sink.onPipelineStage?.({ threadId: 'thread-current', role: 'executor', status: 'running' })
+    const stages = getState().pipelineStages
+    expect(stages).toHaveLength(2)
+    expect(stages[0]).toMatchObject({ role: 'planner', status: 'completed' })
+    expect(stages[1]).toMatchObject({ role: 'executor', status: 'running' })
+  })
+})
+
 describe('thread event sink runtime errors', () => {
   it('adds runtime error events to the timeline with details', () => {
     const { getState, set, get } = makeSinkHarness({

@@ -51,6 +51,7 @@ import {
 } from './token-economy.js'
 import { applyRequestHistoryHygiene } from './request-history-hygiene.js'
 import { estimateModelRequestInputTokens } from './model-request-estimator.js'
+import { isEvidenceLessModelInference } from '../contracts/memory.js'
 import { estimateDeepseekInputTokenCost } from '../adapters/model/deepseek-pricing.js'
 import {
   recentAutoRouterContext,
@@ -692,12 +693,19 @@ export class AgentLoop {
         : null,
       toolCatalogDriftMessage
     })
+    let workspaceStateInjection: { included: string[]; droppedByBudget: string[] } | undefined
     if (this.opts.contextEngine) {
       if (stepIndex === 0) {
         await this.opts.contextEngine.onTurnStart({ threadId, turnId, workspace })
       }
-      const workspaceState = await this.opts.contextEngine.renderInjection(workspace)
-      if (workspaceState) contextInstructions.push(workspaceState)
+      const workspaceState = await this.opts.contextEngine.renderInjectionDetailed(workspace)
+      if (workspaceState) {
+        contextInstructions.push(workspaceState.block)
+        workspaceStateInjection = {
+          included: workspaceState.included,
+          droppedByBudget: workspaceState.droppedByBudget
+        }
+      }
     }
     await this.recordPipelineStage(threadId, turnId, 'input_remembered', {
       memoryCount: memories.length,
@@ -737,6 +745,31 @@ export class AgentLoop {
         rawInputTokens,
         sentInputTokens: estimateModelRequestInputTokens(request)
       })
+    }
+    try {
+      const promptTokensEstimated = estimateModelRequestInputTokens(request)
+      const compactionSoftThreshold = this.opts.compactor.thresholds(model).softThreshold
+      await this.opts.events.record({
+        kind: 'agent_state',
+        threadId,
+        turnId,
+        model: request.model,
+        ...(request.reasoningEffort ? { reasoningEffort: request.reasoningEffort } : {}),
+        promptTokensEstimated,
+        compactionSoftThreshold,
+        contextPressure: Math.min(1, Math.max(0, promptTokensEstimated / compactionSoftThreshold)),
+        ...(workspaceStateInjection ? { injection: workspaceStateInjection } : {}),
+        ...(memories.length
+          ? {
+              memories: {
+                factIds: memories.filter((memory) => !isEvidenceLessModelInference(memory)).map((memory) => memory.id),
+                hypothesisIds: memories.filter((memory) => isEvidenceLessModelInference(memory)).map((memory) => memory.id)
+              }
+            }
+          : {})
+      })
+    } catch {
+      // agent_state is observability only; never fail the step.
     }
     await this.recordPipelineStage(threadId, turnId, 'pre_send', {
       model: request.model,
