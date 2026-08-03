@@ -1747,6 +1747,59 @@ describe('DeepseekCompatModelClient', () => {
     expect(error.message.length).toBeLessThanOrEqual(600)
   })
 
+  it('redacts escaped quotes in JSON access and refresh token diagnostics', async () => {
+    const accessPrefix = 'access-prefix'
+    const accessSuffix = 'access-secret-tail'
+    const refreshPrefix = 'refresh-prefix'
+    const refreshSuffix = 'refresh-secret-tail'
+    const body = [
+      'provider failure: ',
+      '{"access_token":"' + accessPrefix + '\\"' + accessSuffix + '",',
+      '"refresh_token":"' + refreshPrefix + '\\"' + refreshSuffix + '"}'
+    ].join('')
+    const fetchImpl: typeof fetch = async () => new Response(body, { status: 401 })
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash',
+      fetchImpl
+    })
+    const chunks: ModelStreamChunk[] = []
+
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) chunks.push(chunk)
+
+    const error = chunks.find((chunk) => chunk.kind === 'error')
+    if (!error || error.kind !== 'error') throw new Error('expected error chunk')
+    expect(error.message).toContain('<redacted>')
+    expect(error.message).not.toContain(accessPrefix)
+    expect(error.message).not.toContain(accessSuffix)
+    expect(error.message).not.toContain(refreshPrefix)
+    expect(error.message).not.toContain(refreshSuffix)
+    expect(error.message.length).toBeLessThanOrEqual(600)
+  })
+
+  it('redacts an unclosed JSON refresh token diagnostic', async () => {
+    const refreshPrefix = 'unclosed-refresh-prefix'
+    const refreshSuffix = 'unclosed-refresh-secret-tail'
+    const body = '{"refresh_token":"' + refreshPrefix + '\\"' + refreshSuffix
+    const fetchImpl: typeof fetch = async () => new Response(body, { status: 401 })
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash',
+      fetchImpl
+    })
+    const chunks: ModelStreamChunk[] = []
+
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) chunks.push(chunk)
+
+    const error = chunks.find((chunk) => chunk.kind === 'error')
+    if (!error || error.kind !== 'error') throw new Error('expected error chunk')
+    expect(error.message).toContain('<redacted>')
+    expect(error.message).not.toContain(refreshPrefix)
+    expect(error.message).not.toContain(refreshSuffix)
+  })
+
   it('parses streamed SSE events with tool call deltas', async () => {
     const frames = [
       'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\n',

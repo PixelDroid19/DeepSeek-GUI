@@ -5,7 +5,7 @@ const SECRET_TEXT_PATTERNS = [
   /\bbearer\s+([^\s,;]+)/gi
 ]
 const QUOTED_SECRET_FIELD_PATTERN = new RegExp(
-  `(["']${SECRET_FIELD_NAME_PATTERN}["']\\s*:\\s*["'])(?:Bearer\\s+)?[^"']*(["'])`,
+  `((["'])${SECRET_FIELD_NAME_PATTERN}\\2\\s*:\\s*(["']))(?:Bearer\\s+)?(?:\\\\.|(?!\\3)[\\s\\S])*(\\3|$)`,
   'gi'
 )
 
@@ -32,7 +32,7 @@ function redact(value: unknown, key = ''): unknown {
 }
 
 export function redactSecretText(value: string): string {
-  const quotedFieldsRedacted = value.replace(QUOTED_SECRET_FIELD_PATTERN, `$1${REDACTED_SECRET}$2`)
+  const quotedFieldsRedacted = value.replace(QUOTED_SECRET_FIELD_PATTERN, `$1${REDACTED_SECRET}$4`)
   return SECRET_TEXT_PATTERNS.reduce((current, pattern) =>
     current.replace(pattern, (match, key) =>
       match.toLowerCase().startsWith('bearer ')
