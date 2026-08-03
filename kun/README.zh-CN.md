@@ -137,7 +137,8 @@ Kun 使用 JSON 配置文件管理运行时行为，避免重建后重配或硬�
     "approvalPolicy": "auto",
     "sandboxMode": "workspace-write",
     "storage": {
-      "backend": "hybrid"
+      "backend": "hybrid",
+      "deployment": "single-host"
     },
     "insecure": false
   },
@@ -222,13 +223,14 @@ Kun 使用 JSON 配置文件管理运行时行为，避免重建后重配或硬�
     "memory": {
       "enabled": false,
       "scopes": ["user", "workspace", "project"],
-      "maxInjectedRecords": 8
+      "maxInjectedRecords": 8,
+      "retrievalBudgetBytes": 6144
     }
   }
 }
 ```
 
-Kun 默认使用混合存储：`threads/{threadId}/messages.jsonl` 与 `events.jsonl` 是会话的标准回放日志；`index.sqlite3` 仅保存可重建的线程元数据（列表与搜索加速）。将 `serve.storage.backend` 设置为 `"file"` 可以回退到旧版 JSON 索引，或设置 `serve.storage.sqlitePath` 覆盖默认的 `{dataDir}/index.sqlite3`。
+Kun 默认使用混合存储：`threads/{threadId}/messages.jsonl` 与 `events.jsonl` 是会话的标准回放日志；`index.sqlite3` 仅保存可重建的线程元数据（列表与搜索加速）。`serve.storage.deployment` 默认为 `"single-host"`；`"multi-host"` 会在未注入分布式 fencing 服务时安全失败。将 `serve.storage.backend` 设置为 `"file"` 可以回退到旧版 JSON 索引，或设置 `serve.storage.sqlitePath` 覆盖默认的 `{dataDir}/index.sqlite3`。
 
 模型窗口、模型能力和模型级压缩阈值写在 `models.profiles`。内置配置已包含 `deepseek-v4-pro`、`deepseek-v4-flash` 以及兼容别名 `deepseek-chat` / `deepseek-reasoner`；DeepSeek V4 默认是 1M 上下文，并在约 980k input tokens 时开始压缩。旧的 `contextCompaction.modelProfiles` 仍会读取以兼容已有配置，但新配置请使用 `models.profiles`。更完整的文件位置、字段格式和用户自定义方式见 `../docs/KUN_CONFIG.md`。
 
@@ -242,7 +244,7 @@ Kun 默认使用混合存储：`threads/{threadId}/messages.jsonl` 与 `events.j
 - `capabilities.web` 暴露 `web_fetch` 与/或 `web_search`。内置 provider 负责 HTTP(S) 抓取；搜索功能依赖 provider 实现，未配置时会变为不可用。
 - `capabilities.skills` 扫描 `roots` 下的 `skill.json`，并在 `legacySkillMd` 为 `true` 时兼容 `SKILL.md`。
 - `capabilities.attachments` 将图片二进制从线程日志剥离，允许回合记录引用 `attachmentIds`。视觉模型直接接收图片部分，纯文本模型走受限文本 fallback。
-- `capabilities.memory` 在数据目录下持久化跨会话记忆，按作用域检索并注入上下文；也会公开 `memory_create`、`memory_update`、`memory_delete` 工具。
+- `capabilities.memory` 在数据目录下持久化跨会话记忆，按作用域检索并注入上下文；也会公开 `memory_create`、`memory_update`、`memory_delete` 工具。JSON 是规范数据源，SQLite FTS5/BM25 索引可重建，并受记录数与字节预算限制。
 - `capabilities.subagents` 通过 `maxParallel` 与 `maxChildRuns` 限制委派任务并发。
 
 在渲染端使用 `GET /v1/runtime/info` 获取运行时能力清单，使用
@@ -256,7 +258,7 @@ Kun 默认使用混合存储：`threads/{threadId}/messages.jsonl` 与 `events.j
 {--data-dir}/
   config.json      # 可选，运行时配置
   attachments/     # 附件元数据与二进制（启用时）
-  memory/          # 长期记忆记录与墓碑记录（启用时）
+  memory/          # 长期记忆 JSON、墓碑记录与可重建的 memory-index.sqlite3（启用时）
   child-runs/      # 子任务运行记录（subagents 开启时）
   threads/
     index.json

@@ -191,7 +191,8 @@ Shape:
     "approvalPolicy": "auto",
     "sandboxMode": "workspace-write",
     "storage": {
-      "backend": "hybrid"
+      "backend": "hybrid",
+      "deployment": "single-host"
     },
     "insecure": false
   },
@@ -306,7 +307,8 @@ Shape:
     "memory": {
       "enabled": false,
       "scopes": ["user", "workspace", "project"],
-      "maxInjectedRecords": 8
+      "maxInjectedRecords": 8,
+      "retrievalBudgetBytes": 6144
     }
   }
 }
@@ -315,7 +317,10 @@ Shape:
 Kun defaults to hybrid session storage: `threads/{threadId}/messages.jsonl`
 and `events.jsonl` remain the canonical transcript/replay logs, while
 `index.sqlite3` stores only rebuildable thread metadata for fast lists
-and search. Set `serve.storage.backend` to `"file"` to use the legacy
+and search. `serve.storage.deployment` defaults to `"single-host"`; setting
+`"multi-host"` fails closed because the local file lease cannot provide
+distributed fencing. Inject a distributed coordinator before enabling that
+deployment. Set `serve.storage.backend` to `"file"` to use the legacy
 JSON index backend, or set `serve.storage.sqlitePath` to override the
 default `{dataDir}/index.sqlite3` path.
 
@@ -331,15 +336,25 @@ See `../docs/KUN_CONFIG.md` for the detailed file layout and examples.
 Feature flags are intentionally explicit:
 
 - `capabilities.mcp` starts configured MCP clients and imports their tools into the dynamic registry. Workspace-scoped servers require `trustedWorkspaceRoots`.
-- `serve.mcpSearch` can collapse a large MCP catalog into four entry points: `mcp_search`, `mcp_describe`, `mcp_call`, and `mcp_refresh_catalog`. When the catalog is too large, the model searches for relevant tools first, then describes and calls the exact tool instead of carrying every MCP schema on every turn.
+- `serve.mcpSearch` can collapse a large MCP catalog into four entry points: `mcp_search`, `mcp_describe`, `mcp_call`, and `mcp_refresh_catalog`. When the catalog is too large, the model searches for relevant tools first, then describes and calls the exact tool instead of carrying every MCP schema on every turn. `mcp_call` requires the fingerprint returned by `mcp_describe`; the provider revalidates it before sending.
+- MCP calls validate declared input/output schemas and emit a redacted, structured outcome (`planned`, `approved`, `sent`, `acknowledged`, `failed_known`, `failed_unknown`, or `cancelled`) into telemetry. A timeout or cancellation after `sent` is deliberately `failed_unknown`; the host does not resend because the SDK cannot prove pre-send delivery.
 - `serve.tokenEconomy` / `tokenEconomyMode` compresses tool descriptions, tool results, and history context while preserving code, paths, commands, URLs, errors, and other high-value signals.
 - `contextCompaction` controls fallback long-thread compaction thresholds and summary behavior. Per-model thresholds live in `models.profiles`. Compaction preserves goals, constraints, decisions, touched files, tool outcomes, and unresolved next steps.
 - `serve.runtimeTuning.toolStorm` suppresses repeated identical tool calls within a turn so useless tool loops do not keep spending tokens.
 - `capabilities.web` exposes `web_fetch` and/or `web_search`. The built-in provider can fetch HTTP(S) pages; search requires a provider implementation and may report unavailable.
 - `capabilities.skills` scans configured roots for `skill.json` manifests and, when `legacySkillMd` is true, older `SKILL.md` directories.
 - `capabilities.attachments` stores image bytes outside thread logs and allows turns to reference `attachmentIds`. Vision-capable models receive image parts; text-only models receive a bounded compressed base64 text fallback.
-- `capabilities.memory` stores long-term records under the data dir, retrieves scoped matches before turns, and exposes `memory_create`, `memory_update`, and `memory_delete` tools.
+- `capabilities.memory` stores long-term records under the data dir, retrieves scoped matches before turns, and exposes `memory_create`, `memory_update`, and `memory_delete` tools. JSON records are canonical; `memory-index.sqlite3` is a versioned, rebuildable FTS5/BM25 projection with metadata filters, a configured record cap, a byte budget, and a retrieval trace in diagnostics.
 - `capabilities.subagents` exposes `delegate_task` with `maxParallel` and `maxChildRuns` concurrency budgets.
+
+Thread mutations are fenced across the full read-modify-write operation. File
+and hybrid stores infer a durable `FileTurnLeaseStore` for runtimes sharing a
+data directory; tombstones reject stale upserts, revoke active turn leases,
+and make late items/events fail closed. That lease uses the local host/PID
+namespace only. Declaring a file store as `deployment: "multi-host"` throws at
+composition time; multi-host deployments must inject a real distributed
+`ThreadMutationCoordinator`/lease service rather than silently accepting an
+unsafe local lock.
 
 Use `GET /v1/runtime/info` for the runtime capability manifest and
 `GET /v1/runtime/tools` for redacted provider diagnostics. The GUI
@@ -353,7 +368,7 @@ Settings page reads both routes.
 {--data-dir}/
   config.json      # Optional Kun runtime config
   attachments/     # Image metadata + content blobs when enabled
-  memory/          # Long-term memory records and tombstones when enabled
+  memory/          # Long-term memory JSON records, tombstones, and memory-index.sqlite3
   child-runs/      # Delegated child run records when subagents are enabled
   ledger/          # Per-workspace context-engine ledger ({workspaceHash}.json)
   telemetry/       # Per-workspace tool/turn telemetry (JSONL, size-rotated)
@@ -408,21 +423,27 @@ workspace-state sections, and injected memory ids split into verified
 facts vs unverified hypotheses). The GUI's Agent State panel renders
 this live alongside rigorous pipeline stage progress.
 
-Memory records may include provenance and freshness metadata:
-`provenance.kind` is `verified-by-command`, `observed-in-file`,
-`user-stated`, or `model-inferred`; optional evidence can record
-`command`, `file`, `commit`, and `branch`, plus `verifiedAt`.
-`ttl.expiresAt` excludes old records from retrieval, and
-`ttl.staleWhen` can mark a record stale when its evidence file changes
-or when git observes a different branch. Stale records stay on disk
-with `staleAt` for review, but they are not injected. Evidence-less
+Memory records may include a kind (`fact`, `procedure`, `gotcha`,
+`episode`, `working`, or `hypothesis`), an explicit status, provenance,
+relations, and freshness metadata. New records—including compaction
+extracts—always start as `candidate`; a model inference cannot make a
+record verified. The only promotion path is an official passing outcome
+with durable evidence references, digests, and compatible workspace/project
+identity. `ttl.expiresAt` excludes old records from retrieval, and
+`ttl.staleWhen` can mark a record stale when its evidence file changes or
+when git observes a different branch. Stale records stay on disk with
+`staleAt` for review, but they are not injected. Evidence-less
 model-inferred records are capped at confidence `0.5` and render as
-unverified hypotheses.
+unverified hypotheses. Use `rebuildIndex()` or delete the SQLite file to
+recreate the derived index from canonical JSON.
 
 When `memory.autoFormation` is true, structured compaction extracts can
-form workspace memories: decisions become low-confidence hypotheses,
-and resolved-error entries become command-verified memories. Formation
-is capped per compaction and deduplicated by normalized content.
+form workspace memories: decisions become low-confidence hypothesis
+candidates and resolved-error entries become gotcha candidates. Formation
+is capped per compaction and deduplicated by normalized content. Harness
+trial outcomes additionally form procedure candidates on passes and gotcha
+candidates on failures; only a passing official outcome with independent
+evidence promotes the procedure.
 
 Action levels classify each tool call before execution: L0 read, L1
 workspace edit, L2 local execution, L3 network/install/delegation, and
