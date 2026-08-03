@@ -1,5 +1,11 @@
-import type { HarnessGateVerdict } from '../contracts/harness.js'
+import type { HarnessEvidence, HarnessGateVerdict } from '../contracts/harness.js'
 import type { VerdictArtifact } from '../contracts/roles.js'
+
+/**
+ * Redacted evidence registered by the pipeline itself. The digest is a
+ * SHA-256 value; no command output or verifier prose belongs in this record.
+ */
+export type TrustedEvidenceRecord = Pick<HarnessEvidence, 'id' | 'kind' | 'digest'>
 
 /**
  * Mechanical facts captured during a rigorous turn. Counts are deliberately
@@ -12,6 +18,9 @@ export type CompletionGateInput = {
   requiredVerifierResultsMissing?: number
   requiredCriterionFailed?: number
   requiredCriterionWithoutEvidence?: number
+  requiredCriterionUnknownEvidence?: number
+  requiredCriterionWrongEvidenceKind?: number
+  requiredCriterionAmbiguous?: number
   optionalWarningCount?: number
   suiteChanged?: boolean
   forbiddenPaths?: readonly string[]
@@ -21,6 +30,8 @@ export type CompletionGateInput = {
   workspaceHashBefore?: string | null
   workspaceHashAfter?: string | null
   workspaceArtifactCaptureUnavailable?: boolean
+  suiteArtifactCaptureUnavailable?: boolean
+  trustedEvidence?: readonly TrustedEvidenceRecord[]
   verifierResultPresent?: boolean
   allRequiredEvidencePass?: boolean
   /** Reviewer output is advisory: it cannot override mechanical evidence. */
@@ -53,12 +64,29 @@ export function evaluateCompletionGate(input: CompletionGateInput): CompletionGa
     'requiredCriterionWithoutEvidence',
     invalidFields
   )
+  const requiredCriterionUnknownEvidence = count(
+    input.requiredCriterionUnknownEvidence,
+    'requiredCriterionUnknownEvidence',
+    invalidFields
+  )
+  const requiredCriterionWrongEvidenceKind = count(
+    input.requiredCriterionWrongEvidenceKind,
+    'requiredCriterionWrongEvidenceKind',
+    invalidFields
+  )
+  const requiredCriterionAmbiguous = count(
+    input.requiredCriterionAmbiguous,
+    'requiredCriterionAmbiguous',
+    invalidFields
+  )
   const optionalWarningCount = count(input.optionalWarningCount, 'optionalWarningCount', invalidFields)
   const forbiddenPathCount = count(input.forbiddenPathCount, 'forbiddenPathCount', invalidFields)
   validateBoolean(input.suiteChanged, 'suiteChanged', invalidFields)
   validateBoolean(input.verifierResultPresent, 'verifierResultPresent', invalidFields)
   validateBoolean(input.allRequiredEvidencePass, 'allRequiredEvidencePass', invalidFields)
   validateBoolean(input.workspaceArtifactCaptureUnavailable, 'workspaceArtifactCaptureUnavailable', invalidFields)
+  validateBoolean(input.suiteArtifactCaptureUnavailable, 'suiteArtifactCaptureUnavailable', invalidFields)
+  validateTrustedEvidence(input.trustedEvidence, invalidFields)
   const forbiddenPaths = uniqueNonEmpty(input.forbiddenPaths, invalidFields)
   const workspaceHash = compareHashPair(
     input.workspaceHashBefore,
@@ -90,12 +118,16 @@ export function evaluateCompletionGate(input: CompletionGateInput): CompletionGa
   if (
     requiredChecksFailed ||
     requiredCriterionFailed ||
-    requiredCriterionWithoutEvidence
+    requiredCriterionWithoutEvidence ||
+    requiredCriterionWrongEvidenceKind
   ) {
     const reasons: string[] = []
     if (requiredChecksFailed) reasons.push(`${requiredChecksFailed} required mechanical checks failed`)
     if (requiredCriterionFailed) reasons.push(`${requiredCriterionFailed} required verification criteria failed`)
     if (requiredCriterionWithoutEvidence) reasons.push(`${requiredCriterionWithoutEvidence} required verification criteria lack evidence`)
+    if (requiredCriterionWrongEvidenceKind) {
+      reasons.push(`${requiredCriterionWrongEvidenceKind} required verification criteria have no accepted trusted evidence kind`)
+    }
     return { verdict: 'fix', reasons }
   }
 
@@ -105,16 +137,26 @@ export function evaluateCompletionGate(input: CompletionGateInput): CompletionGa
   if (
     requiredChecksMissing ||
     requiredVerifierResultsMissing ||
+    requiredCriterionUnknownEvidence ||
+    requiredCriterionAmbiguous ||
     workspaceHash === 'missing' ||
     artifactHash === 'missing' ||
-    input.workspaceArtifactCaptureUnavailable
+    input.workspaceArtifactCaptureUnavailable ||
+    input.suiteArtifactCaptureUnavailable
   ) {
     const reasons: string[] = []
     if (requiredChecksMissing) reasons.push(`${requiredChecksMissing} required mechanical checks did not run`)
     if (requiredVerifierResultsMissing) reasons.push(`${requiredVerifierResultsMissing} required verifier results are missing`)
+    if (requiredCriterionUnknownEvidence) {
+      reasons.push(`${requiredCriterionUnknownEvidence} required verification criteria cite unknown trusted evidence`)
+    }
+    if (requiredCriterionAmbiguous) {
+      reasons.push(`${requiredCriterionAmbiguous} required verification criteria have ambiguous verifier results`)
+    }
     if (workspaceHash === 'missing') reasons.push('workspace artifact hash is incomplete')
     if (artifactHash === 'missing') reasons.push('captured artifact hash is incomplete')
     if (input.workspaceArtifactCaptureUnavailable) reasons.push('workspace artifact capture unavailable')
+    if (input.suiteArtifactCaptureUnavailable) reasons.push('evaluation suite capture unavailable')
     return inconclusive(reasons)
   }
   if (input.allRequiredEvidencePass === false) {
@@ -150,6 +192,34 @@ function count(value: number | undefined, name: string, invalidFields: string[])
 
 function validateBoolean(value: boolean | undefined, name: string, invalidFields: string[]): void {
   if (value !== undefined && typeof value !== 'boolean') invalidFields.push(name)
+}
+
+function validateTrustedEvidence(value: readonly TrustedEvidenceRecord[] | undefined, invalidFields: string[]): void {
+  if (value === undefined) return
+  if (!Array.isArray(value)) {
+    invalidFields.push('trustedEvidence')
+    return
+  }
+  const ids = new Set<string>()
+  for (const record of value) {
+    if (!record || typeof record !== 'object') {
+      invalidFields.push('trustedEvidence')
+      continue
+    }
+    const { id, kind, digest } = record
+    if (
+      typeof id !== 'string' ||
+      !id.trim() ||
+      ids.has(id) ||
+      (kind !== 'command' && kind !== 'diff' && kind !== 'artifact' && kind !== 'static-report') ||
+      typeof digest !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(digest)
+    ) {
+      invalidFields.push('trustedEvidence')
+      continue
+    }
+    ids.add(id)
+  }
 }
 
 function uniqueNonEmpty(paths: readonly string[] | undefined, invalidFields: string[]): string[] {

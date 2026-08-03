@@ -10,6 +10,30 @@ describe('completion gate', () => {
     expect(evaluateCompletionGate({ requiredCriterionWithoutEvidence: 1 })).toMatchObject({ verdict: 'fix' })
   })
 
+  it('is inconclusive when a required criterion cites unknown trusted evidence', () => {
+    expect(evaluateCompletionGate({
+      requiredCriterionUnknownEvidence: 1,
+      verifierSaysShip: true,
+      allRequiredEvidencePass: true
+    })).toMatchObject({ verdict: 'inconclusive' })
+  })
+
+  it('requires a fix when a required criterion has no accepted trusted evidence kind', () => {
+    expect(evaluateCompletionGate({
+      requiredCriterionWrongEvidenceKind: 1,
+      verifierSaysShip: true,
+      allRequiredEvidencePass: true
+    })).toMatchObject({ verdict: 'fix' })
+  })
+
+  it('is inconclusive when a required criterion has duplicate verifier results', () => {
+    expect(evaluateCompletionGate({
+      requiredCriterionAmbiguous: 1,
+      verifierSaysShip: true,
+      allRequiredEvidencePass: true
+    })).toMatchObject({ verdict: 'inconclusive' })
+  })
+
   it('fails when the evaluation suite changes during the turn', () => {
     expect(evaluateCompletionGate({ suiteChanged: true })).toMatchObject({ verdict: 'fail' })
   })
@@ -70,6 +94,14 @@ describe('completion gate', () => {
   it('is inconclusive when a required workspace artifact capture is unavailable', () => {
     expect(evaluateCompletionGate({
       workspaceArtifactCaptureUnavailable: true,
+      verifierSaysShip: true,
+      allRequiredEvidencePass: true
+    })).toMatchObject({ verdict: 'inconclusive' })
+  })
+
+  it('is inconclusive when a final evaluation-suite capture is unavailable', () => {
+    expect(evaluateCompletionGate({
+      suiteArtifactCaptureUnavailable: true,
       verifierSaysShip: true,
       allRequiredEvidencePass: true
     })).toMatchObject({ verdict: 'inconclusive' })

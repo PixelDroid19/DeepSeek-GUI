@@ -49,7 +49,7 @@ export const ROLE_PROFILES: Record<RoleId, RoleProfile> = {
       'Try to break the change against the planner criteria and the actual diff.',
       'Use tests or focused commands where useful. Do not rely on executor narrative.',
       'End with a fenced JSON block matching:',
-      '{"findings":[{"severity":"...","description":"...","evidence":"..."}],"criteriaResults":[{"criterion":"...","pass":true}],"commandsRun":["..."]}'
+      '{"findings":[{"severity":"...","description":"...","evidence":"..."}],"criteriaResults":[{"criterion":"...","pass":true,"evidenceIds":["..."]}],"commandsRun":["..."]}'
     ].join('\n')
   },
   reviewer: {

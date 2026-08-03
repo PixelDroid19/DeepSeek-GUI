@@ -109,4 +109,10 @@ describe('role contracts and routing', () => {
     expect(prompt).toContain('diff --git')
     expect(prompt).not.toContain('summary')
   })
+
+  it('requires verifier criterion results to declare durable evidence IDs', () => {
+    expect(ROLE_PROFILES.verifier.promptAddendum).toContain(
+      '"criteriaResults":[{"criterion":"...","pass":true,"evidenceIds":["..."]}]'
+    )
+  })
 })

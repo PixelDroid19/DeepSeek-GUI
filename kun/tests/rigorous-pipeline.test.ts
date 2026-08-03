@@ -532,6 +532,411 @@ describe('rigorous pipeline', () => {
     await rm(workspace, { recursive: true, force: true })
   })
 
+  it('rejects an invented verifier evidence ID for a required harness criterion', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-harness-unknown-evidence-'))
+    await execFileAsync('git', ['init', '--quiet', workspace])
+    await writeFile(join(workspace, '.keep'), 'base\n', 'utf8')
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.email', 'kun@example.test'])
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.name', 'Kun Test'])
+    await execFileAsync('git', ['-C', workspace, 'add', '.keep'])
+    await execFileAsync('git', ['-C', workspace, 'commit', '--quiet', '-m', 'baseline'])
+    let executorRuns = 0
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        executorRuns += 1
+        return { summary: 'execution', artifact: { summary: 's', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return {
+          summary: 'verification',
+          artifact: {
+            findings: [],
+            criteriaResults: [{ criterion: 'acceptance', pass: true, evidenceIds: ['invented:claim'] }],
+            commandsRun: []
+          }
+        }
+      }
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({
+      title: 'Unknown harness evidence', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work',
+        mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
+        harnessTask: REQUIRED_HARNESS_TASK
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect(executorRuns).toBe(1)
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'review',
+        title: 'Rigorous completion gate',
+        reviewText: expect.stringContaining('unknown trusted evidence')
+      })
+    ]))
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('requires an accepted trusted evidence kind for every required harness criterion', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-harness-evidence-kind-'))
+    await execFileAsync('git', ['init', '--quiet', workspace])
+    await writeFile(join(workspace, '.keep'), 'base\n', 'utf8')
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.email', 'kun@example.test'])
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.name', 'Kun Test'])
+    await execFileAsync('git', ['-C', workspace, 'add', '.keep'])
+    await execFileAsync('git', ['-C', workspace, 'commit', '--quiet', '-m', 'baseline'])
+    let executorRuns = 0
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        executorRuns += 1
+        return { summary: 'execution', artifact: { summary: 's', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return {
+          summary: 'verification',
+          artifact: {
+            findings: [],
+            criteriaResults: [{ criterion: 'acceptance', pass: true, evidenceIds: ['artifact:execution'] }],
+            commandsRun: []
+          }
+        }
+      }
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({
+      title: 'Wrong harness evidence kind', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work',
+        mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
+        harnessTask: REQUIRED_HARNESS_TASK
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect(executorRuns).toBe(2)
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'review',
+        title: 'Rigorous completion gate (final)',
+        reviewText: expect.stringContaining('no accepted trusted evidence kind')
+      })
+    ]))
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('rejects duplicate verifier results for a required harness criterion', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-harness-duplicate-criterion-'))
+    await execFileAsync('git', ['init', '--quiet', workspace])
+    await writeFile(join(workspace, '.keep'), 'base\n', 'utf8')
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.email', 'kun@example.test'])
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.name', 'Kun Test'])
+    await execFileAsync('git', ['-C', workspace, 'add', '.keep'])
+    await execFileAsync('git', ['-C', workspace, 'commit', '--quiet', '-m', 'baseline'])
+    let executorRuns = 0
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        executorRuns += 1
+        return { summary: 'execution', artifact: { summary: 's', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return {
+          summary: 'verification',
+          artifact: {
+            findings: [],
+            criteriaResults: [
+              { criterion: 'acceptance', pass: true, evidenceIds: ['artifact:execution'] },
+              { criterion: 'The required acceptance criterion passes.', pass: false, evidenceIds: ['artifact:execution'] }
+            ],
+            commandsRun: []
+          }
+        }
+      }
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({
+      title: 'Duplicate harness criterion', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work',
+        mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
+        harnessTask: {
+          ...REQUIRED_HARNESS_TASK,
+          acceptanceCriteria: [{
+            ...REQUIRED_HARNESS_TASK.acceptanceCriteria[0],
+            acceptedEvidenceKinds: ['artifact']
+          }]
+        }
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect(executorRuns).toBe(1)
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'review',
+        title: 'Rigorous completion gate',
+        reviewText: expect.stringContaining('ambiguous verifier results')
+      })
+    ]))
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('persists redacted trusted evidence IDs and stable digests in the completion-gate report', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-harness-trusted-evidence-'))
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-rigorous-harness-trusted-evidence-data-'))
+    await execFileAsync('git', ['init', '--quiet', workspace])
+    await writeFile(join(workspace, '.keep'), 'base\n', 'utf8')
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.email', 'kun@example.test'])
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.name', 'Kun Test'])
+    await execFileAsync('git', ['-C', workspace, 'add', '.keep'])
+    await execFileAsync('git', ['-C', workspace, 'commit', '--quiet', '-m', 'baseline'])
+    const store = new EvalSuiteStore({ dir: join(dataDir, 'evals') })
+    const evalToolHost = new LocalToolHost({
+      tools: [
+        LocalToolHost.defineTool({
+          name: 'bash',
+          toolKind: 'command_execution',
+          policy: 'auto',
+          inputSchema: { type: 'object', properties: {} },
+          description: 'private evidence check',
+          execute: async () => ({ output: 'private harness output' })
+        })
+      ],
+      actionLevels: { enabled: false }
+    })
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        return { summary: 'private executor summary', artifact: { summary: 'private executor summary', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return {
+          summary: 'verification',
+          rawText: 'private verifier raw output',
+          artifact: {
+            findings: [],
+            criteriaResults: [{ criterion: 'acceptance', pass: true, evidenceIds: ['command:harness:proof'] }],
+            commandsRun: []
+          }
+        }
+      }
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child, {
+      enabled: true,
+      store,
+      toolHost: evalToolHost,
+      approvalPolicy: 'auto'
+    })
+    const thread = await runtime.threads.create({
+      title: 'Trusted harness evidence', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work',
+        mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
+        harnessTask: {
+          ...REQUIRED_HARNESS_TASK,
+          verification: [{
+            id: 'proof',
+            command: 'private command',
+            expectation: { kind: 'exit-zero' },
+            required: true,
+            timeoutMs: 1_000
+          }]
+        }
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('completed')
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    const gate = items.find((item) => item.kind === 'review' && item.title === 'Rigorous completion gate')
+    const report = gate?.kind === 'review' ? gate.reviewText ?? '' : ''
+    const verifier = items.find(
+      (item) => item.kind === 'review' && 'roleName' in item && item.roleName === 'verifier'
+    )
+    const verifierReport = verifier?.kind === 'review' ? verifier.reviewText ?? '' : ''
+    expect(report).toContain('Trusted evidence:')
+    expect(report).toContain('command:harness:proof')
+    expect(report).toContain('diff:workspace')
+    expect(report).toContain('artifact:execution')
+    expect(report).toContain('static-report:verifier')
+    expect(report).toMatch(/[a-f0-9]{64}/)
+    expect(report).not.toContain('private command')
+    expect(report).not.toContain('private harness output')
+    expect(report).not.toContain('private verifier raw output')
+    expect(verifierReport).not.toContain('private command')
+    expect(verifierReport).not.toContain('private harness output')
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dataDir, { recursive: true, force: true })
+  })
+
+  it('re-captures suite and workspace evidence after the initial reviewer returns', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-delayed-initial-mutation-'))
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-rigorous-delayed-initial-mutation-data-'))
+    await execFileAsync('git', ['init', '--quiet', workspace])
+    await writeFile(join(workspace, '.keep'), 'base\n', 'utf8')
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.email', 'kun@example.test'])
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.name', 'Kun Test'])
+    await execFileAsync('git', ['-C', workspace, 'add', '.keep'])
+    await execFileAsync('git', ['-C', workspace, 'commit', '--quiet', '-m', 'baseline'])
+    const store = new EvalSuiteStore({ dir: join(dataDir, 'evals') })
+    await store.addCheck(workspace, {
+      name: 'smoke', command: 'echo ok', expect: { kind: 'exit-zero' },
+      addedAt: '2026-06-11T00:00:00.000Z', source: 'user'
+    })
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        return { summary: 'execution', artifact: { summary: 's', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return { summary: 'verification', artifact: { findings: [], criteriaResults: [], commandsRun: [] } }
+      }
+      await store.removeCheck(workspace, 'smoke')
+      await writeFile(join(workspace, 'late-reviewer-change.txt'), 'late\n', 'utf8')
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child, {
+      enabled: true,
+      store,
+      toolHost: new LocalToolHost({
+        tools: [LocalToolHost.defineTool({
+          name: 'bash', toolKind: 'command_execution', policy: 'auto',
+          inputSchema: { type: 'object', properties: {} }, description: 'passing bash',
+          execute: async () => ({ output: 'ok' })
+        })],
+        actionLevels: { enabled: false }
+      }),
+      approvalPolicy: 'auto'
+    })
+    const thread = await runtime.threads.create({
+      title: 'Delayed initial mutation', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work', mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: [] }
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'review', title: 'Rigorous completion gate',
+        reviewText: expect.stringContaining('evaluation suite changed during the turn')
+      }),
+      expect.objectContaining({
+        kind: 'review', title: 'Rigorous completion gate',
+        reviewText: expect.stringContaining('workspace artifact hash changed after capture')
+      })
+    ]))
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dataDir, { recursive: true, force: true })
+  })
+
+  it('re-captures suite and workspace evidence after the final reviewer returns', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-delayed-final-mutation-'))
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-rigorous-delayed-final-mutation-data-'))
+    await execFileAsync('git', ['init', '--quiet', workspace])
+    await writeFile(join(workspace, '.keep'), 'base\n', 'utf8')
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.email', 'kun@example.test'])
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.name', 'Kun Test'])
+    await execFileAsync('git', ['-C', workspace, 'add', '.keep'])
+    await execFileAsync('git', ['-C', workspace, 'commit', '--quiet', '-m', 'baseline'])
+    const store = new EvalSuiteStore({ dir: join(dataDir, 'evals') })
+    await store.addCheck(workspace, {
+      name: 'smoke', command: 'echo ok', expect: { kind: 'exit-zero' },
+      addedAt: '2026-06-11T00:00:00.000Z', source: 'user'
+    })
+    let reviewerRuns = 0
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        return { summary: 'execution', artifact: { summary: 's', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return { summary: 'verification', artifact: { findings: [], criteriaResults: [], commandsRun: [] } }
+      }
+      reviewerRuns += 1
+      if (reviewerRuns === 1) return { summary: 'verdict', artifact: { verdict: 'fix', reasons: ['one round'] } }
+      await store.removeCheck(workspace, 'smoke')
+      await writeFile(join(workspace, 'late-final-reviewer-change.txt'), 'late\n', 'utf8')
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child, {
+      enabled: true,
+      store,
+      toolHost: new LocalToolHost({
+        tools: [LocalToolHost.defineTool({
+          name: 'bash', toolKind: 'command_execution', policy: 'auto',
+          inputSchema: { type: 'object', properties: {} }, description: 'passing bash',
+          execute: async () => ({ output: 'ok' })
+        })],
+        actionLevels: { enabled: false }
+      }),
+      approvalPolicy: 'auto'
+    })
+    const thread = await runtime.threads.create({
+      title: 'Delayed final mutation', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work', mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: [] }
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect(reviewerRuns).toBe(2)
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'review', title: 'Rigorous completion gate (final)',
+        reviewText: expect.stringContaining('evaluation suite changed during the turn')
+      }),
+      expect.objectContaining({
+        kind: 'review', title: 'Rigorous completion gate (final)',
+        reviewText: expect.stringContaining('workspace artifact hash changed after capture')
+      })
+    ]))
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dataDir, { recursive: true, force: true })
+  })
+
   it('fails before a fix round when a harness turn changes a forbidden path', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-harness-path-'))
     let executorRuns = 0
