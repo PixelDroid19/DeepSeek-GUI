@@ -142,7 +142,7 @@ const MAX_ADAPTIVE_DIGEST_DEPTH = 64
 const MAX_ADAPTIVE_DIGEST_ITEMS = 2_048
 const MAX_ADAPTIVE_DIGEST_COLLECTION = 128
 const MAX_ADAPTIVE_DIGEST_BYTES = 128 * 1_024
-const MAX_ADAPTIVE_DIGEST_STRING_SAMPLE_BYTES = 4 * 1_024
+const MAX_ADAPTIVE_DIGEST_STRING_CHUNK_CODE_UNITS = 16 * 1_024
 const ADAPTIVE_DIGEST_OVERFLOW_RESERVE_BYTES = 128
 
 export type AdaptiveTrialRuntimeState = {
@@ -766,11 +766,11 @@ function adaptiveObservation(input: {
 }
 
 /**
- * Hashes a bounded structural sample of the file-change request and returned
- * diff/hash artifact without retaining raw file content in observations.
- * Traversal is iterative so hostile nested tool arguments cannot overflow the
- * runtime stack; depth, items, and hashed bytes each have a deterministic
- * overflow marker.
+ * Hashes the complete string values of a bounded file-change structure and
+ * returned diff/hash artifact without retaining raw file content in
+ * observations. String bytes are fed to SHA-256 in bounded chunks, while
+ * traversal itself remains iterative with deterministic depth/item/byte
+ * overflow markers.
  */
 function fileChangeDiffFingerprint(
   contentDigest: string,
@@ -839,7 +839,7 @@ function appendStableDigestValue(
     const frame = frames.pop()
     if (!frame) continue
     if (frame.kind === 'text') {
-      if (frame.sampled) appendSampledDigestText(writer, frame.tag, frame.value)
+      if (frame.sampled) appendExactDigestText(writer, frame.tag, frame.value)
       else writer.append(frame.tag, frame.value)
       continue
     }
@@ -858,7 +858,7 @@ function appendStableDigestValue(
       continue
     }
     if (typeof frame.value === 'string') {
-      appendSampledDigestText(writer, 'string', frame.value)
+      appendExactDigestText(writer, 'string', frame.value)
       continue
     }
     if (typeof frame.value === 'boolean') {
@@ -930,26 +930,40 @@ function boundedDigestKeys(value: Record<string, unknown>): { values: string[]; 
   return { values, truncated }
 }
 
-function appendSampledDigestText(writer: BoundedDigestWriter, tag: string, value: string): void {
-  const head = boundedUtf8Prefix(value, MAX_ADAPTIVE_DIGEST_STRING_SAMPLE_BYTES)
-  if (!head.truncated) {
-    writer.append(tag, head.value)
-    return
+function appendExactDigestText(writer: BoundedDigestWriter, tag: string, value: string): void {
+  writer.append(`${tag}_sha256`, sha256Utf8Chunks(value))
+  writer.append(`${tag}_utf16_length`, String(value.length))
+}
+
+function sha256Utf8Chunks(value: string): string {
+  const hash = createHash('sha256')
+  for (let start = 0; start < value.length;) {
+    let end = Math.min(value.length, start + MAX_ADAPTIVE_DIGEST_STRING_CHUNK_CODE_UNITS)
+    if (
+      end < value.length &&
+      isHighSurrogate(value.charCodeAt(end - 1)) &&
+      isLowSurrogate(value.charCodeAt(end))
+    ) {
+      end -= 1
+    }
+    if (end === start) end = Math.min(value.length, start + 2)
+    hash.update(value.slice(start, end), 'utf8')
+    start = end
   }
-  const tail = boundedUtf8Suffix(value, MAX_ADAPTIVE_DIGEST_STRING_SAMPLE_BYTES)
-  writer.append(`${tag}_head`, head.value)
-  writer.append(`${tag}_tail`, tail.value)
-  writer.append(`${tag}_overflow`, `utf16_length:${value.length}`)
+  return hash.digest('hex')
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff
 }
 
 function boundedUtf8Prefix(value: string, maxBytes: number): { value: string; truncated: boolean } {
   const length = boundedUtf8Length(value, maxBytes, (count) => value.slice(0, count))
   return { value: value.slice(0, length), truncated: length < value.length }
-}
-
-function boundedUtf8Suffix(value: string, maxBytes: number): { value: string; truncated: boolean } {
-  const length = boundedUtf8Length(value, maxBytes, (count) => value.slice(value.length - count))
-  return { value: value.slice(value.length - length), truncated: length < value.length }
 }
 
 function boundedUtf8Length(

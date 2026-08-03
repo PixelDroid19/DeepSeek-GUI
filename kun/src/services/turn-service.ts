@@ -102,6 +102,10 @@ export class TurnService {
     if (isAdaptiveTrial && this.activeAdaptiveThreadLeases.has(input.threadId)) {
       throw new Error('adaptive harness trial requires exclusive thread execution')
     }
+    // Per-turn leases from the prior implementation intentionally have their
+    // own canonical path. They are only acquired after the adaptive turn has
+    // been durably written as running, so this serialized mutation still sees
+    // and rejects that persisted turn without scanning arbitrary lock files.
     const adaptiveThreadLease = isAdaptiveTrial
       ? await this.adaptiveTrialLeases.acquireThread({ threadId: input.threadId })
       : undefined

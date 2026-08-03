@@ -213,8 +213,8 @@ function normalizeTtl(value: number | undefined): number {
 
 function leaseKey(scope: AdaptiveTrialLeaseScope, threadId: string, turnId: string): string {
   const identity = scope === 'turn'
-    // Preserve the pre-thread-lease path so an in-flight turn lease from a
-    // rolling upgrade remains visible and cannot be bypassed.
+    // Preserve the pre-thread-lease path so a new runtime still observes an
+    // in-flight per-turn lease created by the previous version.
     ? `${threadId}\u0000${turnId}`
     : `\u0000thread\u0000${threadId}`
   return createHash('sha256').update(identity).digest('hex')

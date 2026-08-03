@@ -462,6 +462,86 @@ describe('runtime factory usage carryover', () => {
     }
   })
 
+  it('serializes same-service adaptive starts before an owner map is recorded', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-adaptive-local-thread-lease-'))
+    try {
+      const runtime = sharedFileTurnRuntime(dataDir, 'single-runtime')
+      const threadId = 'thr_local_adaptive_start'
+      await runtime.threadStore.upsert(createThreadRecord({
+        id: threadId,
+        title: 'Local adaptive start',
+        workspace: '/tmp',
+        model: 'test-model'
+      }))
+
+      const starts = await Promise.allSettled([
+        runtime.turns.startTurn({
+          threadId,
+          request: { prompt: 'first adaptive start', harnessTask: ADAPTIVE_TASK }
+        }),
+        runtime.turns.startTurn({
+          threadId,
+          request: { prompt: 'second adaptive start', harnessTask: ADAPTIVE_TASK }
+        })
+      ])
+      const accepted = starts.find((start) => start.status === 'fulfilled')
+      const rejected = starts.find((start) => start.status === 'rejected')
+
+      expect(accepted?.status).toBe('fulfilled')
+      expect(rejected?.status).toBe('rejected')
+      if (!accepted || accepted.status !== 'fulfilled') throw new Error('expected one adaptive start')
+      if (!rejected || rejected.status !== 'rejected') throw new Error('expected one rejected adaptive start')
+      expect(String(rejected.reason)).toContain('adaptive harness trial requires exclusive thread execution')
+      expect((await runtime.threadStore.get(threadId))?.turns).toHaveLength(1)
+      await runtime.turns.interruptTurn({ threadId, turnId: accepted.value.turnId })
+    } finally {
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a fresh adaptive start while legacy per-turn state remains running', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-adaptive-legacy-turn-lease-'))
+    const threadId = 'thr_legacy_adaptive_start'
+    const legacyTurnId = 'turn_legacy'
+    const legacyLeaseStore = new FileAdaptiveTrialLeaseStore({ dataDir, owner: 'legacy-runtime' })
+    let legacyLease: Awaited<ReturnType<typeof legacyLeaseStore.acquire>> = null
+    try {
+      const runtime = sharedFileTurnRuntime(dataDir, 'new-runtime')
+      await runtime.threadStore.upsert({
+        ...createThreadRecord({
+          id: threadId,
+          title: 'Legacy adaptive start',
+          workspace: '/tmp',
+          model: 'test-model'
+        }),
+        status: 'running',
+        turns: [createTurnRecord({
+          id: legacyTurnId,
+          threadId,
+          prompt: 'legacy adaptive work',
+          harnessTask: ADAPTIVE_TASK,
+          adaptiveTrialMarker: adaptiveMarker('running'),
+          status: 'running'
+        })]
+      })
+      legacyLease = await legacyLeaseStore.acquire({ threadId, turnId: legacyTurnId })
+      expect(legacyLease).not.toBeNull()
+
+      await expect(runtime.turns.startTurn({
+        threadId,
+        request: { prompt: 'new adaptive work', harnessTask: ADAPTIVE_TASK }
+      })).rejects.toThrow('adaptive harness trial requires exclusive thread execution')
+
+      const probe = new FileAdaptiveTrialLeaseStore({ dataDir, owner: 'thread-lease-probe' })
+      const releasedThreadLease = await probe.acquireThread({ threadId })
+      expect(releasedThreadLease).not.toBeNull()
+      if (releasedThreadLease) await probe.release(releasedThreadLease)
+    } finally {
+      if (legacyLease) await legacyLeaseStore.release(legacyLease)
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
   it('uses a full file-change digest so same-path same-byte edits are progress', () => {
     const sharedPrefix = 'x'.repeat(1_024)
     const items = [
@@ -500,7 +580,11 @@ describe('runtime factory usage carryover', () => {
   it('bounds deeply nested and oversized file-change fingerprints without retaining raw content', () => {
     let nested: Record<string, unknown> = { leaf: 'secret' }
     for (let index = 0; index < 20_000; index += 1) nested = { next: nested }
-    const oversizedPrefix = 'x'.repeat(1_000_000)
+    const sharedHead = 'h'.repeat(16 * 1_024)
+    const sharedTail = 't'.repeat(16 * 1_024)
+    const sharedCenter = 'm'.repeat(512 * 1_024)
+    const firstLargeContent = `${sharedHead}${sharedCenter}A${sharedCenter}${sharedTail}`
+    const secondLargeContent = `${sharedHead}${sharedCenter}B${sharedCenter}${sharedTail}`
     const items = [
       makeToolCallItem({
         id: 'item_nested_write', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'nested_write',
@@ -512,19 +596,19 @@ describe('runtime factory usage carryover', () => {
       }),
       makeToolCallItem({
         id: 'item_large_write', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'large_write',
-        toolName: 'write', toolKind: 'file_change', arguments: { path: 'src/large.ts', content: `${oversizedPrefix}A` }
+        toolName: 'write', toolKind: 'file_change', arguments: { path: 'src/large.ts', content: firstLargeContent }
       }),
       makeToolResultItem({
         id: 'item_large_result', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'large_write',
-        toolName: 'write', toolKind: 'file_change', output: { bytes_written: oversizedPrefix.length + 1 }
+        toolName: 'write', toolKind: 'file_change', output: { bytes_written: firstLargeContent.length }
       }),
       makeToolCallItem({
         id: 'item_large_write_changed', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'large_write_changed',
-        toolName: 'write', toolKind: 'file_change', arguments: { path: 'src/large.ts', content: `${oversizedPrefix}B` }
+        toolName: 'write', toolKind: 'file_change', arguments: { path: 'src/large.ts', content: secondLargeContent }
       }),
       makeToolResultItem({
         id: 'item_large_result_changed', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'large_write_changed',
-        toolName: 'write', toolKind: 'file_change', output: { bytes_written: oversizedPrefix.length + 1 }
+        toolName: 'write', toolKind: 'file_change', output: { bytes_written: secondLargeContent.length }
       })
     ]
 
@@ -537,7 +621,16 @@ describe('runtime factory usage carryover', () => {
       expect.stringMatching(/^sha256:/)
     ])
     expect(observations[1]?.diffFingerprint).not.toBe(observations[2]?.diffFingerprint)
-    expect(JSON.stringify(observations)).not.toContain(oversizedPrefix)
+    expect(detectStall(observations.slice(1), {
+      maxObservations: 2,
+      repeatedActionThreshold: 2,
+      repeatedErrorThreshold: 3,
+      noProgressWindow: 2,
+      readRediscoveryThreshold: 3
+    })).toBeNull()
+    expect(JSON.stringify(observations)).not.toContain(sharedHead)
+    expect(JSON.stringify(observations)).not.toContain(sharedCenter)
+    expect(JSON.stringify(observations)).not.toContain(sharedTail)
     expect(JSON.stringify(observations)).not.toContain('secret')
   })
 })
