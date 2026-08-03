@@ -22,6 +22,10 @@ import type { ThreadStore } from '../ports/thread-store.js'
 import type { RuntimeTuningConfig } from '../config/kun-config.js'
 import { RuntimeEventRecorder } from './runtime-event-recorder.js'
 import { ThreadService } from './thread-service.js'
+import {
+  LeaseEventSequenceCoordinator,
+  LeaseThreadMutationCoordinator
+} from './thread-mutation.js'
 import { TurnService } from './turn-service.js'
 import { UsageService } from './usage-service.js'
 import { resolveReviewTargetPrompt } from '../review/git-review-target.js'
@@ -125,6 +129,8 @@ export class ReviewService {
     const ids = new RandomIdGenerator()
     const inflight = new InflightTracker()
     const steering = new SteeringQueue()
+    const threadMutations = new LeaseThreadMutationCoordinator()
+    const eventMutations = new LeaseEventSequenceCoordinator({ turnLeases: threadMutations.leaseStore })
     const compactor = new ContextCompactor({
       contextCompaction: this.deps.contextCompaction,
       models: this.deps.models
@@ -132,8 +138,11 @@ export class ReviewService {
     const events = new RuntimeEventRecorder({
       eventBus,
       sessionStore,
+      threadDeleted: async (threadId) => threadStore.isDeleted(threadId),
       allocateSeq: (threadId) => eventBus.allocateSeq(threadId),
-      nowIso
+      nowIso,
+      threadMutations,
+      eventMutations
     })
     const turns = new TurnService({
       threadStore,
@@ -144,14 +153,17 @@ export class ReviewService {
       compactor,
       ids,
       nowIso,
-      usage
+      usage,
+      threadMutations
     })
     const threads = new ThreadService({
       threadStore,
       sessionStore,
       events,
       ids,
-      nowIso
+      nowIso,
+      threadMutations,
+      eventMutations
     })
     const loop = new AgentLoop({
       threadStore,
@@ -166,6 +178,7 @@ export class ReviewService {
       usage,
       events,
       turns,
+      threadMutations,
       inflight,
       steering,
       compactor,

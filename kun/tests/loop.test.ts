@@ -9,6 +9,7 @@ import { GET_GOAL_TOOL_NAME, UPDATE_GOAL_TOOL_NAME } from '../src/adapters/tool/
 import { FileThreadStore, FileSessionStore } from '../src/adapters/file/index.js'
 import { RuntimeEventRecorder } from '../src/services/runtime-event-recorder.js'
 import { ContextCompactor } from '../src/loop/context-compactor.js'
+import { effectiveHistoryAfterLatestCompaction } from '../src/loop/compaction-prompt.js'
 import { resolveModelContextProfile } from '../src/loop/model-context-profile.js'
 import { makeAssistantTextItem, makeToolCallItem, makeUserItem } from '../src/domain/item.js'
 import { createThreadRecord } from '../src/domain/thread.js'
@@ -1980,6 +1981,67 @@ describe('AgentLoop', () => {
       .toContain('Model summary: preserve alpha.txt')
     expect(persistedSummary?.kind === 'compaction' ? persistedSummary.summary : '')
       .toContain('Model summary: preserve alpha.txt')
+    expect(persisted.some((item) => item.id === 'model_summary_hist_0')).toBe(true)
+  })
+
+  it('does not persist a stale compaction when an item arrives during summary generation', async () => {
+    let releaseSummary!: () => void
+    const summaryReady = new Promise<void>((resolve) => {
+      releaseSummary = resolve
+    })
+    let summaryStarted!: () => void
+    const summaryStartedPromise = new Promise<void>((resolve) => {
+      summaryStarted = resolve
+    })
+    const h = makeHarness({
+      provider: 'fold-race',
+      model: 'fold-race',
+      async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+        const isSummaryRequest = request.tools.length === 0 &&
+          request.contextInstructions?.some((text) => text.includes('history fold'))
+        if (isSummaryRequest) {
+          summaryStarted()
+          await summaryReady
+          yield { kind: 'assistant_text_delta', text: 'summary before the late item' }
+          yield { kind: 'completed', stopReason: 'stop' }
+          return
+        }
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }, {
+      compactor: new ContextCompactor({ softThreshold: 8, hardThreshold: 16 }),
+      contextCompaction: { summaryMode: 'model', summaryTimeoutMs: 5_000 }
+    })
+    await bootstrapThread(h)
+    for (let i = 0; i < 10; i += 1) {
+      await h.sessionStore.appendItem(h.threadId, makeUserItem({
+        id: `fold_race_hist_${i}`,
+        turnId: h.turnId,
+        threadId: h.threadId,
+        text: `history item ${i} ${'x'.repeat(24)}`
+      }))
+    }
+
+    const run = h.loop.runTurn(h.threadId, h.turnId)
+    try {
+      await summaryStartedPromise
+      const lateItem = makeAssistantTextItem({
+        id: 'fold_race_late_item',
+        turnId: h.turnId,
+        threadId: h.threadId,
+        text: 'late tool result must remain visible'
+      })
+      await h.turns.applyItem(h.threadId, lateItem)
+      releaseSummary()
+      await expect(run).resolves.toBe('completed')
+
+      const persisted = await h.sessionStore.loadItems(h.threadId)
+      const effective = effectiveHistoryAfterLatestCompaction(persisted)
+      expect(effective.some((item) => item.id === lateItem.id)).toBe(true)
+      expect(persisted.some((item) => item.id === 'fold_race_hist_0')).toBe(true)
+    } finally {
+      releaseSummary()
+    }
   })
 
   it('records a visible fallback event when configured model compaction summaries fail', async () => {
@@ -2309,6 +2371,7 @@ describe('AgentLoop', () => {
       request: { reason: 'manual test' }
     })
     expect(compacted.summary).toContain('original requirement alpha')
+    expect((await h.sessionStore.loadItems(h.threadId)).some((item) => item.id === 'manual_hist_0')).toBe(true)
 
     const next = await h.turns.startTurn({
       threadId: h.threadId,

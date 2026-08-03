@@ -15,9 +15,15 @@ import type { RuntimeEvent } from '../../contracts/events.js'
 import type { TurnItem } from '../../contracts/items.js'
 import type { Turn } from '../../contracts/turns.js'
 import type { ApprovalPolicy, SandboxMode } from '../../contracts/policy.js'
-import type { ThreadStore, ThreadStoreListOptions } from '../../ports/thread-store.js'
+import type {
+  ThreadStore,
+  ThreadStoreListOptions,
+  ThreadStoreMutationCoordination
+} from '../../ports/thread-store.js'
 import { toThreadSummary } from '../../domain/thread.js'
 import { readJsonl } from '../file/file-thread-store.js'
+import { atomicWriteFile } from '../file/atomic-write.js'
+import { withFileMutationQueue } from '../tool/file-mutation-queue.js'
 
 type ThreadMetadataLine = {
   kind: 'thread_metadata'
@@ -73,15 +79,25 @@ type ThreadIndexRecord = {
  */
 export class HybridThreadStore implements ThreadStore {
   private readonly dataDir: string
+  private readonly coordinationDataDir: string
+  private readonly coordinationDeployment: ThreadStoreMutationCoordination['deployment']
   private readonly sqlitePath: string
   private readonly nowIso: () => string
   private readonly readyPromise: Promise<void>
   private readonly metadataQueues = new Map<string, Promise<void>>()
   private db: BetterSqliteDatabase | null = null
 
-  constructor(options: { dataDir: string; sqlitePath?: string; nowIso?: () => string }) {
-    this.dataDir = resolve(options.dataDir, 'threads')
-    this.sqlitePath = resolve(options.sqlitePath ?? join(options.dataDir, 'index.sqlite3'))
+  constructor(options: {
+    dataDir: string
+    sqlitePath?: string
+    nowIso?: () => string
+    /** File-backed coordination is host-local; multi-host use fails closed in services. */
+    deployment?: ThreadStoreMutationCoordination['deployment']
+  }) {
+    this.coordinationDataDir = resolve(options.dataDir)
+    this.dataDir = resolve(this.coordinationDataDir, 'threads')
+    this.sqlitePath = resolve(options.sqlitePath ?? join(this.coordinationDataDir, 'index.sqlite3'))
+    this.coordinationDeployment = options.deployment ?? 'single-host'
     this.nowIso = options.nowIso ?? (() => new Date().toISOString())
     this.readyPromise = this.initialize()
   }
@@ -105,6 +121,10 @@ export class HybridThreadStore implements ThreadStore {
         const rows = this.queryThreadRows(options)
         const summaries: ThreadSummary[] = []
         for (const row of rows) {
+          if (await this.isDeleted(row.id)) {
+            this.deleteIndexRow(row.id)
+            continue
+          }
           if (await this.rowHasReadableJsonl(row)) {
             summaries.push(summaryFromRow(row))
           } else {
@@ -121,6 +141,10 @@ export class HybridThreadStore implements ThreadStore {
 
   async get(threadId: string): Promise<ThreadRecord | null> {
     await this.ready()
+    if (await this.isDeleted(threadId)) {
+      this.deleteIndexRow(threadId)
+      return null
+    }
     if (this.db) {
       const row = this.findRow(threadId)
       if (row && !(await this.rowHasReadableJsonl(row))) {
@@ -135,26 +159,76 @@ export class HybridThreadStore implements ThreadStore {
     return thread
   }
 
+  async exists(threadId: string): Promise<boolean> {
+    await this.ready()
+    if (await this.isDeleted(threadId)) return false
+    if (!(await pathExists(this.threadDir(threadId)))) return false
+    return (await pathExists(this.metadataPath(threadId))) || (await pathExists(this.legacyThreadPath(threadId)))
+  }
+
+  async isDeleted(threadId: string): Promise<boolean> {
+    return pathExists(this.deletedMarkerPath(threadId))
+  }
+
+  getMutationCoordination(): ThreadStoreMutationCoordination {
+    return {
+      kind: 'file',
+      dataDir: this.coordinationDataDir,
+      deployment: this.coordinationDeployment
+    }
+  }
+
+  async create(thread: ThreadRecord): Promise<ThreadRecord> {
+    await this.ready()
+    return this.withThreadLifecycle(thread.id, async () => {
+      await this.appendMetadata(thread)
+      if (this.db) {
+        this.upsertIndexBestEffort(await this.indexRecordForThread(thread))
+      }
+      await rm(this.deletedMarkerPath(thread.id), { force: true })
+      return thread
+    })
+  }
+
   async upsert(thread: ThreadRecord): Promise<ThreadRecord> {
     await this.ready()
-    await this.appendMetadata(thread)
-    if (this.db) {
-      this.upsertIndexBestEffort(await this.indexRecordForThread(thread))
-    }
-    return thread
+    return this.withThreadLifecycle(thread.id, async () => {
+      if (await this.isDeleted(thread.id)) {
+        throw new Error(`thread has been deleted: ${thread.id}`)
+      }
+      await this.appendMetadata(thread)
+      if (this.db) {
+        this.upsertIndexBestEffort(await this.indexRecordForThread(thread))
+      }
+      return thread
+    })
   }
 
   async delete(threadId: string): Promise<boolean> {
     await this.ready()
-    const dir = this.threadDir(threadId)
-    const existed = await pathExists(dir)
-    if (!existed) {
-      this.deleteIndexRow(threadId)
-      return false
-    }
-    await rm(dir, { recursive: true, force: true })
-    this.deleteIndexRow(threadId)
-    return true
+    return this.withThreadLifecycle(threadId, async () => {
+      const dir = this.threadDir(threadId)
+      const existed = await pathExists(dir)
+      if (!existed) {
+        this.deleteIndexRow(threadId)
+        return false
+      }
+      const markerPath = this.deletedMarkerPath(threadId)
+      await atomicWriteFile(
+        markerPath,
+        JSON.stringify({ version: 1, deletedAt: this.nowIso() })
+      )
+      let removed = false
+      try {
+        await rm(dir, { recursive: true, force: true })
+        removed = true
+        this.deleteIndexRow(threadId)
+      } catch (error) {
+        if (!removed) await rm(markerPath, { force: true })
+        throw error
+      }
+      return true
+    })
   }
 
   async noteEventSeq(threadId: string, seq: number): Promise<void> {
@@ -249,6 +323,7 @@ export class HybridThreadStore implements ThreadStore {
     if (!this.db) return
     const discovered = new Set<string>()
     for (const threadId of await this.threadIdsFromFilesystem()) {
+      if (await this.isDeleted(threadId)) continue
       const thread = await this.readThreadFromDisk(threadId)
       if (!thread) continue
       discovered.add(thread.id)
@@ -259,7 +334,7 @@ export class HybridThreadStore implements ThreadStore {
       const rows = this.db.prepare('SELECT id FROM threads').all() as Array<{ id: string }>
       for (const row of rows) {
         if (discovered.has(row.id)) continue
-        if (!(await pathExists(this.threadDir(row.id)))) {
+        if (await this.isDeleted(row.id) || !(await pathExists(this.threadDir(row.id)))) {
           this.deleteIndexRow(row.id)
         }
       }
@@ -479,6 +554,7 @@ export class HybridThreadStore implements ThreadStore {
   private async listFromFilesystem(): Promise<ThreadSummary[]> {
     const summaries: ThreadSummary[] = []
     for (const threadId of await this.threadIdsFromFilesystem()) {
+      if (await this.isDeleted(threadId)) continue
       const thread = await this.readThreadFromDisk(threadId)
       if (thread) summaries.push(toThreadSummary(thread))
     }
@@ -495,6 +571,7 @@ export class HybridThreadStore implements ThreadStore {
   }
 
   private async rowHasReadableJsonl(row: ThreadRow): Promise<boolean> {
+    if (await this.isDeleted(row.id)) return false
     if (row.metadata_path !== this.metadataPath(row.id)) return false
     if (row.messages_path !== this.messagesPath(row.id)) return false
     if (row.events_path !== this.eventsPath(row.id)) return false
@@ -504,6 +581,18 @@ export class HybridThreadStore implements ThreadStore {
 
   private threadDir(threadId: string): string {
     return join(this.dataDir, threadId)
+  }
+
+  private deletedDir(): string {
+    return resolve(this.dataDir, '..', 'thread-tombstones')
+  }
+
+  private deletedMarkerPath(threadId: string): string {
+    return join(this.deletedDir(), `${encodeURIComponent(threadId)}.json`)
+  }
+
+  private async withThreadLifecycle<T>(threadId: string, operation: () => Promise<T>): Promise<T> {
+    return withFileMutationQueue(this.deletedMarkerPath(threadId), operation)
   }
 
   private metadataPath(threadId: string): string {

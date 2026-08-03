@@ -69,6 +69,7 @@ export function buildModelStepRequest({
   planTurnActive,
   prefix,
   reasoningEffort,
+  seed,
   requiredToolName,
   systemPrompt,
   textFallbacks,
@@ -85,6 +86,7 @@ export function buildModelStepRequest({
   planTurnActive: boolean
   prefix: TurnItem[]
   reasoningEffort?: string
+  seed?: number
   requiredToolName?: string
   systemPrompt?: string
   textFallbacks: readonly ModelTextAttachmentFallback[]
@@ -106,6 +108,7 @@ export function buildModelStepRequest({
     tools,
     ...(requiredToolName ? { requiredToolName } : {}),
     ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(seed === undefined ? {} : { seed }),
     abortSignal
   }
 }

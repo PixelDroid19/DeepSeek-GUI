@@ -80,6 +80,34 @@ describe('child agent executor', () => {
       ]
     })
     expect(seen[0]?.tools).toEqual([])
+    expect(seen[0]?.seed).toBeUndefined()
+  })
+
+  it('forwards an explicit sampling seed to the child model request', async () => {
+    const seen: ModelRequest[] = []
+    const executor = createChildAgentExecutor({
+      model: model([
+        { kind: 'assistant_text_delta', text: 'seeded child' },
+        { kind: 'completed', stopReason: 'stop' }
+      ], seen),
+      toolHost: new LocalToolHost({ registry: new CapabilityRegistry([]) }),
+      prefix: createImmutablePrefix({ systemPrompt: 'child system' }),
+      defaultModel: 'child-test',
+      nowIso: () => '2026-06-03T00:00:00.000Z'
+    })
+
+    await executor({
+      childId: 'child_seeded',
+      parentThreadId: 'thr_parent',
+      parentTurnId: 'turn_parent',
+      label: 'review',
+      prompt: 'Review the issue',
+      samplingSeed: 17,
+      signal: new AbortController().signal
+    })
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.seed).toBe(17)
   })
 
   it('fails the child run when the child loop cannot produce a completed turn', async () => {

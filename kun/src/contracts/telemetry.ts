@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { McpToolExecutionRecordSchema } from './mcp-tool-outcome.js'
 
 export const ToolExecutionRecordSchema = z
   .object({
@@ -12,7 +13,9 @@ export const ToolExecutionRecordSchema = z
     turnId: z.string(),
     startedAt: z.string(),
     durationMs: z.number().min(0),
-    isError: z.boolean()
+    isError: z.boolean(),
+    /** MCP-only reliability metadata; arguments are represented by a redacted hash. */
+    mcp: McpToolExecutionRecordSchema.optional()
   })
   .strict()
 

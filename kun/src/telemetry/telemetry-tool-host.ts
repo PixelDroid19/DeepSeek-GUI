@@ -6,6 +6,10 @@ import type {
 } from '../ports/tool-host.js'
 import type { TurnItem } from '../contracts/items.js'
 import type { ToolExecutionRecord } from '../contracts/telemetry.js'
+import {
+  McpToolExecutionRecordSchema,
+  type McpToolExecutionRecord
+} from '../contracts/mcp-tool-outcome.js'
 import { extractToolTarget } from './target-normalization.js'
 
 export type ToolExecutionObservation = {
@@ -68,6 +72,7 @@ export class TelemetryToolHost implements ToolHost {
     } finally {
       try {
         const target = extractToolTarget(call.toolName, call.arguments, context.workspace)
+        const mcp = mcpExecutionRecord(output, call.callId)
         this.observer.onToolExecution({
           record: {
             type: 'tool-execution',
@@ -79,7 +84,8 @@ export class TelemetryToolHost implements ToolHost {
             turnId: context.turnId,
             startedAt: startedAt.toISOString(),
             durationMs: Math.max(0, performance.now() - start),
-            isError
+            isError,
+            ...(mcp ? { mcp } : {})
           },
           workspace: context.workspace,
           ...(toolKind !== undefined ? { toolKind } : {}),
@@ -90,4 +96,14 @@ export class TelemetryToolHost implements ToolHost {
       }
     }
   }
+}
+
+function mcpExecutionRecord(output: unknown, callId: string): McpToolExecutionRecord | undefined {
+  if (!isRecord(output) || !isRecord(output.mcp)) return undefined
+  const parsed = McpToolExecutionRecordSchema.safeParse({ ...output.mcp, callId })
+  return parsed.success ? parsed.data : undefined
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }

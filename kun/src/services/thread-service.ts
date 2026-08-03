@@ -25,6 +25,12 @@ import { createThreadRecord, toThreadSummary, touchThread } from '../domain/thre
 import type { AgentSession } from '../domain/session.js'
 import { repairModelHistoryItems } from '../domain/model-history-repair.js'
 import type { RuntimeEventRecorder } from './runtime-event-recorder.js'
+import {
+  LeaseThreadMutationCoordinator,
+  getThreadEventCoordinator,
+  getThreadMutationCoordinator,
+  type ThreadMutationCoordinator
+} from './thread-mutation.js'
 import { withFileMutationQueue } from '../adapters/tool/file-mutation-queue.js'
 import { DEFAULT_KUN_MODEL } from '../config/kun-config.js'
 import { isGuiPlanRelativePath } from '../shared/gui-plan.js'
@@ -43,6 +49,10 @@ export type ThreadServiceOptions = {
   events: RuntimeEventRecorder
   ids: IdGenerator
   nowIso: () => string
+  /** Optional shared fence for durable read-mutate-write operations. */
+  threadMutations?: ThreadMutationCoordinator
+  /** Separate fence for event persistence and deletion ordering. */
+  eventMutations?: ThreadMutationCoordinator
 }
 
 export type ListThreadsOptions = ThreadStoreListOptions
@@ -77,6 +87,8 @@ export class ThreadService {
   private readonly events: RuntimeEventRecorder
   private readonly ids: IdGenerator
   private readonly nowIso: () => string
+  private readonly threadMutations: ThreadMutationCoordinator
+  private readonly eventMutations?: ThreadMutationCoordinator
 
   constructor(options: ThreadServiceOptions) {
     this.threadStore = options.threadStore
@@ -84,6 +96,23 @@ export class ThreadService {
     this.events = options.events
     this.ids = options.ids
     this.nowIso = options.nowIso
+    this.events.bindThreadDeletedChecker((threadId) => options.threadStore.isDeleted(threadId))
+    this.threadMutations = getThreadMutationCoordinator({
+      threadStore: options.threadStore,
+      coordinator: options.threadMutations
+    })
+    const recorderEventMutations = this.events.getEventCoordinator()
+    if (recorderEventMutations && options.eventMutations && recorderEventMutations !== options.eventMutations) {
+      throw new Error('event recorder and thread service use different event coordinators')
+    }
+    const eventMutations = recorderEventMutations ?? getThreadEventCoordinator({
+      threadMutations: this.threadMutations,
+      eventMutations: options.eventMutations
+    })
+    if (!eventMutations) {
+      throw new Error('thread event coordinator could not be resolved')
+    }
+    this.eventMutations = this.events.bindEventCoordinator(eventMutations)
   }
 
   async list(options: ListThreadsOptions = {}): Promise<ThreadSummary[]> {
@@ -126,7 +155,9 @@ export class ThreadService {
       ...(request.costBudgetUsd !== undefined ? { costBudgetUsd: request.costBudgetUsd } : {}),
       status: options.status
     })
-    await this.threadStore.upsert(thread)
+    await this.threadMutations.run(thread.id, async () => {
+      await this.persistNewThread(thread)
+    })
     await this.events.record({
       kind: 'thread_created',
       threadId: thread.id,
@@ -145,26 +176,29 @@ export class ThreadService {
     costBudgetWarningSent?: boolean
     relation?: ThreadRelation
   }): Promise<ThreadRecord> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    const { costBudgetUsd, costBudgetWarningSent, ...standardPatch } = patch
-    const merged: ThreadRecord = { ...current, ...standardPatch }
-    if (costBudgetUsd === null) {
-      delete (merged as { costBudgetUsd?: number }).costBudgetUsd
-      delete (merged as { costBudgetWarningSent?: boolean }).costBudgetWarningSent
-    } else if (costBudgetUsd !== undefined) {
-      merged.costBudgetUsd = costBudgetUsd
-      merged.costBudgetWarningSent = false
-    } else if (costBudgetWarningSent !== undefined) {
-      merged.costBudgetWarningSent = costBudgetWarningSent
-    }
-    if (patch.relation !== undefined && patch.relation !== 'side') {
-      // Promoting a side thread clears the parent link so the thread
-      // surfaces in the default list as a standalone primary thread.
-      delete (merged as { parentThreadId?: string }).parentThreadId
-    }
-    const updated = touchThread(merged, this.nowIso())
-    await this.threadStore.upsert(updated)
+    const updated = await this.threadMutations.run(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      const { costBudgetUsd, costBudgetWarningSent, ...standardPatch } = patch
+      const merged: ThreadRecord = { ...current, ...standardPatch }
+      if (costBudgetUsd === null) {
+        delete (merged as { costBudgetUsd?: number }).costBudgetUsd
+        delete (merged as { costBudgetWarningSent?: boolean }).costBudgetWarningSent
+      } else if (costBudgetUsd !== undefined) {
+        merged.costBudgetUsd = costBudgetUsd
+        merged.costBudgetWarningSent = false
+      } else if (costBudgetWarningSent !== undefined) {
+        merged.costBudgetWarningSent = costBudgetWarningSent
+      }
+      if (patch.relation !== undefined && patch.relation !== 'side') {
+        // Promoting a side thread clears the parent link so the thread
+        // surfaces in the default list as a standalone primary thread.
+        delete (merged as { parentThreadId?: string }).parentThreadId
+      }
+      const next = touchThread(merged, this.nowIso())
+      await this.threadStore.upsert(next)
+      return next
+    })
     await this.events.record({
       kind: 'thread_updated',
       threadId,
@@ -181,34 +215,36 @@ export class ThreadService {
   }
 
   async setGoal(threadId: string, request: SetThreadGoalRequest): Promise<ThreadGoal> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    if (!current.goal && !request.objective) {
-      throw new Error(`cannot update goal for thread ${threadId}: no goal exists`)
-    }
+    const goal = await this.threadMutations.run(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      if (!current.goal && !request.objective) {
+        throw new Error(`cannot update goal for thread ${threadId}: no goal exists`)
+      }
 
-    const now = this.nowIso()
-    const existing = current.goal
-    const objective = request.objective?.trim()
-    const goal: ThreadGoal = {
-      threadId,
-      objective: objective ?? existing?.objective ?? '',
-      status: request.status ?? (objective ? 'active' : existing?.status ?? 'active'),
-      ...(request.tokenBudget !== undefined
-        ? request.tokenBudget === null
-          ? {}
-          : { tokenBudget: request.tokenBudget }
-        : existing?.tokenBudget !== undefined
-          ? { tokenBudget: existing.tokenBudget }
-          : {}),
-      tokensUsed: existing?.tokensUsed ?? 0,
-      timeUsedSeconds: existing?.timeUsedSeconds ?? 0,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now
-    }
+      const now = this.nowIso()
+      const existing = current.goal
+      const objective = request.objective?.trim()
+      const nextGoal: ThreadGoal = {
+        threadId,
+        objective: objective ?? existing?.objective ?? '',
+        status: request.status ?? (objective ? 'active' : existing?.status ?? 'active'),
+        ...(request.tokenBudget !== undefined
+          ? request.tokenBudget === null
+            ? {}
+            : { tokenBudget: request.tokenBudget }
+          : existing?.tokenBudget !== undefined
+            ? { tokenBudget: existing.tokenBudget }
+            : {}),
+        tokensUsed: existing?.tokensUsed ?? 0,
+        timeUsedSeconds: existing?.timeUsedSeconds ?? 0,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now
+      }
 
-    const updated = touchThread({ ...current, goal }, now)
-    await this.threadStore.upsert(updated)
+      await this.threadStore.upsert(touchThread({ ...current, goal: nextGoal }, now))
+      return nextGoal
+    })
     await this.events.record({
       kind: 'goal_updated',
       threadId,
@@ -218,14 +254,16 @@ export class ThreadService {
   }
 
   async clearGoal(threadId: string): Promise<boolean> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    if (!current.goal) {
-      return false
-    }
-    const updated = touchThread({ ...current }, this.nowIso())
-    delete (updated as { goal?: ThreadGoal }).goal
-    await this.threadStore.upsert(updated)
+    const cleared = await this.threadMutations.run(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      if (!current.goal) return false
+      const updated = touchThread({ ...current }, this.nowIso())
+      delete (updated as { goal?: ThreadGoal }).goal
+      await this.threadStore.upsert(updated)
+      return true
+    })
+    if (!cleared) return false
     await this.events.record({
       kind: 'goal_cleared',
       threadId,
@@ -241,23 +279,25 @@ export class ThreadService {
   }
 
   async setTodos(threadId: string, request: SetThreadTodosRequest): Promise<ThreadTodoList> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    const now = this.nowIso()
-    const items = normalizeTodoItems({
-      rawItems: request.todos,
-      existingItems: current.todos?.items ?? [],
-      now,
-      ids: this.ids
+    const todos = await this.threadMutations.run(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      const now = this.nowIso()
+      const items = normalizeTodoItems({
+        rawItems: request.todos,
+        existingItems: current.todos?.items ?? [],
+        now,
+        ids: this.ids
+      })
+      await this.patchPlanMarkdownForTodoStatusChanges(current, items)
+      const nextTodos: ThreadTodoList = {
+        threadId,
+        items,
+        updatedAt: now
+      }
+      await this.threadStore.upsert(touchThread({ ...current, todos: nextTodos }, now))
+      return nextTodos
     })
-    await this.patchPlanMarkdownForTodoStatusChanges(current, items)
-    const todos: ThreadTodoList = {
-      threadId,
-      items,
-      updatedAt: now
-    }
-    const updated = touchThread({ ...current, todos }, now)
-    await this.threadStore.upsert(updated)
     await this.events.record({
       kind: 'todos_updated',
       threadId,
@@ -267,12 +307,16 @@ export class ThreadService {
   }
 
   async clearTodos(threadId: string): Promise<boolean> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    if (!current.todos) return false
-    const updated = touchThread({ ...current }, this.nowIso())
-    delete (updated as { todos?: ThreadTodoList }).todos
-    await this.threadStore.upsert(updated)
+    const cleared = await this.threadMutations.run(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      if (!current.todos) return false
+      const updated = touchThread({ ...current }, this.nowIso())
+      delete (updated as { todos?: ThreadTodoList }).todos
+      await this.threadStore.upsert(updated)
+      return true
+    })
+    if (!cleared) return false
     await this.events.record({
       kind: 'todos_cleared',
       threadId,
@@ -282,29 +326,31 @@ export class ThreadService {
   }
 
   async syncTodosFromPlan(threadId: string, options: SyncPlanTodosOptions): Promise<ThreadTodoList> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    const relativePath = normalizePlanRelativePath(options.relativePath)
-    if (!isGuiPlanRelativePath(relativePath)) {
-      throw new Error(`invalid GUI plan relative path: ${options.relativePath}`)
-    }
-    const now = this.nowIso()
-    const planItems = extractPlanTodos({
-      markdown: options.markdown,
-      planId: options.planId,
-      relativePath,
-      threadId,
-      now
+    const todos = await this.threadMutations.run(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      const relativePath = normalizePlanRelativePath(options.relativePath)
+      if (!isGuiPlanRelativePath(relativePath)) {
+        throw new Error(`invalid GUI plan relative path: ${options.relativePath}`)
+      }
+      const now = this.nowIso()
+      const planItems = extractPlanTodos({
+        markdown: options.markdown,
+        planId: options.planId,
+        relativePath,
+        threadId,
+        now
+      })
+      const nextTodos = mergePlanTodos({
+        threadId,
+        existing: current.todos ?? null,
+        planItems,
+        now,
+        preserveCompleted: options.preserveCompleted ?? true
+      })
+      await this.threadStore.upsert(touchThread({ ...current, todos: nextTodos }, now))
+      return nextTodos
     })
-    const todos = mergePlanTodos({
-      threadId,
-      existing: current.todos ?? null,
-      planItems,
-      now,
-      preserveCompleted: options.preserveCompleted ?? true
-    })
-    const updated = touchThread({ ...current, todos }, now)
-    await this.threadStore.upsert(updated)
     await this.events.record({
       kind: 'todos_updated',
       threadId,
@@ -356,52 +402,75 @@ export class ThreadService {
   }
 
   async delete(threadId: string): Promise<boolean> {
-    const ok = await this.threadStore.delete(threadId)
+    // Delete takes the event fence first, so a recorder either appends before
+    // deletion or observes the missing thread and rejects the late event.
+    let cancelledTurnIds: string[] = []
+    const remove = () => this.threadMutations.run(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      cancelledTurnIds = current?.turns
+        .filter((turn) => turn.status === 'running')
+        .map((turn) => turn.id) ?? []
+      return this.threadStore.delete(threadId)
+    })
+    const ok = this.eventMutations && this.eventMutations !== this.threadMutations
+      ? await this.eventMutations.run(threadId, remove)
+      : await remove()
     if (!ok) return false
+    const leaseCoordinator = this.threadMutations instanceof LeaseThreadMutationCoordinator
+      ? this.threadMutations
+      : undefined
+    if (leaseCoordinator) {
+      await Promise.all(cancelledTurnIds.map((turnId) =>
+        leaseCoordinator.leaseStore.releaseThread({ threadId, turnId }).catch(() => undefined)
+      ))
+    }
     return true
   }
 
   async fork(threadId: string, options: ForkThreadOptions = {}): Promise<ThreadRecord> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    const now = this.nowIso()
-    const forkId = this.ids.next('thr')
-    const relation: ThreadRelation = options.relation ?? 'fork'
-    // Snapshot semantics: clone each turn as it stands now. The parent
-    // loop keeps mutating its own record; we copy, never borrow.
-    const clonedTurns = current.turns.map((turn) =>
-      cloneTurnForFork(turn, forkId, now, { relation })
-    )
-    const clonedItems = clonedTurns.flatMap((turn) => turn.items)
-    const defaultTitle = relation === 'side' ? `${current.title} · side` : `${current.title} fork`
-    const fork = createThreadRecord({
-      id: forkId,
-      title: options.title?.trim() || defaultTitle,
-      workspace: current.workspace,
-      model: current.model,
-      mode: current.mode,
-      status: 'idle',
-      approvalPolicy: current.approvalPolicy,
-      sandboxMode: current.sandboxMode,
-      relation,
-      parentThreadId: current.id,
-      forkedFromThreadId: current.id,
-      forkedFromTitle: current.title,
-      forkedAt: now,
-      forkedFromMessageCount: clonedItems.filter((item) => item.kind === 'user_message').length,
-      forkedFromTurnCount: clonedTurns.length,
-      ...(current.todos ? { todos: cloneTodoListForThread(current.todos, forkId, now) } : {}),
-      createdAt: now
+    const record = await this.threadMutations.run(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      const now = this.nowIso()
+      const forkId = this.ids.next('thr')
+      const relation: ThreadRelation = options.relation ?? 'fork'
+      // Snapshot semantics: clone each turn as it stands now. The parent
+      // loop keeps mutating its own record; we copy, never borrow.
+      const clonedTurns = current.turns.map((turn) =>
+        cloneTurnForFork(turn, forkId, now, { relation })
+      )
+      const clonedItems = clonedTurns.flatMap((turn) => turn.items)
+      const defaultTitle = relation === 'side' ? `${current.title} · side` : `${current.title} fork`
+      const fork = createThreadRecord({
+        id: forkId,
+        title: options.title?.trim() || defaultTitle,
+        workspace: current.workspace,
+        model: current.model,
+        mode: current.mode,
+        status: 'idle',
+        approvalPolicy: current.approvalPolicy,
+        sandboxMode: current.sandboxMode,
+        relation,
+        parentThreadId: current.id,
+        forkedFromThreadId: current.id,
+        forkedFromTitle: current.title,
+        forkedAt: now,
+        forkedFromMessageCount: clonedItems.filter((item) => item.kind === 'user_message').length,
+        forkedFromTurnCount: clonedTurns.length,
+        ...(current.todos ? { todos: cloneTodoListForThread(current.todos, forkId, now) } : {}),
+        createdAt: now
+      })
+      const next: ThreadRecord = {
+        ...fork,
+        updatedAt: now,
+        turns: clonedTurns
+      }
+      for (const item of clonedItems) {
+        await this.sessionStore.appendItem(next.id, item)
+      }
+      await this.persistNewThread(next)
+      return next
     })
-    const record: ThreadRecord = {
-      ...fork,
-      updatedAt: now,
-      turns: clonedTurns
-    }
-    for (const item of clonedItems) {
-      await this.sessionStore.appendItem(record.id, item)
-    }
-    await this.threadStore.upsert(record)
     await this.events.record({
       kind: 'thread_created',
       threadId: record.id,
@@ -414,68 +483,76 @@ export class ThreadService {
     sessionId: string,
     options: ResumeSessionOptions = {}
   ): Promise<ResumeSessionResult> {
-    const sourceThread = await this.threadStore.get(sessionId)
-    const sourceSession = await this.sessionStore.loadSession(sessionId)
-    const sourceItems = sourceThread
-      ? sourceThread.turns.flatMap((turn) => turn.items)
-      : sourceSession?.items.length
-        ? sourceSession.items
-        : await this.sessionStore.loadItems(sessionId)
-    if (!sourceThread && !sourceSession && sourceItems.length === 0) {
-      throw new Error(`session not found: ${sessionId}`)
-    }
+    const result = await this.threadMutations.run(sessionId, async () => {
+      const sourceThread = await this.threadStore.get(sessionId)
+      const sourceSession = await this.sessionStore.loadSession(sessionId)
+      const sourceItems = sourceThread
+        ? sourceThread.turns.flatMap((turn) => turn.items)
+        : sourceSession?.items.length
+          ? sourceSession.items
+          : await this.sessionStore.loadItems(sessionId)
+      if (!sourceThread && !sourceSession && sourceItems.length === 0) {
+        throw new Error(`session not found: ${sessionId}`)
+      }
 
-    const now = this.nowIso()
-    const threadId = this.ids.next('thr')
-    const sourceTurns = sourceThread
-      ? sourceThread.turns
-      : rebuildTurnsFromItems({
-          items: sourceItems,
-          threadId,
-          fallbackTurnId: sourceSession?.turnId ?? this.ids.next('turn'),
-          fallbackPrompt: `Resumed session ${sessionId.slice(0, 8)}`,
-          now
-        })
-    const clonedTurns = sourceTurns.map((turn) => cloneTurnForThread(turn, threadId, now))
-    const clonedItems = clonedTurns.flatMap((turn) => turn.items)
-    const sourceTitle = sourceThread?.title ?? `Session ${sessionId.slice(0, 8)}`
-    const record = createThreadRecord({
-      id: threadId,
-      title: `${sourceTitle} resumed`,
-      workspace: options.workspace ?? sourceThread?.workspace ?? '~',
-      model: options.model ?? sourceThread?.model ?? DEFAULT_KUN_MODEL,
-      mode: options.mode ?? sourceThread?.mode ?? 'agent',
-      status: 'idle',
-      approvalPolicy: sourceThread?.approvalPolicy,
-      sandboxMode: sourceThread?.sandboxMode,
-      forkedFromThreadId: sourceThread?.id,
-      forkedFromTitle: sourceThread?.title,
-      forkedAt: now,
-      forkedFromMessageCount: clonedItems.filter((item) => item.kind === 'user_message').length,
-      forkedFromTurnCount: clonedTurns.length,
-      ...(sourceThread?.todos ? { todos: cloneTodoListForThread(sourceThread.todos, threadId, now) } : {}),
-      createdAt: now
+      const now = this.nowIso()
+      const threadId = this.ids.next('thr')
+      const sourceTurns = sourceThread
+        ? sourceThread.turns
+        : rebuildTurnsFromItems({
+            items: sourceItems,
+            threadId,
+            fallbackTurnId: sourceSession?.turnId ?? this.ids.next('turn'),
+            fallbackPrompt: `Resumed session ${sessionId.slice(0, 8)}`,
+            now
+          })
+      const clonedTurns = sourceTurns.map((turn) => cloneTurnForThread(turn, threadId, now))
+      const clonedItems = clonedTurns.flatMap((turn) => turn.items)
+      const sourceTitle = sourceThread?.title ?? `Session ${sessionId.slice(0, 8)}`
+      const record = createThreadRecord({
+        id: threadId,
+        title: `${sourceTitle} resumed`,
+        workspace: options.workspace ?? sourceThread?.workspace ?? '~',
+        model: options.model ?? sourceThread?.model ?? DEFAULT_KUN_MODEL,
+        mode: options.mode ?? sourceThread?.mode ?? 'agent',
+        status: 'idle',
+        approvalPolicy: sourceThread?.approvalPolicy,
+        sandboxMode: sourceThread?.sandboxMode,
+        forkedFromThreadId: sourceThread?.id,
+        forkedFromTitle: sourceThread?.title,
+        forkedAt: now,
+        forkedFromMessageCount: clonedItems.filter((item) => item.kind === 'user_message').length,
+        forkedFromTurnCount: clonedTurns.length,
+        ...(sourceThread?.todos ? { todos: cloneTodoListForThread(sourceThread.todos, threadId, now) } : {}),
+        createdAt: now
+      })
+      const resumed: ThreadRecord = {
+        ...record,
+        updatedAt: now,
+        turns: clonedTurns
+      }
+      for (const item of clonedItems) {
+        await this.sessionStore.appendItem(resumed.id, item)
+      }
+      await this.persistNewThread(resumed)
+      await this.sessionStore.upsertSession(toSessionSnapshot(resumed, now))
+      return { thread: resumed, sessionId, messageCount: clonedItems.length }
     })
-    const resumed: ThreadRecord = {
-      ...record,
-      updatedAt: now,
-      turns: clonedTurns
-    }
-    for (const item of clonedItems) {
-      await this.sessionStore.appendItem(resumed.id, item)
-    }
-    await this.threadStore.upsert(resumed)
-    await this.sessionStore.upsertSession(toSessionSnapshot(resumed, now))
     await this.events.record({
       kind: 'thread_created',
-      threadId: resumed.id,
-      title: resumed.title
+      threadId: result.thread.id,
+      title: result.thread.title
     })
-    return { thread: resumed, sessionId, messageCount: clonedItems.length }
+    return result
   }
 
   toSummary(thread: ThreadRecord): ThreadSummary {
     return toThreadSummary(thread)
+  }
+
+  private async persistNewThread(thread: ThreadRecord): Promise<ThreadRecord> {
+    if (this.threadStore.create) return this.threadStore.create(thread)
+    return this.threadStore.upsert(thread)
   }
 }
 

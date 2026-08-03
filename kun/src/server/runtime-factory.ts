@@ -69,6 +69,10 @@ import { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
 import { ThreadService } from '../services/thread-service.js'
 import { TurnService } from '../services/turn-service.js'
 import { FileTurnLeaseStore } from '../services/adaptive-trial-lease.js'
+import {
+  LeaseEventSequenceCoordinator,
+  LeaseThreadMutationCoordinator
+} from '../services/thread-mutation.js'
 import { ReviewService } from '../services/review-service.js'
 import { UsageService } from '../services/usage-service.js'
 import type { UsageEvent } from '../contracts/events.js'
@@ -224,6 +228,7 @@ export async function createKunServeRuntime(
   })
   const sessionStore = stores.sessionStore
   const threadStore = stores.threadStore
+  const threadDeleted = threadDeletedForStore(threadStore)
   const approvalGate = new InMemoryApprovalGate()
   const userInputGate = new InMemoryUserInputGate()
   const workspaceInspector = new LocalWorkspaceInspector()
@@ -238,7 +243,21 @@ export async function createKunServeRuntime(
   const ids = new RandomIdGenerator()
   const nowIso = () => new Date().toISOString()
   const allocateSeq = (threadId: string) => eventBus.allocateSeq(threadId)
-  const events = new RuntimeEventRecorder({ eventBus, sessionStore, allocateSeq, nowIso })
+  const turnLeases = new FileTurnLeaseStore({
+    dataDir: options.dataDir,
+    deployment: options.storage?.deployment
+  })
+  const threadMutations = new LeaseThreadMutationCoordinator({ turnLeases })
+  const eventMutations = new LeaseEventSequenceCoordinator({ turnLeases })
+  const events = new RuntimeEventRecorder({
+    eventBus,
+    sessionStore,
+    threadDeleted,
+    allocateSeq,
+    nowIso,
+    threadMutations,
+    eventMutations
+  })
   const rolesConfig = { ...DEFAULT_ROLES_CONFIG, ...(options.roles ?? {}) }
   const prefix = createImmutablePrefix({
     systemPrompt: KUN_SYSTEM_PROMPT,
@@ -258,10 +277,19 @@ export async function createKunServeRuntime(
     ids,
     nowIso,
     usage: usageService,
-    turnLeases: new FileTurnLeaseStore({ dataDir: options.dataDir }),
+    turnLeases,
+    threadMutations,
     roles: rolesConfig
   })
-  const threadService = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
+  const threadService = new ThreadService({
+    threadStore,
+    sessionStore,
+    events,
+    ids,
+    nowIso,
+    threadMutations,
+    eventMutations
+  })
   await seedUsageCarryover({ threadStore, sessionStore, usageService })
   const modelClient = new DeepseekCompatModelClient({
     baseUrl: options.baseUrl,
@@ -297,9 +325,10 @@ export async function createKunServeRuntime(
     : undefined
   const memoryStore = options.capabilities?.memory.enabled
     ? new FileMemoryStore({
-        rootDir: join(options.dataDir, 'memory'),
-        config: options.capabilities.memory,
-        nowIso
+      rootDir: join(options.dataDir, 'memory'),
+      config: options.capabilities.memory,
+      retrievalBudgetBytes: options.capabilities.memory.retrievalBudgetBytes,
+      nowIso
       })
     : undefined
   const actionLevelsConfig = { ...DEFAULT_ACTION_LEVELS_CONFIG, ...(options.actionLevels ?? {}) }
@@ -445,6 +474,7 @@ export async function createKunServeRuntime(
     usage: usageService,
     events,
     turns: turnService,
+    threadMutations,
     inflight,
     steering,
     compactor,
@@ -761,7 +791,8 @@ function adaptiveObservation(input: {
       : {}),
     ...(result?.isError
       ? { command: { exitCode: 1, error: boundedToolObservation(result.output) } }
-      : result ? { evidenceFingerprint: boundedToolObservation(result.output) } : {})
+      : result ? { evidenceFingerprint: boundedToolObservation(result.output) } : {}),
+    ...(result ? { evalScore: result.isError ? 0 : 1 } : {})
   }
 }
 
@@ -1281,13 +1312,14 @@ async function createPersistentStores(input: {
   if (storage.backend === 'file') {
     return {
       sessionStore: new FileSessionStore({ dataDir: input.dataDir }),
-      threadStore: new FileThreadStore({ dataDir: input.dataDir })
+      threadStore: new FileThreadStore({ dataDir: input.dataDir, deployment: storage.deployment })
     }
   }
 
   const threadStore = new HybridThreadStore({
     dataDir: input.dataDir,
     sqlitePath: storage.sqlitePath ? expandHomePath(storage.sqlitePath) : undefined,
+    deployment: storage.deployment,
     nowIso: input.nowIso
   })
   await threadStore.ready()
@@ -1301,6 +1333,10 @@ async function createPersistentStores(input: {
       threadStore.close()
     }
   }
+}
+
+function threadDeletedForStore(store: ThreadStore): (threadId: string) => Promise<boolean> {
+  return (threadId) => store.isDeleted(threadId)
 }
 
 export async function seedUsageCarryover(input: {

@@ -2,6 +2,12 @@ import type {
   McpSearchConfig,
   McpServerConfig
 } from '../../contracts/capabilities.js'
+import {
+  createMcpToolOutcome,
+  type McpToolCallResult,
+  type McpToolOutcome
+} from '../../contracts/mcp-tool-outcome.js'
+import { redactSecretText } from '../../config/secret-redaction.js'
 import type { ToolHostContext } from '../../ports/tool-host.js'
 import type { CapabilityToolProvider } from './capability-registry.js'
 import { LocalToolHost, type LocalTool } from './local-tool-host.js'
@@ -59,8 +65,8 @@ const ACTION_SYNONYMS: Record<string, string[]> = {
 export type McpSearchClientLike = {
   callTool(
     input: { name: string; arguments: Record<string, unknown> },
-    options?: { signal?: AbortSignal; timeout?: number }
-  ): Promise<unknown>
+    options?: { signal?: AbortSignal; timeout?: number; catalogFingerprint?: string }
+  ): Promise<McpToolCallResult>
 }
 
 export type McpSearchToolDescriptor = {
@@ -117,7 +123,7 @@ export type McpSearchCatalogState = {
 export type McpSearchProviderOptions = {
   config: McpSearchConfig
   state: McpSearchCatalogState
-  refreshCatalog: () => Promise<McpSearchCatalogRecord[]>
+  refreshCatalog: (signal?: AbortSignal) => Promise<McpSearchCatalogRecord[]>
   isServerTrusted: (server: McpServerConfig, workspace: string) => boolean
 }
 
@@ -240,6 +246,7 @@ function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
             query,
             totalIndexed: options.state.records.length,
             searchedTools: records.length,
+            catalogFingerprint: options.state.catalogFingerprint,
             results: results.map(formatSearchResult)
           }
         }
@@ -260,7 +267,7 @@ function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
         const toolId = stringArg(args.toolId)
         const record = resolveTrustedRecord(options, context, toolId)
         if (!record) return { output: { error: `unknown MCP tool: ${toolId}` }, isError: true }
-        return { output: describeRecord(record) }
+        return { output: describeRecord(record, options.state.catalogFingerprint) }
       }
     }),
     LocalToolHost.defineTool({
@@ -270,28 +277,96 @@ function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
         type: 'object',
         properties: {
           toolId: { type: 'string', description: 'Canonical MCP tool id in the form serverId/toolName.' },
-          arguments: { type: 'object', description: 'Arguments matching the MCP tool input schema.' }
+          arguments: { type: 'object', description: 'Arguments matching the MCP tool input schema.' },
+          catalogFingerprint: {
+            type: 'string',
+            description: 'Fingerprint returned by mcp_describe. It binds this call to the reviewed catalog.'
+          }
         },
-        required: ['toolId', 'arguments']
+        required: ['toolId', 'arguments', 'catalogFingerprint']
       },
       policy: 'on-request',
       execute: async (args, context) => {
         const toolId = stringArg(args.toolId)
+        const initialRecord = resolveTrustedRecord(options, context, toolId)
+        if (!initialRecord) return { output: { error: `unknown MCP tool: ${toolId}` }, isError: true }
+        if (!isObject(args.arguments)) {
+          return { output: { error: 'arguments must be an object' }, isError: true }
+        }
+        const callArgs = args.arguments
+        const plannedCatalogFingerprint = optionalStringArg(args.catalogFingerprint)
+        if (!plannedCatalogFingerprint) {
+          return failedMcpSearchCall({
+            record: initialRecord,
+            argumentsValue: callArgs,
+            catalogFingerprint: options.state.catalogFingerprint,
+            plannedCatalogFingerprint: undefined,
+            catalog: 'not_checked',
+            error: 'catalogFingerprint from mcp_describe is required before mcp_call'
+          })
+        }
+        if (!isCatalogFingerprint(plannedCatalogFingerprint)) {
+          return { output: { error: 'catalogFingerprint must be a 16-character lowercase hexadecimal hash' }, isError: true }
+        }
+
+        try {
+          await options.refreshCatalog(context.abortSignal)
+        } catch (error) {
+          const cancelled = context.abortSignal.aborted
+          return failedMcpSearchCall({
+            record: initialRecord,
+            argumentsValue: callArgs,
+            catalogFingerprint: options.state.catalogFingerprint,
+            plannedCatalogFingerprint,
+            catalog: 'not_checked',
+            error: cancelled ? 'MCP catalog revalidation was cancelled' : errorMessage(error),
+            ...(cancelled ? { state: 'cancelled' as const } : {})
+          })
+        }
+
+        const currentCatalogFingerprint = options.state.catalogFingerprint
+        if (plannedCatalogFingerprint && plannedCatalogFingerprint !== currentCatalogFingerprint) {
+          return failedMcpSearchCall({
+            record: initialRecord,
+            argumentsValue: callArgs,
+            catalogFingerprint: currentCatalogFingerprint,
+            plannedCatalogFingerprint,
+            catalog: 'drifted',
+            error: 'MCP catalog changed after mcp_describe; run mcp_search and mcp_describe again'
+          })
+        }
+
         const record = resolveTrustedRecord(options, context, toolId)
-        if (!record) return { output: { error: `unknown MCP tool: ${toolId}` }, isError: true }
-        const callArgs = objectArg(args.arguments)
-        const result = await record.client.callTool(
+        if (!record) {
+          return failedMcpSearchCall({
+            record: initialRecord,
+            argumentsValue: callArgs,
+            catalogFingerprint: currentCatalogFingerprint,
+            plannedCatalogFingerprint,
+            catalog: 'drifted',
+            error: `MCP tool is no longer available: ${toolId}`
+          })
+        }
+        const execution = await record.client.callTool(
           { name: record.descriptor.name, arguments: callArgs },
-          { signal: context.abortSignal, timeout: record.server.timeoutMs }
+          {
+            signal: context.abortSignal,
+            timeout: record.server.timeoutMs,
+            ...(plannedCatalogFingerprint ? { catalogFingerprint: plannedCatalogFingerprint } : {})
+          }
         )
         return {
           output: {
             serverId: record.serverId,
             toolName: record.descriptor.name,
             toolId: record.toolId,
-            result
+            ...(execution.result !== undefined ? { result: execution.result } : {}),
+            mcp: {
+              ...execution.mcp,
+              ...(currentCatalogFingerprint ? { catalogFingerprint: currentCatalogFingerprint } : {})
+            }
           },
-          isError: typeof result === 'object' && result !== null && (result as { isError?: boolean }).isError === true
+          isError: execution.isError
         }
       }
     }),
@@ -303,8 +378,8 @@ function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
         properties: {}
       },
       policy: 'auto',
-      execute: async () => {
-        const records = await options.refreshCatalog()
+      execute: async (_args, context) => {
+        const records = await options.refreshCatalog(context.abortSignal)
         return {
           output: {
             refreshedAt: options.state.lastRefreshedAt,
@@ -329,6 +404,58 @@ function resolveTrustedRecord(
 ): McpSearchCatalogRecord | undefined {
   if (!toolId) return undefined
   return trustedRecords(options, context).find((record) => record.toolId === toolId)
+}
+
+function failedMcpSearchCall(input: {
+  record: McpSearchCatalogRecord
+  argumentsValue: Record<string, unknown>
+  catalogFingerprint: string | undefined
+  plannedCatalogFingerprint: string | undefined
+  catalog: McpToolOutcome['postcondition']['catalog']
+  error: string
+  state?: 'failed_known' | 'cancelled'
+}): { output: Record<string, unknown>; isError: true } {
+  const state = input.state ?? 'failed_known'
+  const response = state === 'cancelled' ? 'cancelled' : 'not_sent'
+  const annotations = input.record.descriptor.annotations
+  const mcp = createMcpToolOutcome({
+    state,
+    stateHistory: state === 'cancelled'
+      ? ['planned', 'approved', 'cancelled']
+      : ['planned', 'approved', 'failed_known'],
+    attempt: 1,
+    arguments: input.argumentsValue,
+    catalogFingerprint: input.catalogFingerprint ?? '0000000000000000',
+    ...(input.plannedCatalogFingerprint ? { plannedCatalogFingerprint: input.plannedCatalogFingerprint } : {}),
+    permissions: {
+      workspaceTrusted: true,
+      trustScope: input.record.server.trustScope,
+      policy: input.record.policy,
+      annotationHints: {
+        readOnly: annotations?.readOnlyHint === true,
+        idempotent: annotations?.idempotentHint === true,
+        destructive: annotations?.destructiveHint === true,
+        openWorld: annotations?.openWorldHint === true
+      }
+    },
+    timeoutMs: input.record.server.timeoutMs,
+    error: redactSecretText(input.error),
+    postcondition: {
+      catalog: input.catalog,
+      inputSchema: 'not_checked',
+      outputSchema: 'not_checked',
+      response
+    }
+  })
+  return {
+    output: {
+      serverId: input.record.serverId,
+      toolName: input.record.descriptor.name,
+      toolId: input.record.toolId,
+      mcp
+    },
+    isError: true
+  }
 }
 
 function searchRecords(
@@ -494,7 +621,10 @@ function formatSearchResult(result: SearchResult): Record<string, unknown> {
   }
 }
 
-function describeRecord(record: McpSearchCatalogRecord): Record<string, unknown> {
+function describeRecord(
+  record: McpSearchCatalogRecord,
+  catalogFingerprint: string | undefined
+): Record<string, unknown> {
   const descriptor = record.descriptor
   return {
     toolId: record.toolId,
@@ -509,6 +639,7 @@ function describeRecord(record: McpSearchCatalogRecord): Record<string, unknown>
     ...(descriptor.execution ? { execution: descriptor.execution } : {}),
     ...(descriptor.icons ? { icons: descriptor.icons } : {}),
     ...(descriptor._meta ? { meta: descriptor._meta } : {}),
+    ...(catalogFingerprint ? { catalogFingerprint } : {}),
     policy: record.policy
   }
 }
@@ -583,14 +714,24 @@ function stringArg(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+function optionalStringArg(value: unknown): string | undefined {
+  return typeof value === 'string' ? value.trim() || undefined : undefined
+}
+
+function isCatalogFingerprint(value: string): boolean {
+  return /^[a-f0-9]{16}$/.test(value)
+}
+
 function numberArg(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-function objectArg(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {}
+function isObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function clampPositiveInt(value: number | undefined, fallback: number, max: number): number {

@@ -16,9 +16,13 @@ import type { ApprovalGate } from '../src/ports/approval-gate.js'
 import { RandomIdGenerator } from '../src/ports/id-generator.js'
 import { RuntimeEventRecorder } from '../src/services/runtime-event-recorder.js'
 import { ThreadService } from '../src/services/thread-service.js'
+import {
+  LeaseEventSequenceCoordinator,
+  LeaseThreadMutationCoordinator
+} from '../src/services/thread-mutation.js'
 import { TurnService } from '../src/services/turn-service.js'
 import { UsageService } from '../src/services/usage-service.js'
-import { RigorousPipeline } from '../src/orchestration/rigorous-pipeline.js'
+import { enforceHarnessPathConstraints, RigorousPipeline } from '../src/orchestration/rigorous-pipeline.js'
 import { EvalSuiteStore } from '../src/evals/eval-suite-store.js'
 import { LocalToolHost } from '../src/adapters/tool/local-tool-host.js'
 import { VerificationCriterionResultSchema } from '../src/contracts/roles.js'
@@ -60,11 +64,16 @@ function makeRuntime(
   const threadStore = new InMemoryThreadStore()
   const ids = new RandomIdGenerator()
   const nowIso = () => '2026-06-11T00:00:00.000Z'
+  const threadMutations = new LeaseThreadMutationCoordinator()
+  const eventMutations = new LeaseEventSequenceCoordinator({ turnLeases: threadMutations.leaseStore })
   const events = new RuntimeEventRecorder({
     eventBus,
     sessionStore,
+    threadDeleted: async (threadId) => threadStore.isDeleted(threadId),
     allocateSeq: (threadId) => eventBus.allocateSeq(threadId),
-    nowIso
+    nowIso,
+    threadMutations,
+    eventMutations
   })
   const usage = new UsageService()
   const turns = new TurnService({
@@ -77,14 +86,17 @@ function makeRuntime(
     ids,
     nowIso,
     usage,
-    roles: { enabled: true }
+    roles: { enabled: true },
+    threadMutations
   })
   const threads = new ThreadService({
     threadStore,
     sessionStore,
     events,
     ids,
-    nowIso
+    nowIso,
+    threadMutations,
+    eventMutations
   })
   const approvalGate: ApprovalGate = {
     request: async () => 'allow',
@@ -117,11 +129,15 @@ function makeTurnRuntimeWithRoles(enabled: boolean) {
   const threadStore = new InMemoryThreadStore()
   const ids = new RandomIdGenerator()
   const nowIso = () => '2026-06-11T00:00:00.000Z'
+  const threadMutations = new LeaseThreadMutationCoordinator()
+  const eventMutations = new LeaseEventSequenceCoordinator({ turnLeases: threadMutations.leaseStore })
   const events = new RuntimeEventRecorder({
     eventBus,
     sessionStore,
     allocateSeq: (threadId) => eventBus.allocateSeq(threadId),
-    nowIso
+    nowIso,
+    threadMutations,
+    eventMutations
   })
   const usage = new UsageService()
   const turns = new TurnService({
@@ -134,19 +150,35 @@ function makeTurnRuntimeWithRoles(enabled: boolean) {
     ids,
     nowIso,
     usage,
-    roles: { enabled }
+    roles: { enabled },
+    threadMutations
   })
   const threads = new ThreadService({
     threadStore,
     sessionStore,
     events,
     ids,
-    nowIso
+    nowIso,
+    threadMutations,
+    eventMutations
   })
   return { ...runtime, threadStore, sessionStore, turns, threads }
 }
 
 describe('rigorous pipeline', () => {
+  it('enforces both allowed and forbidden path constraints over tracked and untracked paths', () => {
+    expect(enforceHarnessPathConstraints({
+      ...REQUIRED_HARNESS_TASK,
+      constraints: [
+        { kind: 'allowed-path', value: 'src/**' },
+        { kind: 'forbidden-path', value: 'src/generated/**' }
+      ]
+    }, ['src/parser.ts', 'src/generated/output.ts', 'docs/README.md'])).toEqual({
+      forbiddenPaths: ['src/generated/output.ts'],
+      outOfScopePaths: ['docs/README.md']
+    })
+  })
+
   it('keeps legacy verifier criteria parseable with empty evidence IDs', () => {
     expect(VerificationCriterionResultSchema.parse({
       criterion: 'focused tests pass',
@@ -360,8 +392,12 @@ describe('rigorous pipeline', () => {
   it('pins every rigorous harness stage to the explicit Flash model', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-flash-pin-'))
     const models: Array<string | undefined> = []
+    const roles: string[] = []
+    const samplingSeeds: Array<number | undefined> = []
     const child: ChildRunExecutor = async (input) => {
       models.push(input.model)
+      roles.push(input.label ?? '')
+      samplingSeeds.push(input.samplingSeed)
       if (input.artifactKind === 'plan') {
         return { summary: 'plan', artifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] } }
       }
@@ -386,7 +422,7 @@ describe('rigorous pipeline', () => {
         prompt: 'do work',
         model: 'deepseek-v4-flash',
         mode: 'rigorous',
-        harnessTask: REQUIRED_HARNESS_TASK
+        harnessTask: { ...REQUIRED_HARNESS_TASK, seed: 17 }
       }
     })
 
@@ -394,6 +430,13 @@ describe('rigorous pipeline', () => {
 
     expect(models.length).toBeGreaterThanOrEqual(4)
     expect(models.every((model) => model === 'deepseek-v4-flash')).toBe(true)
+    expect(roles).toEqual(expect.arrayContaining([
+      'rigorous:planner',
+      'rigorous:executor',
+      'rigorous:verifier',
+      'rigorous:reviewer'
+    ]))
+    expect(samplingSeeds).toEqual(samplingSeeds.map(() => 17))
     await rm(workspace, { recursive: true, force: true })
   })
 
@@ -552,10 +595,12 @@ describe('rigorous pipeline', () => {
     await execFileAsync('git', ['init', '--quiet', workspace])
     const roles: string[] = []
     const models: Array<string | undefined> = []
+    const samplingSeeds: Array<number | undefined> = []
     let reviewerRuns = 0
     const child: ChildRunExecutor = async (input) => {
       roles.push(input.label ?? '')
       models.push(input.model)
+      samplingSeeds.push(input.samplingSeed)
       if (input.artifactKind === 'execution') {
         return { summary: 'execution', artifact: { summary: 'changed', filesChanged: [], deviationsFromPlan: [] } }
       }
@@ -567,7 +612,21 @@ describe('rigorous pipeline', () => {
         return { summary: 'review', artifact: { verdict: 'fix', reasons: ['initial diagnosis'] } }
       }
       if (reviewerRuns === 2) {
-        return { summary: 'critic', artifact: { verdict: 'fix', reasons: ['new hypothesis: isolate the failed state'] } }
+        return {
+          summary: 'critic',
+          artifact: {
+            verdict: 'fix',
+            reasons: [
+              'ANCHOR: the repeated action produced no new workspace evidence',
+              'EVIDENCE: diff:workspace',
+              'TARGET: the current workspace diff',
+              'ACTION: inspect the failed state and apply one focused correction',
+              'VERIFY: rerun the required acceptance command',
+              'STOP: stop after this bounded correction if the command remains failed',
+              'WHY_DIFFERENT: the previous attempt repeated the same action without a new correction'
+            ]
+          }
+        }
       }
       return { summary: 'review', artifact: { verdict: 'ship', reasons: ['fixed'] } }
     }
@@ -584,6 +643,7 @@ describe('rigorous pipeline', () => {
         planArtifact: { intent: 'recover', risks: [], steps: ['fix'], verificationCriteria: [] },
         harnessTask: {
           ...REQUIRED_HARNESS_TASK,
+          seed: 17,
           executionPolicy: 'adaptive',
           acceptanceCriteria: [{
             id: 'optional',
@@ -615,6 +675,7 @@ describe('rigorous pipeline', () => {
       'rigorous:reviewer'
     ])
     expect(models).toEqual(models.map(() => 'harness-pinned-model'))
+    expect(samplingSeeds).toEqual(samplingSeeds.map(() => 17))
     const items = await runtime.sessionStore.loadItems(thread.id)
     expect(items).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'review', title: 'Adaptive recovery checkpoint' }),
@@ -1397,6 +1458,47 @@ describe('rigorous pipeline', () => {
         title: 'Rigorous completion gate',
         reviewText: expect.stringContaining('kun/src/generated/unsafe.ts')
       })
+    ]))
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('detects a forbidden tracked edit hidden with assume-unchanged', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-harness-assume-unchanged-'))
+    await mkdir(join(workspace, 'kun/src/generated'), { recursive: true })
+    await writeFile(join(workspace, 'kun/src/generated/unsafe.ts'), 'baseline\n', 'utf8')
+    await execFileAsync('git', ['init', '--quiet', workspace])
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.email', 'kun@example.test'])
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.name', 'Kun Test'])
+    await execFileAsync('git', ['-C', workspace, 'add', '.'])
+    await execFileAsync('git', ['-C', workspace, 'commit', '--quiet', '-m', 'baseline'])
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        await writeFile(join(workspace, 'kun/src/generated/unsafe.ts'), 'mutated\n', 'utf8')
+        await execFileAsync('git', ['-C', workspace, 'update-index', '--assume-unchanged', 'kun/src/generated/unsafe.ts'])
+        return { summary: 'execution', artifact: { summary: 's', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return {
+          summary: 'verification',
+          artifact: { findings: [], criteriaResults: [{ criterion: 'acceptance', pass: true, evidenceIds: ['check:acceptance'] }], commandsRun: [] }
+        }
+      }
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({ title: 'Assume unchanged', workspace, model: 'thread-model', mode: 'agent' })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work', model: 'harness-test-model', mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
+        harnessTask: { ...REQUIRED_HARNESS_TASK, constraints: [{ kind: 'forbidden-path', value: 'kun/src/generated/**' }] }
+      }
+    })
+    expect(await runtime.pipeline.run(thread.id, turn.turnId)).toBe('failed')
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'review', title: 'Rigorous completion gate', reviewText: expect.stringContaining('unsafe.ts') })
     ]))
     await rm(workspace, { recursive: true, force: true })
   })

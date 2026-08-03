@@ -146,6 +146,9 @@ function classifyCommandSegment(segment: string): RuntimeActionClassification {
   if (CREDENTIAL_PATH_RE.test(segment)) {
     return { level: 4, reason: 'command references credential-sensitive path' }
   }
+  if (/[<>]/.test(segment) || /\/dev\/tcp\//i.test(segment) || /\/dev\/udp\//i.test(segment)) {
+    return { level: 3, reason: 'shell redirection or network pseudo-device requires approval' }
+  }
   // Skip leading environment assignments (`FOO=bar cmd ...`) so they
   // cannot mask the real head command from classification.
   const tokens = tokenizeShellWords(segment)

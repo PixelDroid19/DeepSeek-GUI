@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { InMemoryEventBus } from '../src/adapters/in-memory-event-bus.js'
+import { FileThreadStore } from '../src/adapters/file/file-thread-store.js'
 import { HybridSessionStore, HybridThreadStore } from '../src/adapters/hybrid/index.js'
 import { makeUserItem } from '../src/domain/item.js'
 import { appendTurnItem, createTurnRecord, startTurn } from '../src/domain/turn.js'
@@ -60,6 +61,34 @@ describe('HybridThreadStore', () => {
       kind: 'user_message',
       text: 'hello from jsonl'
     })
+  })
+
+  it('treats a pending deletion tombstone as authoritative', async () => {
+    const record = createThreadRecord({
+      id: 'thr_pending_delete',
+      title: 'Pending delete',
+      workspace: '/tmp/project',
+      model: 'deepseek-chat'
+    })
+    const markerDir = join(dataDir, 'thread-tombstones')
+    await mkdir(markerDir, { recursive: true })
+
+    const fileStore = new FileThreadStore({ dataDir })
+    await fileStore.upsert(record)
+    await writeFile(join(markerDir, `${encodeURIComponent(record.id)}.json`), '{}', 'utf8')
+    expect(await fileStore.isDeleted(record.id)).toBe(true)
+    await expect(fileStore.get(record.id)).resolves.toBeNull()
+    await expect(fileStore.exists(record.id)).resolves.toBe(false)
+    await expect(fileStore.list()).resolves.toEqual([])
+
+    const hybrid = await createHybridStores()
+    const hybridRecord = { ...record, id: 'thr_pending_delete_hybrid' }
+    await hybrid.threadStore.upsert(hybridRecord)
+    await writeFile(join(markerDir, `${encodeURIComponent(hybridRecord.id)}.json`), '{}', 'utf8')
+    expect(await hybrid.threadStore.isDeleted(hybridRecord.id)).toBe(true)
+    await expect(hybrid.threadStore.get(hybridRecord.id)).resolves.toBeNull()
+    await expect(hybrid.threadStore.exists(hybridRecord.id)).resolves.toBe(false)
+    await expect(hybrid.threadStore.list()).resolves.toEqual([])
   })
 
   it('rebuilds the SQLite index from JSONL after the database is deleted', async () => {

@@ -24,6 +24,7 @@ import {
   shellCommandArgs,
   shellRuntimeInfo,
   spawnCapture,
+  toolChildEnvironment,
   terminateSpawnTree,
   waitForSpawnExit
 } from './builtin-tool-utils.js'
@@ -136,7 +137,7 @@ export function createLocalBashOperations(): BashLocalToolOperations {
       const { shell, args, name } = shellRuntimeInfo()
       const child = spawn(shell, shellCommandArgs({ shell, args }, command), {
         cwd,
-        env: process.env,
+        env: toolChildEnvironment(),
         detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true

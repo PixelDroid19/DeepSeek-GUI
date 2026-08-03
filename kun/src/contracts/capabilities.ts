@@ -180,11 +180,17 @@ export const AttachmentsCapabilityConfig = CapabilityToggleConfig.extend({
 }).strict()
 export type AttachmentsCapabilityConfig = z.infer<typeof AttachmentsCapabilityConfig>
 
+export const DEFAULT_MEMORY_RETRIEVAL_BUDGET_BYTES = 6 * 1024
+
 export const MemoryCapabilityConfig = CapabilityToggleConfig.extend({
   scopes: z.array(z.enum(['user', 'workspace', 'project'])).default(['user', 'workspace', 'project']),
-  maxInjectedRecords: z.number().int().positive().default(8)
+  maxInjectedRecords: z.number().int().positive().default(8),
+  retrievalBudgetBytes: z.number().int().positive().default(DEFAULT_MEMORY_RETRIEVAL_BUDGET_BYTES)
 }).strict()
-export type MemoryCapabilityConfig = z.infer<typeof MemoryCapabilityConfig>
+/** Optional in hand-built adapter fixtures; schema parsing supplies the default. */
+export type MemoryCapabilityConfig = Omit<z.infer<typeof MemoryCapabilityConfig>, 'retrievalBudgetBytes'> & {
+  retrievalBudgetBytes?: number
+}
 
 export const KunCapabilitiesConfig = z
   .object({
@@ -249,7 +255,8 @@ export const RuntimeCapabilityManifest = z
     }).strict(),
     memory: RuntimeCapabilityState.extend({
       scopes: z.array(z.enum(['user', 'workspace', 'project'])),
-      maxInjectedRecords: z.number().int().positive()
+      maxInjectedRecords: z.number().int().positive(),
+      retrievalBudgetBytes: z.number().int().positive()
     }).strict()
   })
   .strict()
@@ -379,7 +386,8 @@ export function buildRuntimeCapabilityManifest(input: {
         input.memory?.reason ?? 'memory store is unavailable'
       ),
       scopes: config.memory.scopes,
-      maxInjectedRecords: config.memory.maxInjectedRecords
+      maxInjectedRecords: config.memory.maxInjectedRecords,
+      retrievalBudgetBytes: config.memory.retrievalBudgetBytes
     }
   })
 }

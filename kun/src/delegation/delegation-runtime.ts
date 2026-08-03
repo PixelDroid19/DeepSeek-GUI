@@ -53,6 +53,8 @@ export type ChildRunExecutor = (input: {
   workspace?: string
   model?: string
   reasoningEffort?: TurnReasoningEffort
+  /** Optional harness sampling seed forwarded to every child model step. */
+  samplingSeed?: number
   allowedToolNames?: readonly string[]
   sandboxMode?: SandboxMode
   systemPromptAddendum?: string

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { z } from 'zod'
@@ -10,6 +11,8 @@ import {
 import { MODEL_ENDPOINT_FORMATS } from '../contracts/model-endpoint-format.js'
 
 const SHA256_PREFIX = 'sha256:'
+const MAX_SNAPSHOT_PATHS = 512
+const cleanWorkspaceSnapshotCache = new Map<string, { head: string; digest: string }>()
 const CREDENTIAL_FIELD_NAMES = new Set([
   'apikey',
   'authorization',
@@ -41,11 +44,15 @@ export const BenchmarkManifestIdentitySchema = z.object({
   endpointFormat: z.enum(MODEL_ENDPOINT_FORMATS),
   environmentDigest: z.string().min(1),
   workspaceDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  workspaceDigestTrusted: z.boolean().default(false),
+  /** Digest of the model-visible task contract excluding the execution policy. */
+  taskDefinitionDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
   family: z.string().min(1),
   dataset: z.string().min(1),
   datasetVersion: z.string().min(1),
   taskId: z.string().min(1),
   budgets: HarnessTrialBudgetsSchema,
+  attemptId: z.string().trim().min(1).max(256).optional(),
   seed: z.number().int().nonnegative().max(2_147_483_647).optional(),
   remoteModelRevision: z.string().min(1).optional()
 }).strict()
@@ -73,16 +80,22 @@ export function parseBenchmarkManifest(input: unknown): LoadedBenchmarkManifest 
   }
 
   const canonicalJson = canonicalJsonFor(manifest)
+  const snapshot = workspaceSnapshot(manifest.workspaceRoot)
   const identity = BenchmarkManifestIdentitySchema.parse({
     model: manifest.model,
     endpointFormat: manifest.endpointFormat,
     environmentDigest: manifest.environmentDigest,
-    workspaceDigest: sha256(`workspace:${resolve(manifest.workspaceRoot)}`),
+    workspaceDigest: manifest.workspaceSnapshotDigest ?? snapshot.digest,
+    workspaceDigestTrusted: snapshot.trusted && (
+      manifest.workspaceSnapshotDigest === undefined || manifest.workspaceSnapshotDigest === snapshot.digest
+    ),
+    taskDefinitionDigest: taskDefinitionDigest(manifest.task),
     family: manifest.task.benchmark?.family ?? 'unclassified',
     dataset: manifest.task.benchmark?.dataset ?? 'unclassified',
     datasetVersion: manifest.task.benchmark?.version ?? 'unversioned',
     taskId: manifest.task.id,
     budgets: manifest.task.budgets,
+    ...(manifest.attemptId === undefined ? {} : { attemptId: manifest.attemptId }),
     ...(manifest.seed === undefined ? {} : { seed: manifest.seed }),
     ...(manifest.remoteModelRevision ? { remoteModelRevision: manifest.remoteModelRevision } : {})
   })
@@ -93,6 +106,16 @@ export function parseBenchmarkManifest(input: unknown): LoadedBenchmarkManifest 
     canonicalJson,
     identity
   })
+}
+
+/**
+ * Fairness identity for the task stimulus. Baseline and adaptive executions
+ * intentionally vary only executionPolicy/adaptivePolicy; objective,
+ * criteria, constraints, checks, budgets, and benchmark identity stay fixed.
+ */
+export function taskDefinitionDigest(task: HarnessTrialManifest['task']): string {
+  const { executionPolicy: _executionPolicy, adaptivePolicy: _adaptivePolicy, ...fairnessTask } = task
+  return sha256(canonicalJsonFor(fairnessTask))
 }
 
 /** Reads a JSON manifest without retaining or echoing source contents on error. */
@@ -148,6 +171,76 @@ export const benchmarkManifestHash = hashBenchmarkManifest
 
 export function sha256(value: string): string {
   return `${SHA256_PREFIX}${createHash('sha256').update(value).digest('hex')}`
+}
+
+/**
+ * Hash the materialized Git snapshot rather than the workspace path. This is
+ * synchronous because manifest parsing is intentionally pure from the caller's
+ * perspective; a trusted controller may provide workspaceSnapshotDigest when
+ * it owns a container/archive snapshot instead.
+ */
+export function workspaceSnapshotDigest(workspaceRoot: string): string {
+  return workspaceSnapshot(workspaceRoot).digest
+}
+
+export function workspaceSnapshotAttestation(workspaceRoot: string): { digest: string; trusted: boolean } {
+  return workspaceSnapshot(workspaceRoot)
+}
+
+function workspaceSnapshot(workspaceRoot: string): { digest: string; trusted: boolean } {
+  const workspace = resolve(workspaceRoot)
+  try {
+    const head = gitSnapshotOutput(workspace, ['rev-parse', 'HEAD'])
+    const status = gitSnapshotOutput(workspace, ['status', '--porcelain=v1', '--untracked-files=all'])
+    const ignored = gitSnapshotPaths(workspace, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory'])
+    if (!status.trim() && ignored.length === 0) {
+      const cached = cleanWorkspaceSnapshotCache.get(workspace)
+      if (cached?.head === head.trim()) return { digest: cached.digest, trusted: true }
+      const digest = sha256(canonicalJsonFor({ head: head.trim(), clean: true }))
+      cleanWorkspaceSnapshotCache.set(workspace, { head: head.trim(), digest })
+      return { digest, trusted: true }
+    }
+    const unstaged = gitSnapshotOutput(workspace, ['diff', '--raw', '--no-ext-diff', '-z'])
+    const staged = gitSnapshotOutput(workspace, ['diff', '--cached', '--raw', '--no-ext-diff', '-z'])
+    const changed = gitSnapshotPaths(workspace, ['diff', '--name-only', '--no-ext-diff'])
+    const stagedChanged = gitSnapshotPaths(workspace, ['diff', '--cached', '--name-only', '--no-ext-diff'])
+    const untracked = gitSnapshotPaths(workspace, ['ls-files', '--others', '--exclude-standard'])
+    // Directory-level ignored paths are intentionally represented as an
+    // incomplete snapshot rather than hashed recursively in the parser.
+    const uniquePaths = [...new Set([...changed, ...stagedChanged, ...untracked, ...ignored])].sort()
+    const complete = uniquePaths.length <= MAX_SNAPSHOT_PATHS
+    const pathHashes = uniquePaths.slice(0, MAX_SNAPSHOT_PATHS).map((path) => {
+      try {
+        return `${path}\u0000${gitSnapshotOutput(workspace, ['hash-object', '--', path])}`
+      } catch {
+        return `${path}\u0000missing`
+      }
+    })
+    return {
+      digest: sha256(canonicalJsonFor({
+      head,
+      unstaged,
+      staged,
+      pathHashes,
+      ...(complete ? {} : { untrackedOverflow: uniquePaths.length })
+      })),
+      trusted: complete && ignored.length === 0
+    }
+  } catch {
+    return { digest: sha256(`workspace-unavailable:${workspace}`), trusted: false }
+  }
+}
+
+function gitSnapshotOutput(workspace: string, args: readonly string[]): string {
+  return execFileSync('git', ['-C', workspace, ...args], {
+    encoding: 'utf8',
+    maxBuffer: 8 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'ignore']
+  })
+}
+
+function gitSnapshotPaths(workspace: string, args: readonly string[]): string[] {
+  return gitSnapshotOutput(workspace, [...args, '-z']).split('\0').filter(Boolean)
 }
 
 function assertNoCredentialFields(value: unknown, seen = new WeakSet<object>()): void {

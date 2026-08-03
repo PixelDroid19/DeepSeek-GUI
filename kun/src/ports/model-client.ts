@@ -54,6 +54,8 @@ export type ModelRequest = {
   /** Optional sampling controls for classifier-style calls. */
   temperature?: number
   topP?: number
+  /** Optional provider sampling seed pinned by a harness trial. */
+  seed?: number
   /** Optional structured response mode for short JSON classifier paths. */
   responseFormat?: 'json_object'
   /**

@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { readFile, readdir, stat } from 'node:fs/promises'
+import { lstat, readFile, readdir, realpath, stat } from 'node:fs/promises'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { ToolHostContext } from '../../ports/tool-host.js'
@@ -22,6 +22,22 @@ const POWERSHELL_UTF8_OUTPUT_PREAMBLE = [
   '[Console]::OutputEncoding = $OutputEncoding',
   'try { [Console]::InputEncoding = $OutputEncoding } catch {}'
 ].join('; ')
+const TOOL_ENV_ALLOWLIST = new Set([
+  'PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'TZ', 'TERM',
+  'SHELL', 'USER', 'LOGNAME', 'PWD', 'OLDPWD', 'NODE_ENV', 'CI',
+  'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR',
+  'SystemRoot', 'ComSpec', 'PATHEXT', 'USERPROFILE'
+])
+
+/** Environment visible to model-controlled child processes; provider secrets stay in the client only. */
+export function toolChildEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const safe: NodeJS.ProcessEnv = {}
+  for (const key of TOOL_ENV_ALLOWLIST) {
+    const value = source[key]
+    if (typeof value === 'string') safe[key] = value
+  }
+  return safe
+}
 
 function firstLookupResult(
   lookup: SpawnSyncLike,
@@ -72,6 +88,33 @@ export function resolveWorkspacePath(inputPath: string, context: ToolHostContext
     workspaceRoot: root,
     absolutePath,
     relativePath: relativePath || '.'
+  }
+}
+
+/** Resolve the materialized path and reject symlink escapes before I/O. */
+export async function assertWorkspacePathContained(
+  absolutePath: string,
+  workspace: string,
+  allowMissingLeaf = false
+): Promise<void> {
+  const root = await realpath(workspaceRoot(workspace))
+  let probe = absolutePath
+  let resolvedTarget: string
+  while (true) {
+    try {
+      const stats = await lstat(probe)
+      if (stats.isSymbolicLink()) throw new Error('symbolic links are not allowed for workspace tool paths')
+      resolvedTarget = await realpath(probe)
+      break
+    } catch (error) {
+      const missing = error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT'
+      if (!missing || !allowMissingLeaf || probe === dirname(probe)) throw error
+      probe = dirname(probe)
+    }
+  }
+  const escaped = relative(root, resolvedTarget)
+  if (escaped === '..' || escaped.startsWith(`..${sep}`) || isAbsolute(escaped)) {
+    throw new Error('workspace tool path resolves outside the workspace root')
   }
 }
 
@@ -387,7 +430,7 @@ export async function spawnCapture(
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   const child = spawn(file, args, {
     cwd: options.cwd,
-    env: process.env,
+    env: toolChildEnvironment(),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true
   })

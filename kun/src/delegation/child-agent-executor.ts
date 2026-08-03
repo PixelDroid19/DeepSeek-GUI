@@ -25,6 +25,10 @@ import type { ToolHost } from '../ports/tool-host.js'
 import type { SkillRuntime } from '../skills/skill-runtime.js'
 import { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
 import { ThreadService } from '../services/thread-service.js'
+import {
+  LeaseEventSequenceCoordinator,
+  LeaseThreadMutationCoordinator
+} from '../services/thread-mutation.js'
 import { TurnService } from '../services/turn-service.js'
 import { UsageService } from '../services/usage-service.js'
 import type { ChildRunExecutor } from './delegation-runtime.js'
@@ -56,6 +60,8 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
     const ids = new RandomIdGenerator()
     const inflight = new InflightTracker()
     const steering = new SteeringQueue()
+    const threadMutations = new LeaseThreadMutationCoordinator()
+    const eventMutations = new LeaseEventSequenceCoordinator({ turnLeases: threadMutations.leaseStore })
     const compactor = new ContextCompactor({
       contextCompaction: options.contextCompaction,
       models: options.models
@@ -63,8 +69,11 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
     const events = new RuntimeEventRecorder({
       eventBus,
       sessionStore,
+      threadDeleted: async (threadId) => threadStore.isDeleted(threadId),
       allocateSeq: (threadId) => eventBus.allocateSeq(threadId),
-      nowIso
+      nowIso,
+      threadMutations,
+      eventMutations
     })
     const turns = new TurnService({
       threadStore,
@@ -75,14 +84,17 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
       compactor,
       ids,
       nowIso,
-      usage
+      usage,
+      threadMutations
     })
     const threads = new ThreadService({
       threadStore,
       sessionStore,
       events,
       ids,
-      nowIso
+      nowIso,
+      threadMutations,
+      eventMutations
     })
     const childPrefix = input.systemPromptAddendum?.trim()
       ? createImmutablePrefix({
@@ -104,6 +116,7 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
       usage,
       events,
       turns,
+      threadMutations,
       inflight,
       steering,
       compactor,
@@ -150,7 +163,9 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
     if (input.signal.aborted) abortChild()
     else input.signal.addEventListener('abort', abortChild, { once: true })
     try {
-      const status = await loop.runTurn(thread.id, started.turnId)
+      const status = await loop.runTurn(thread.id, started.turnId, {
+        ...(input.samplingSeed === undefined ? {} : { samplingSeed: input.samplingSeed })
+      })
       const runtimeError = (await sessionStore.loadEventsSince(thread.id, 0))
         .find((event) => event.kind === 'error' && event.turnId === started.turnId)
       if (runtimeError?.kind === 'error') {
@@ -219,7 +234,7 @@ function childThreadTitle(childId: string, label?: string): string {
 function summarizeChildTurn(
   items: readonly TurnItem[],
   turnId: string,
-  status: 'completed' | 'failed' | 'aborted'
+  status: 'completed' | 'failed' | 'aborted' | 'escalated'
 ): string {
   const turnItems = items.filter((item) => item.turnId === turnId)
   const assistantText = turnItems

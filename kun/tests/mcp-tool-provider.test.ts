@@ -10,6 +10,7 @@ import {
 import { REDACTED_SECRET } from '../src/config/secret-redaction.js'
 import { KunCapabilitiesConfig, type McpServerConfig } from '../src/contracts/capabilities.js'
 import type { ToolHostContext } from '../src/ports/tool-host.js'
+import { TelemetryToolHost } from '../src/telemetry/telemetry-tool-host.js'
 
 function buildContext(workspace: string): ToolHostContext {
   return {
@@ -208,17 +209,25 @@ describe('MCP tool provider', () => {
       toolName: 'mcp_describe',
       arguments: { toolId: 'github/search_issues' }
     }, context)
+    const catalogFingerprint = describe.item.kind === 'tool_result'
+      ? (describe.item.output as { catalogFingerprint?: string }).catalogFingerprint
+      : undefined
     if (describe.item.kind === 'tool_result') {
       expect(describe.item.output).toMatchObject({
         toolId: 'github/search_issues',
-        toolName: 'search_issues'
+        toolName: 'search_issues',
+        catalogFingerprint: expect.any(String)
       })
     }
 
     const call = await host.execute({
       callId: 'call_tool',
       toolName: 'mcp_call',
-      arguments: { toolId: 'github/search_issues', arguments: { query: 'bug' } }
+      arguments: {
+        toolId: 'github/search_issues',
+        arguments: { query: 'bug' },
+        catalogFingerprint
+      }
     }, context)
     if (call.item.kind === 'tool_result') {
       expect(call.item.output).toMatchObject({
@@ -345,9 +354,10 @@ describe('MCP tool provider', () => {
     expect(callOptions[0]?.signal).toBe(controller.signal)
   })
 
-  it('reconnects and retries once when an MCP tool call fails', async () => {
+  it('does not retry a read-only MCP call when delivery is not proven by the SDK', async () => {
     let factories = 0
     let closes = 0
+    let calls = 0
     const config = KunCapabilitiesConfig.parse({
       mcp: {
         enabled: true,
@@ -364,7 +374,6 @@ describe('MCP tool provider', () => {
     const built = await buildMcpToolProviders(config.mcp, {
       clientFactory: async () => {
         factories += 1
-        const instance = factories
         return {
           async listTools() {
             return {
@@ -378,8 +387,10 @@ describe('MCP tool provider', () => {
             }
           },
           async callTool() {
-            if (instance === 1) throw new Error('stale connection')
-            return { ok: true, instance }
+            calls += 1
+            throw Object.assign(new Error('connection failed before send'), {
+              mcpDelivery: 'pre-send' as const
+            })
           },
           async close() {
             closes += 1
@@ -394,11 +405,598 @@ describe('MCP tool provider', () => {
       arguments: {}
     }, buildContext('/tmp/project'))
 
-    expect(factories).toBe(2)
-    expect(closes).toBe(1)
+    expect(factories).toBe(1)
+    expect(closes).toBe(0)
+    expect(calls).toBe(1)
+    expect(result.item.kind === 'tool_result' ? result.item.isError : false).toBe(true)
     expect(result.item.kind === 'tool_result' ? result.item.output : {}).toMatchObject({
-      result: { ok: true, instance: 2 }
+      mcp: {
+        state: 'failed_unknown',
+        attempt: 1,
+        postcondition: { response: 'unknown' }
+      }
     })
+  })
+
+  it('does not retry a mutating MCP call after an uncertain failure', async () => {
+    let factories = 0
+    let calls = 0
+    const config = KunCapabilitiesConfig.parse({
+      mcp: {
+        enabled: true,
+        servers: {
+          github: {
+            transport: 'stdio',
+            command: 'node',
+            trustScope: 'workspace',
+            trustedWorkspaceRoots: ['/tmp/project']
+          }
+        }
+      }
+    })
+    const built = await buildMcpToolProviders(config.mcp, {
+      clientFactory: async () => {
+        factories += 1
+        return {
+          async listTools() {
+            return {
+              tools: [{
+                name: 'create_issue',
+                inputSchema: { type: 'object' },
+                annotations: { destructiveHint: true }
+              }]
+            }
+          },
+          async callTool() {
+            calls += 1
+            throw Object.assign(new Error('connection failed before send'), {
+              mcpDelivery: 'pre-send' as const
+            })
+          },
+          async close() {
+            // no-op
+          }
+        }
+      }
+    })
+    const host = new LocalToolHost({ registry: new CapabilityRegistry(built.providers) })
+
+    const result = await host.execute({
+      callId: 'call_mutation',
+      toolName: 'mcp_github_create_issue',
+      arguments: {}
+    }, buildContext('/tmp/project'))
+
+    expect(factories).toBe(1)
+    expect(calls).toBe(1)
+    expect(result.item.kind === 'tool_result' ? result.item.isError : false).toBe(true)
+    expect(result.item.kind === 'tool_result' ? result.item.output : {}).toMatchObject({
+      mcp: {
+        state: 'failed_unknown',
+        attempt: 1
+      }
+    })
+  })
+
+  it('does not blindly repeat an MCP call whose delivery is uncertain', async () => {
+    let factories = 0
+    let calls = 0
+    const config = KunCapabilitiesConfig.parse({
+      mcp: {
+        enabled: true,
+        servers: {
+          github: {
+            transport: 'stdio',
+            command: 'node',
+            trustScope: 'workspace',
+            trustedWorkspaceRoots: ['/tmp/project']
+          }
+        }
+      }
+    })
+    const built = await buildMcpToolProviders(config.mcp, {
+      clientFactory: async () => {
+        factories += 1
+        return {
+          async listTools() {
+            return {
+              tools: [{
+                name: 'read_issue',
+                inputSchema: { type: 'object' },
+                annotations: { readOnlyHint: true }
+              }]
+            }
+          },
+          async callTool() {
+            calls += 1
+            throw new Error('socket reset after request dispatch')
+          },
+          async close() {
+            // no-op
+          }
+        }
+      }
+    })
+    const host = new LocalToolHost({ registry: new CapabilityRegistry(built.providers) })
+
+    const result = await host.execute({
+      callId: 'call_unknown',
+      toolName: 'mcp_github_read_issue',
+      arguments: {}
+    }, buildContext('/tmp/project'))
+
+    expect(factories).toBe(1)
+    expect(calls).toBe(1)
+    expect(result.item.kind === 'tool_result' ? result.item.isError : false).toBe(true)
+    expect(result.item.kind === 'tool_result' ? result.item.output : {}).toMatchObject({
+      mcp: {
+        state: 'failed_unknown',
+        attempt: 1
+      }
+    })
+  })
+
+  it('keeps a cancellation after dispatch as failed_unknown', async () => {
+    let calls = 0
+    const controller = new AbortController()
+    const config = KunCapabilitiesConfig.parse({
+      mcp: {
+        enabled: true,
+        servers: {
+          github: {
+            transport: 'stdio',
+            command: 'node',
+            trustScope: 'workspace',
+            trustedWorkspaceRoots: ['/tmp/project']
+          }
+        }
+      }
+    })
+    const built = await buildMcpToolProviders(config.mcp, {
+      clientFactory: async () => ({
+        async listTools() {
+          return {
+            tools: [{
+              name: 'create_issue',
+              inputSchema: { type: 'object' },
+              annotations: { destructiveHint: true }
+            }]
+          }
+        },
+        async callTool() {
+          calls += 1
+          controller.abort()
+          throw new Error('request cancelled after dispatch')
+        },
+        async close() {
+          // no-op
+        }
+      })
+    })
+    const host = new LocalToolHost({ registry: new CapabilityRegistry(built.providers) })
+
+    const result = await host.execute({
+      callId: 'call_cancelled_after_send',
+      toolName: 'mcp_github_create_issue',
+      arguments: {}
+    }, { ...buildContext('/tmp/project'), abortSignal: controller.signal })
+
+    expect(calls).toBe(1)
+    expect(result.item.kind === 'tool_result' ? result.item.isError : false).toBe(true)
+    expect(result.item.kind === 'tool_result' ? result.item.output : {}).toMatchObject({
+      mcp: {
+        state: 'failed_unknown',
+        postcondition: { response: 'unknown' }
+      }
+    })
+  })
+
+  it('rejects MCP input that does not match the advertised JSON schema before sending it', async () => {
+    let calls = 0
+    const config = KunCapabilitiesConfig.parse({
+      mcp: {
+        enabled: true,
+        servers: {
+          github: {
+            transport: 'stdio',
+            command: 'node',
+            trustScope: 'workspace',
+            trustedWorkspaceRoots: ['/tmp/project']
+          }
+        }
+      }
+    })
+    const built = await buildMcpToolProviders(config.mcp, {
+      clientFactory: async () => ({
+        async listTools() {
+          return {
+            tools: [{
+              name: 'read_issue',
+              inputSchema: {
+                type: 'object',
+                properties: { issueId: { type: 'string' } },
+                required: ['issueId']
+              },
+              annotations: { readOnlyHint: true }
+            }]
+          }
+        },
+        async callTool() {
+          calls += 1
+          return { structuredContent: { issueId: '42' } }
+        },
+        async close() {
+          // no-op
+        }
+      })
+    })
+    const host = new LocalToolHost({ registry: new CapabilityRegistry(built.providers) })
+
+    const result = await host.execute({
+      callId: 'call_invalid_input',
+      toolName: 'mcp_github_read_issue',
+      arguments: {}
+    }, buildContext('/tmp/project'))
+
+    expect(calls).toBe(0)
+    expect(result.item.kind === 'tool_result' ? result.item.isError : false).toBe(true)
+    expect(result.item.kind === 'tool_result' ? result.item.output : {}).toMatchObject({
+      mcp: {
+        state: 'failed_known',
+        postcondition: {
+          inputSchema: 'invalid',
+          response: 'not_sent'
+        }
+      }
+    })
+  })
+
+  it('marks an acknowledged MCP response invalid when structured output violates its schema', async () => {
+    let calls = 0
+    const config = KunCapabilitiesConfig.parse({
+      mcp: {
+        enabled: true,
+        servers: {
+          github: {
+            transport: 'stdio',
+            command: 'node',
+            trustScope: 'workspace',
+            trustedWorkspaceRoots: ['/tmp/project']
+          }
+        }
+      }
+    })
+    const built = await buildMcpToolProviders(config.mcp, {
+      clientFactory: async () => ({
+        async listTools() {
+          return {
+            tools: [{
+              name: 'read_issue',
+              inputSchema: { type: 'object' },
+              outputSchema: {
+                type: 'object',
+                properties: { issueId: { type: 'string' } },
+                required: ['issueId']
+              },
+              annotations: { readOnlyHint: true }
+            }]
+          }
+        },
+        async callTool() {
+          calls += 1
+          return { structuredContent: {} }
+        },
+        async close() {
+          // no-op
+        }
+      })
+    })
+    const host = new LocalToolHost({ registry: new CapabilityRegistry(built.providers) })
+
+    const result = await host.execute({
+      callId: 'call_invalid_output',
+      toolName: 'mcp_github_read_issue',
+      arguments: {}
+    }, buildContext('/tmp/project'))
+
+    expect(calls).toBe(1)
+    expect(result.item.kind === 'tool_result' ? result.item.isError : false).toBe(true)
+    expect(result.item.kind === 'tool_result' ? result.item.output : {}).toMatchObject({
+      mcp: {
+        state: 'failed_known',
+        postcondition: {
+          outputSchema: 'invalid',
+          response: 'acknowledged'
+        }
+      }
+    })
+  })
+
+  it('isolates same-$id schemas advertised by distinct MCP tools', async () => {
+    const calls: string[] = []
+    const config = KunCapabilitiesConfig.parse({
+      mcp: {
+        enabled: true,
+        servers: {
+          github: {
+            transport: 'stdio',
+            command: 'node',
+            trustScope: 'workspace',
+            trustedWorkspaceRoots: ['/tmp/project']
+          }
+        }
+      }
+    })
+    const built = await buildMcpToolProviders(config.mcp, {
+      clientFactory: async () => ({
+        async listTools() {
+          return {
+            tools: [
+              {
+                name: 'read_text_issue',
+                inputSchema: {
+                  $id: 'https://mcp.example.test/schemas/issue',
+                  type: 'object',
+                  properties: { issueId: { type: 'string' } },
+                  required: ['issueId']
+                },
+                annotations: { readOnlyHint: true }
+              },
+              {
+                name: 'read_number_issue',
+                inputSchema: {
+                  $id: 'https://mcp.example.test/schemas/issue',
+                  type: 'object',
+                  properties: { issueId: { type: 'number' } },
+                  required: ['issueId']
+                },
+                annotations: { readOnlyHint: true }
+              }
+            ]
+          }
+        },
+        async callTool(input) {
+          calls.push(input.name)
+          return { structuredContent: { ok: true } }
+        },
+        async close() {
+          // no-op
+        }
+      })
+    })
+    const host = new LocalToolHost({ registry: new CapabilityRegistry(built.providers) })
+    const context = buildContext('/tmp/project')
+
+    await host.execute({
+      callId: 'call_text_schema',
+      toolName: 'mcp_github_read_text_issue',
+      arguments: { issueId: '42' }
+    }, context)
+    const numberResult = await host.execute({
+      callId: 'call_number_schema',
+      toolName: 'mcp_github_read_number_issue',
+      arguments: { issueId: 42 }
+    }, context)
+
+    expect(calls).toEqual(['read_text_issue', 'read_number_issue'])
+    expect(numberResult.item.kind === 'tool_result' ? numberResult.item.isError : true).toBe(false)
+  })
+
+  it('requires the mcp_describe catalog fingerprint before mcp_call', async () => {
+    let calls = 0
+    const config = KunCapabilitiesConfig.parse({
+      mcp: {
+        enabled: true,
+        search: { enabled: true, mode: 'search' },
+        servers: {
+          github: {
+            transport: 'stdio',
+            command: 'node',
+            trustScope: 'workspace',
+            trustedWorkspaceRoots: ['/tmp/project']
+          }
+        }
+      }
+    })
+    const built = await buildMcpToolProviders(config.mcp, {
+      clientFactory: async () => ({
+        async listTools() {
+          return {
+            tools: [{
+              name: 'read_issue',
+              inputSchema: {
+                type: 'object',
+                properties: { issueId: { type: 'string' } },
+                required: ['issueId']
+              },
+              annotations: { readOnlyHint: true }
+            }]
+          }
+        },
+        async callTool() {
+          calls += 1
+          return { structuredContent: { issueId: '42' } }
+        },
+        async close() {
+          // no-op
+        }
+      })
+    })
+    const host = new LocalToolHost({ registry: new CapabilityRegistry(built.providers) })
+
+    const result = await host.execute({
+      callId: 'call_without_catalog_fingerprint',
+      toolName: 'mcp_call',
+      arguments: { toolId: 'github/read_issue', arguments: { issueId: '42' } }
+    }, buildContext('/tmp/project'))
+
+    expect(calls).toBe(0)
+    expect(result.item.kind === 'tool_result' ? result.item.isError : false).toBe(true)
+    expect(result.item.kind === 'tool_result' ? result.item.output : {}).toMatchObject({
+      mcp: {
+        state: 'failed_known',
+        postcondition: { response: 'not_sent' }
+      }
+    })
+  })
+
+  it('revalidates the described MCP catalog fingerprint before sending mcp_call', async () => {
+    let revisedCatalog = false
+    let calls = 0
+    const config = KunCapabilitiesConfig.parse({
+      mcp: {
+        enabled: true,
+        search: { enabled: true, mode: 'search' },
+        servers: {
+          github: {
+            transport: 'stdio',
+            command: 'node',
+            trustScope: 'workspace',
+            trustedWorkspaceRoots: ['/tmp/project']
+          }
+        }
+      }
+    })
+    const built = await buildMcpToolProviders(config.mcp, {
+      clientFactory: async () => ({
+        async listTools() {
+          return {
+            tools: [{
+              name: 'read_issue',
+              description: 'Read an issue',
+              inputSchema: revisedCatalog
+                ? {
+                    type: 'object',
+                    properties: {
+                      issueId: { type: 'string' },
+                      includeComments: { type: 'boolean' }
+                    },
+                    required: ['issueId']
+                  }
+                : {
+                    type: 'object',
+                    properties: { issueId: { type: 'string' } },
+                    required: ['issueId']
+                  },
+              annotations: { readOnlyHint: true }
+            }]
+          }
+        },
+        async callTool() {
+          calls += 1
+          return { structuredContent: { issueId: '42' } }
+        },
+        async close() {
+          // no-op
+        }
+      })
+    })
+    const host = new LocalToolHost({ registry: new CapabilityRegistry(built.providers) })
+    const context = buildContext('/tmp/project')
+
+    const describe = await host.execute({
+      callId: 'call_describe_fingerprint',
+      toolName: 'mcp_describe',
+      arguments: { toolId: 'github/read_issue' }
+    }, context)
+    const plannedCatalogFingerprint = describe.item.kind === 'tool_result'
+      ? (describe.item.output as { catalogFingerprint?: unknown }).catalogFingerprint
+      : undefined
+
+    expect(plannedCatalogFingerprint).toEqual(expect.any(String))
+    revisedCatalog = true
+
+    const call = await host.execute({
+      callId: 'call_catalog_drift',
+      toolName: 'mcp_call',
+      arguments: {
+        toolId: 'github/read_issue',
+        arguments: { issueId: '42' },
+        catalogFingerprint: plannedCatalogFingerprint
+      }
+    }, context)
+
+    expect(calls).toBe(0)
+    expect(call.item.kind === 'tool_result' ? call.item.isError : false).toBe(true)
+    expect(call.item.kind === 'tool_result' ? call.item.output : {}).toMatchObject({
+      mcp: {
+        state: 'failed_known',
+        postcondition: {
+          catalog: 'drifted',
+          response: 'not_sent'
+        }
+      }
+    })
+  })
+
+  it('records redacted MCP execution metadata with the host call id', async () => {
+    const observed: Array<{ record: Record<string, unknown> }> = []
+    const config = KunCapabilitiesConfig.parse({
+      mcp: {
+        enabled: true,
+        servers: {
+          github: {
+            transport: 'stdio',
+            command: 'node',
+            trustScope: 'workspace',
+            trustedWorkspaceRoots: ['/tmp/project'],
+            timeoutMs: 1234
+          }
+        }
+      }
+    })
+    const built = await buildMcpToolProviders(config.mcp, {
+      clientFactory: async () => ({
+        async listTools() {
+          return {
+            tools: [{
+              name: 'read_issue',
+              inputSchema: {
+                type: 'object',
+                properties: { issueId: { type: 'string' } },
+                required: ['issueId']
+              },
+              annotations: { readOnlyHint: true }
+            }]
+          }
+        },
+        async callTool() {
+          return { structuredContent: { issueId: '42' } }
+        },
+        async close() {
+          // no-op
+        }
+      })
+    })
+    const host = new TelemetryToolHost(
+      new LocalToolHost({ registry: new CapabilityRegistry(built.providers) }),
+      { onToolExecution: (event) => observed.push({ record: event.record as unknown as Record<string, unknown> }) }
+    )
+
+    await host.execute({
+      callId: 'call_redacted_metadata',
+      toolName: 'mcp_github_read_issue',
+      arguments: { issueId: '42', apiToken: 'do-not-record-this' }
+    }, buildContext('/tmp/project'))
+
+    const mcp = observed[0]?.record.mcp as Record<string, unknown> | undefined
+    expect(mcp).toMatchObject({
+      callId: 'call_redacted_metadata',
+      attempt: 1,
+      timeoutMs: 1234,
+      state: 'acknowledged',
+      permissions: {
+        workspaceTrusted: true,
+        trustScope: 'workspace',
+        policy: 'auto'
+      },
+      postcondition: {
+        catalog: 'matched',
+        response: 'acknowledged'
+      }
+    })
+    expect(mcp?.argumentsHash).toMatch(/^[a-f0-9]{16}$/)
+    expect(JSON.stringify(mcp)).not.toContain('do-not-record-this')
   })
 
   it('reports catalog drift after refreshing MCP search records', async () => {

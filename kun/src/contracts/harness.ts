@@ -22,6 +22,13 @@ export const DEFAULT_HARNESS_ADAPTIVE_POLICY = {
 
 const HarnessIdentifierSchema = z.string().trim().min(1).max(256)
 const HarnessTextSchema = z.string().trim().min(1).max(16_000)
+const HarnessAttemptIdSchema = HarnessIdentifierSchema
+  .refine((value) => value !== 'default', {
+    message: 'attemptId=default is reserved; omit attemptId for the default attempt'
+  })
+  .refine((value) => value !== '<absent-attempt>', {
+    message: 'attemptId=<absent-attempt> is reserved for comparison identity encoding'
+  })
 
 export const HarnessEvidenceKindSchema = z.enum([
   'command',
@@ -116,6 +123,7 @@ export const HarnessTaskSpecSchema = z
     budgets: HarnessTrialBudgetsSchema,
     executionPolicy: HarnessExecutionPolicySchema,
     adaptivePolicy: HarnessAdaptivePolicySchema.optional(),
+    seed: z.number().int().nonnegative().max(2_147_483_647).optional(),
     benchmark: HarnessBenchmarkMetadataSchema.optional()
   })
   .strict()
@@ -158,7 +166,11 @@ export const HarnessTrialManifestSchema = z
     endpointFormat: z.enum(MODEL_ENDPOINT_FORMATS),
     harnessCommit: HarnessIdentifierSchema,
     environmentDigest: HarnessIdentifierSchema,
+    /** Optional digest supplied by a trusted snapshot controller. */
+    workspaceSnapshotDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
     remoteModelRevision: HarnessIdentifierSchema.optional(),
+    /** Stable identity for one repeated execution of the same task. */
+    attemptId: HarnessAttemptIdSchema.optional(),
     seed: z.number().int().nonnegative().max(2_147_483_647).optional()
   })
   .strict()

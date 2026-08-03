@@ -1,5 +1,6 @@
 import { createInterface } from 'node:readline/promises'
 import { stdin as processStdin, stdout as processStdout } from 'node:process'
+import { close as closeFileDescriptor, readSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { LocalToolHost, buildDefaultLocalTools } from '../adapters/tool/local-tool-host.js'
 import type { TurnItem } from '../contracts/items.js'
@@ -25,8 +26,11 @@ import {
   compareTrials,
   loadBenchmarkManifest,
   parseTrialComparisonSuite,
+  recordHarnessExperience,
   renderTrialSummary,
   TrialRecorder,
+  validateExternalTrialAttestation,
+  type ExternalAttestationTrustStore,
   type TrialGate,
   type TrialRuntimeStatus
 } from '../harness/index.js'
@@ -66,6 +70,7 @@ Common options:
   --rigorous                 Run one-shot through planner/executor/verifier/reviewer
   --allow-risky-actions      Headless: auto-allow L3 actions; L4 remains denied
   --json                     Emit machine-readable JSON where supported
+  --attestation-trust-store <path>  Public-key JSON for harness receipt verification
 
 Exec options:
   --list-tools               Print available tools
@@ -95,7 +100,8 @@ const VALUE_FLAGS = new Set([
   'prompt',
   'p',
   'args',
-  'title'
+  'title',
+  'attestation-trust-store'
 ])
 
 export type KunCliCommand = 'serve' | 'run' | 'chat' | 'exec' | 'eval' | 'harness' | 'help'
@@ -394,13 +400,13 @@ export async function runHarnessCommand(argv: readonly string[], io: CliIo): Pro
 }
 
 async function runHarnessTrial(argv: readonly string[], io: CliIo): Promise<number> {
-  if (hasCredentialFlag(argv)) {
-    io.stderr.write('kun harness run: credentials must be supplied only through DEEPSEEK_API_KEY\n')
+  if (hasHarnessConfigurationOverride(argv)) {
+    io.stderr.write('kun harness run: config, credential, endpoint, approval, and sandbox overrides are not allowed\n')
     return ServeExitCode.config
   }
-  const apiKey = (io.env ?? process.env).DEEPSEEK_API_KEY?.trim()
+  const apiKey = await harnessApiKey(io.env ?? process.env)
   if (!apiKey) {
-    io.stderr.write('kun harness run: DEEPSEEK_API_KEY must be set in the environment\n')
+    io.stderr.write('kun harness run: DEEPSEEK_API_KEY or a valid runner secret descriptor is required\n')
     return ServeExitCode.config
   }
   if (harnessModelFlag(argv) !== undefined) {
@@ -424,7 +430,10 @@ async function runHarnessTrial(argv: readonly string[], io: CliIo): Promise<numb
     io.stderr.write(`kun harness run: ${redactSecretText(errorMessage(error))}\n`)
     return ServeExitCode.config
   }
-  const parsed = parseSharedOptions(argv, io)
+  // Harness options are parsed from CLI values and immutable defaults only;
+  // KUN_CONFIG, data-dir/config.json, and the caller's broad environment are
+  // deliberately excluded from this path.
+  const parsed = parseSharedOptions(argv, { ...io, env: {} }, { loadConfig: false })
   if (!parsed.ok) return writeParseError(parsed, io, 'kun harness run')
   const requestedModel = stringFlag(argv, ['model'])
   if (requestedModel !== undefined && requestedModel.trim() !== manifest.manifest.model) {
@@ -479,7 +488,10 @@ async function runHarnessTrial(argv: readonly string[], io: CliIo): Promise<numb
         prompt: manifest.manifest.task.objective,
         model: manifest.manifest.model,
         mode: manifest.manifest.task.executionPolicy === 'normal' ? 'agent' : 'rigorous',
-        harnessTask: manifest.manifest.task
+        harnessTask: {
+          ...manifest.manifest.task,
+          ...(manifest.manifest.seed === undefined ? {} : { seed: manifest.manifest.seed })
+        }
       }
     })
     const returnedStatus = await runtime.runTurn(thread.id, turn.turnId)
@@ -500,8 +512,26 @@ async function runHarnessTrial(argv: readonly string[], io: CliIo): Promise<numb
       finishedAt: new Date().toISOString(),
       recordedAt: new Date().toISOString()
     })
+    if (runtime.memoryStore) {
+      try {
+        await recordHarnessExperience({
+          store: runtime.memoryStore,
+          result,
+          workspace: manifest.manifest.workspaceRoot,
+          sourceThreadId: thread.id,
+          sourceTurnId: turn.turnId,
+          taskObjective: manifest.manifest.task.objective,
+          evidence: trustedEvidenceFromItems(items)
+        })
+      } catch (error) {
+        io.stderr.write(`kun harness run: memory experience persistence failed: ${redactSecretText(errorMessage(error))}\n`)
+      }
+    }
     emit(result)
-    return result.officialOutcome === 'pass' ? ServeExitCode.ok : ServeExitCode.runtime
+    const external = validateExternalTrialAttestation(result)
+    return external.valid && result.externalAttestation?.outcome === 'pass'
+      ? ServeExitCode.ok
+      : ServeExitCode.runtime
   } catch {
     // Never place provider/runtime exception text in a durable trial trace.
     const result = recorder.record({
@@ -524,6 +554,56 @@ async function runHarnessTrial(argv: readonly string[], io: CliIo): Promise<numb
   }
 }
 
+/**
+ * Read a harness credential from a one-shot inherited pipe when the runner
+ * provides KUN_HARNESS_API_KEY_FD. The descriptor is closed before the agent
+ * runtime starts, so model-controlled tools cannot recover the key through
+ * /proc/$PPID/environ or an inherited open secret descriptor. The ordinary
+ * environment path remains available for direct CLI use, but the evaluation
+ * runner deliberately uses the descriptor path.
+ */
+async function harnessApiKey(env: Record<string, string | undefined>): Promise<string | undefined> {
+  const descriptorText = env.KUN_HARNESS_API_KEY_FD?.trim()
+  if (descriptorText !== undefined) {
+    if (!/^\d+$/.test(descriptorText)) return undefined
+    const descriptor = Number(descriptorText)
+    if (!Number.isSafeInteger(descriptor) || descriptor < 3 || descriptor > 1024) return undefined
+    try {
+      const key = readSecretDescriptor(descriptor)
+      return key || undefined
+    } catch {
+      return undefined
+    } finally {
+      await closeDescriptor(descriptor)
+    }
+  }
+  return env.DEEPSEEK_API_KEY?.trim() || undefined
+}
+
+function readSecretDescriptor(descriptor: number): string | undefined {
+  const chunks: Buffer[] = []
+  let total = 0
+  try {
+    while (true) {
+      const chunk = Buffer.allocUnsafe(4096)
+      const bytes = readSync(descriptor, chunk, 0, chunk.length, null)
+      if (bytes === 0) break
+      total += bytes
+      if (total > 16 * 1024) return undefined
+      chunks.push(Buffer.from(chunk.subarray(0, bytes)))
+    }
+    return Buffer.concat(chunks).toString('utf8').trim() || undefined
+  } catch {
+    return undefined
+  }
+}
+
+function closeDescriptor(descriptor: number): Promise<void> {
+  return new Promise((resolve) => {
+    closeFileDescriptor(descriptor, () => resolve())
+  })
+}
+
 async function runHarnessCompare(argv: readonly string[], io: CliIo): Promise<number> {
   const suitePath = positionals(argv)[0]
   if (!suitePath) {
@@ -544,9 +624,32 @@ async function runHarnessCompare(argv: readonly string[], io: CliIo): Promise<nu
     io.stderr.write('kun harness compare: comparison suite must be valid JSON\n')
     return ServeExitCode.config
   }
+  const trustStorePath = stringFlag(argv, ['attestation-trust-store'])
+  if (!trustStorePath) {
+    io.stderr.write('kun harness compare: --attestation-trust-store is required to verify external receipts\n')
+    return ServeExitCode.config
+  }
+  let trustedAttestationKeys: ExternalAttestationTrustStore
+  try {
+    const trustSource = JSON.parse(await readFile(trustStorePath, 'utf8')) as unknown
+    const rawKeys = trustSource && typeof trustSource === 'object' && !Array.isArray(trustSource) && 'keys' in trustSource
+      ? (trustSource as { keys?: unknown }).keys
+      : trustSource
+    if (!rawKeys || typeof rawKeys !== 'object' || Array.isArray(rawKeys)) {
+      throw new Error('trust store must be an object mapping key ids to public keys')
+    }
+    const entries = Object.entries(rawKeys as Record<string, unknown>)
+    if (!entries.length || entries.some(([, value]) => typeof value !== 'string' || !value.trim())) {
+      throw new Error('trust store keys must be non-empty PEM strings')
+    }
+    trustedAttestationKeys = new Map(entries as Array<[string, string]>)
+  } catch (error) {
+    io.stderr.write(`kun harness compare: invalid attestation trust store (${redactSecretText(errorMessage(error))})\n`)
+    return ServeExitCode.config
+  }
   try {
     const parsed = parseTrialComparisonSuite(suite)
-    const report = compareTrials(parsed.baseline, parsed.harness)
+    const report = compareTrials(parsed.baseline, parsed.harness, { trustedAttestationKeys })
     io.stdout.write(`${JSON.stringify(report)}\n`)
     return report.hasRegressions || report.inconclusive ? ServeExitCode.runtime : ServeExitCode.ok
   } catch (error) {
@@ -612,8 +715,13 @@ function normalizeTrialRuntimeStatus(value: unknown): TrialRuntimeStatus {
   return value === 'completed' || value === 'failed' || value === 'aborted' ? value : 'failed'
 }
 
-function hasCredentialFlag(argv: readonly string[]): boolean {
-  return argv.some((token) => /^(?:--api-key|--apiKey)(?:=|$)/.test(token))
+function hasHarnessConfigurationOverride(argv: readonly string[]): boolean {
+  const allowed = new Set(['data-dir', 'dataDir', 'harness-json', 'json', 'allow-risky-actions'])
+  return argv.some((token) => {
+    if (!token.startsWith('--')) return false
+    const raw = token.slice(2).split('=', 1)[0]
+    return !allowed.has(raw)
+  })
 }
 
 type SharedOptionsResult =
@@ -623,7 +731,7 @@ type SharedOptionsResult =
 function parseSharedOptions(
   argv: readonly string[],
   io: CliIo,
-  options: { allowHarnessModel?: boolean } = {}
+  options: { allowHarnessModel?: boolean; loadConfig?: boolean } = {}
 ): SharedOptionsResult {
   const harnessModel = options.allowHarnessModel ? harnessModelFlag(argv) : undefined
   if (harnessModel === null) {
@@ -635,7 +743,8 @@ function parseSharedOptions(
   }
   const parsed = parseServeOptionsSafe(
     harnessModel === undefined ? argv : [...argv, `--model=${harnessModel}`],
-    io.env ?? {}
+    io.env ?? {},
+    { loadConfig: options.loadConfig }
   )
   if (!parsed.ok) return parsed
   return {

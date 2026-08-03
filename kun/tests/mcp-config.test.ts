@@ -3,7 +3,7 @@ import {
   KunCapabilitiesConfig,
   McpServerConfig
 } from '../src/contracts/capabilities.js'
-import { REDACTED_SECRET, redactSecrets } from '../src/config/secret-redaction.js'
+import { REDACTED_SECRET, redactSecretText, redactSecrets } from '../src/config/secret-redaction.js'
 
 describe('MCP config', () => {
   it('accepts trusted stdio MCP servers', () => {
@@ -95,5 +95,11 @@ describe('MCP config', () => {
     expect(redacted.env.CLIENT_SECRET).toBe(REDACTED_SECRET)
     expect(redacted.env.PASSWORD).toBe(REDACTED_SECRET)
     expect(redacted.env.NORMAL).toBe('visible')
+  })
+
+  it('redacts standalone provider-shaped tokens instead of preserving them as labels', () => {
+    const redacted = redactSecretText('sk-audit-secret-123456789 rk-private-12345678')
+    expect(redacted).toBe(`${REDACTED_SECRET} ${REDACTED_SECRET}`)
+    expect(redacted).not.toContain('audit-secret')
   })
 })

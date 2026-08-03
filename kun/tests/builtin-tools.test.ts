@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -56,6 +56,7 @@ import { DEFAULT_MAX_BYTES } from '../src/adapters/tool/truncate.js'
 import type { TurnItem } from '../src/contracts/items.js'
 import type { FsStats } from '../src/adapters/tool/builtin-tool-types.js'
 import type { ToolHostContext } from '../src/ports/tool-host.js'
+import { toolChildEnvironment } from '../src/adapters/tool/builtin-tool-utils.js'
 
 function buildContext(workspace: string): ToolHostContext {
   return {
@@ -375,6 +376,20 @@ describe('Kun built-in tools', () => {
     expect(output.truncation).toBe(null)
   })
 
+  it('does not expose provider credentials to model-controlled child environments', () => {
+    const environment = toolChildEnvironment({
+      PATH: '/bin',
+      HOME: '/tmp/home',
+      DEEPSEEK_API_KEY: 'provider-secret',
+      AWS_SECRET_ACCESS_KEY: 'cloud-secret',
+      CUSTOM_SECRET: 'custom-secret'
+    })
+    expect(environment).toMatchObject({ PATH: '/bin', HOME: '/tmp/home' })
+    expect(environment).not.toHaveProperty('DEEPSEEK_API_KEY')
+    expect(environment).not.toHaveProperty('AWS_SECRET_ACCESS_KEY')
+    expect(environment).not.toHaveProperty('CUSTOM_SECRET')
+  })
+
   it('finishes bash commands after the shell exits even when a background child keeps stdio open', async () => {
     const startedAt = Date.now()
     const output = await executeTool(host, workspace, 'bash', {
@@ -509,6 +524,36 @@ describe('Kun built-in tools', () => {
       toolName: 'read',
       isError: true
     })
+  })
+
+  it('rejects symlinked workspace files before read, edit, or write', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'kun-tools-outside-'))
+    try {
+      const outsideFile = join(outside, 'secret.txt')
+      await writeFile(outsideFile, 'outside-secret\n', 'utf8')
+      await symlink(outsideFile, join(workspace, 'linked.txt'))
+      await symlink(outside, join(workspace, 'linked-dir'))
+
+      for (const [toolName, arguments_] of [
+        ['read', { path: 'linked.txt' }],
+        ['edit', { path: 'linked.txt', oldText: 'outside-secret', newText: 'changed' }],
+        ['write', { path: 'linked.txt', content: 'changed' }]
+      ] as const) {
+        const result = await host.execute(
+          { callId: `call_symlink_${toolName}`, toolName, arguments: arguments_ },
+          buildContext(workspace)
+        )
+        expect(result.item).toMatchObject({ kind: 'tool_result', isError: true })
+      }
+      const nestedWrite = await host.execute(
+        { callId: 'call_symlink_nested_write', toolName: 'write', arguments: { path: 'linked-dir/new.txt', content: 'must-not-escape' } },
+        buildContext(workspace)
+      )
+      expect(nestedWrite.item).toMatchObject({ kind: 'tool_result', isError: true })
+      await expect(readFile(outsideFile, 'utf8')).resolves.toBe('outside-secret\n')
+    } finally {
+      await rm(outside, { recursive: true, force: true })
+    }
   })
 
   it('rejects ambiguous multi-match edits like pi edit does', async () => {

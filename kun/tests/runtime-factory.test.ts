@@ -17,6 +17,11 @@ import {
 import { UsageService } from '../src/services/usage-service.js'
 import { FileTurnLeaseStore } from '../src/services/adaptive-trial-lease.js'
 import { RuntimeEventRecorder } from '../src/services/runtime-event-recorder.js'
+import { ThreadService } from '../src/services/thread-service.js'
+import {
+  LeaseEventSequenceCoordinator,
+  LeaseThreadMutationCoordinator
+} from '../src/services/thread-mutation.js'
 import { TurnService } from '../src/services/turn-service.js'
 import { ContextCompactor } from '../src/loop/context-compactor.js'
 import { InflightTracker } from '../src/loop/inflight-tracker.js'
@@ -113,6 +118,21 @@ class SnapshotBarrierFileThreadStore extends FileThreadStore {
   }
 }
 
+class SnapshotBarrierFileSessionStore extends FileSessionStore {
+  constructor(
+    dataDir: string,
+    private readonly afterHighestSeq: (threadId: string) => Promise<void>
+  ) {
+    super({ dataDir })
+  }
+
+  override async highestSeq(threadId: string): Promise<number> {
+    const highest = await super.highestSeq(threadId)
+    await this.afterHighestSeq(threadId)
+    return highest
+  }
+}
+
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve: (() => void) | undefined
   const promise = new Promise<void>((done) => {
@@ -151,21 +171,29 @@ function sharedFileTurnRuntime(
   threadStore: FileThreadStore
   sessionStore: FileSessionStore
   turns: TurnService
+  threads: ThreadService
 } {
   const threadStore = options.threadStore ?? new FileThreadStore({ dataDir })
   const sessionStore = new FileSessionStore({ dataDir })
   const eventBus = new InMemoryEventBus()
   const nowIso = () => new Date().toISOString()
+  const turnLeases = new FileTurnLeaseStore({ dataDir, owner })
+  const threadMutations = new LeaseThreadMutationCoordinator({ turnLeases })
+  const eventMutations = new LeaseEventSequenceCoordinator({ turnLeases })
+  const events = new RuntimeEventRecorder({
+    eventBus,
+    sessionStore,
+    threadDeleted: async (threadId) => threadStore.isDeleted(threadId),
+    allocateSeq: (threadId) => eventBus.allocateSeq(threadId),
+    nowIso,
+    threadMutations,
+    eventMutations
+  })
   let generatedTurnCount = 0
   const turns = new TurnService({
     threadStore,
     sessionStore,
-    events: new RuntimeEventRecorder({
-      eventBus,
-      sessionStore,
-      allocateSeq: (threadId) => eventBus.allocateSeq(threadId),
-      nowIso
-    }),
+    events,
     inflight: new InflightTracker(),
     steering: new SteeringQueue(),
     compactor: new ContextCompactor({}),
@@ -181,9 +209,19 @@ function sharedFileTurnRuntime(
       : new SequentialIdGenerator(),
     nowIso,
     usage: new UsageService(),
-    turnLeases: new FileTurnLeaseStore({ dataDir, owner })
+    turnLeases,
+    threadMutations
   })
-  return { threadStore, sessionStore, turns }
+  const threads = new ThreadService({
+    threadStore,
+    sessionStore,
+    events,
+    ids: new SequentialIdGenerator(),
+    nowIso,
+    threadMutations,
+    eventMutations
+  })
+  return { threadStore, sessionStore, turns, threads }
 }
 
 describe('runtime factory usage carryover', () => {
@@ -539,6 +577,51 @@ describe('runtime factory usage carryover', () => {
     }
   })
 
+  it('reuses an implicit lease when ThreadService is constructed before TurnService', async () => {
+    const threadStore = new InMemoryThreadStore()
+    const sessionStore = new InMemorySessionStore()
+    const eventBus = new InMemoryEventBus()
+    const nowIso = () => new Date().toISOString()
+    const events = new RuntimeEventRecorder({
+      eventBus,
+      sessionStore,
+      threadDeleted: async (threadId) => threadStore.isDeleted(threadId),
+      allocateSeq: (threadId) => eventBus.allocateSeq(threadId),
+      nowIso
+    })
+    const ids = new SequentialIdGenerator()
+
+    // Direct integrations commonly construct the state service first and
+    // omit optional coordination wiring. TurnService must adopt its implicit
+    // in-memory lease instead of creating an incompatible second one.
+    new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
+    const turns = new TurnService({
+      threadStore,
+      sessionStore,
+      events,
+      inflight: new InflightTracker(),
+      steering: new SteeringQueue(),
+      compactor: new ContextCompactor({}),
+      ids: new SequentialIdGenerator(),
+      nowIso,
+      usage: new UsageService()
+    })
+    const threadId = 'thr_implicit_lease_order'
+    await threadStore.upsert(createThreadRecord({
+      id: threadId,
+      title: 'Implicit lease order',
+      workspace: '/tmp',
+      model: 'test-model'
+    }))
+
+    const started = await turns.startTurn({
+      threadId,
+      request: { prompt: 'start after reversed service construction' }
+    })
+    expect(started.turnId).toBe('turn_1')
+    await turns.interruptTurn({ threadId, turnId: started.turnId })
+  })
+
   it('rejects a fresh adaptive start while legacy per-turn state remains running', async () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'kun-adaptive-legacy-turn-lease-'))
     const threadId = 'thr_legacy_adaptive_start'
@@ -764,6 +847,195 @@ describe('runtime factory usage carryover', () => {
     }
   })
 
+  it('fences a ThreadService update behind a foreign terminal turn write across file stores', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-thread-service-fence-'))
+    const threadId = 'thr_thread_service_fence'
+    const updateSnapshot = deferred()
+    const finishSnapshot = deferred()
+    const allowUpdateWrite = deferred()
+    let interleave = false
+    try {
+      const updaterStore = new SnapshotBarrierFileThreadStore(dataDir, async (observedThreadId) => {
+        if (!interleave || observedThreadId !== threadId) return
+        updateSnapshot.resolve()
+        await allowUpdateWrite.promise
+      })
+      const finisherStore = new SnapshotBarrierFileThreadStore(dataDir, async (observedThreadId) => {
+        if (!interleave || observedThreadId !== threadId) return
+        finishSnapshot.resolve()
+      })
+      const updater = sharedFileTurnRuntime(dataDir, 'thread-updater', 'thread_updater', {
+        threadStore: updaterStore
+      })
+      const finisher = sharedFileTurnRuntime(dataDir, 'turn-finisher', 'turn_finisher', {
+        threadStore: finisherStore
+      })
+      await finisher.threadStore.upsert(createThreadRecord({
+        id: threadId,
+        title: 'Thread service fence',
+        workspace: '/tmp',
+        model: 'test-model'
+      }))
+      const started = await finisher.turns.startTurn({
+        threadId,
+        request: { prompt: 'finish after a concurrent metadata update' }
+      })
+
+      interleave = true
+      const update = updater.threads.update(threadId, { title: 'metadata update survives' })
+      await updateSnapshot.promise
+      const finished = finisher.turns.finishTurn({
+        threadId,
+        turnId: started.turnId,
+        status: 'completed'
+      })
+      const finisherReadBeforeUpdateWrite = await Promise.race([
+        finishSnapshot.promise.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50))
+      ])
+
+      // The updater owns the mutation lease until its title write is durable,
+      // so the foreign turn finisher cannot capture a stale thread snapshot.
+      expect(finisherReadBeforeUpdateWrite).toBe(false)
+      allowUpdateWrite.resolve()
+      await update
+      await finished
+
+      const finalThread = await new FileThreadStore({ dataDir }).get(threadId)
+      expect(finalThread?.title).toBe('metadata update survives')
+      expect(finalThread?.status).toBe('idle')
+      expect(finalThread?.turns.find((turn) => turn.id === started.turnId)?.status).toBe('completed')
+    } finally {
+      allowUpdateWrite.resolve()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  it('serializes cross-runtime event sequence allocation with the event fence', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-event-sequence-fence-'))
+    const threadId = 'thr_event_sequence_fence'
+    const firstSnapshot = deferred()
+    const secondSnapshot = deferred()
+    const allowFirst = deferred()
+    try {
+      const firstSessionStore = new SnapshotBarrierFileSessionStore(dataDir, async (observedThreadId) => {
+        if (observedThreadId !== threadId) return
+        firstSnapshot.resolve()
+        await allowFirst.promise
+      })
+      const secondSessionStore = new SnapshotBarrierFileSessionStore(dataDir, async (observedThreadId) => {
+        if (observedThreadId === threadId) secondSnapshot.resolve()
+      })
+      const firstLeases = new FileTurnLeaseStore({ dataDir, owner: 'event-first' })
+      const secondLeases = new FileTurnLeaseStore({ dataDir, owner: 'event-second' })
+      const first = new RuntimeEventRecorder({
+        eventBus: new InMemoryEventBus(),
+        sessionStore: firstSessionStore,
+        allocateSeq: () => 1,
+        nowIso: () => '2026-08-03T00:00:00.000Z',
+        // Legacy callers that supplied only the state fence still receive a
+        // separate event fence when it is lease-backed.
+        threadMutations: new LeaseThreadMutationCoordinator({ turnLeases: firstLeases })
+      })
+      const second = new RuntimeEventRecorder({
+        eventBus: new InMemoryEventBus(),
+        sessionStore: secondSessionStore,
+        allocateSeq: () => 1,
+        nowIso: () => '2026-08-03T00:00:01.000Z',
+        eventMutations: new LeaseEventSequenceCoordinator({ turnLeases: secondLeases })
+      })
+
+      const firstWrite = first.record({ kind: 'thread_created', threadId, title: 'first' })
+      await firstSnapshot.promise
+      const secondWrite = second.record({ kind: 'thread_created', threadId, title: 'second' })
+      const secondReadBeforeFirstAppend = await Promise.race([
+        secondSnapshot.promise.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50))
+      ])
+      expect(secondReadBeforeFirstAppend).toBe(false)
+
+      allowFirst.resolve()
+      await Promise.all([firstWrite, secondWrite])
+      const persisted = await new FileSessionStore({ dataDir }).loadEventsSince(threadId, 0)
+      expect(persisted.map((event) => event.seq)).toEqual([1, 2])
+    } finally {
+      allowFirst.resolve()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  it('serializes thread deletion with event append and rejects late events', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-delete-event-fence-'))
+    const threadId = 'thr_delete_event_fence'
+    const highestSeqSnapshot = deferred()
+    const allowEvent = deferred()
+    let deletionCompleted = false
+    try {
+      const threadStore = new FileThreadStore({ dataDir })
+      const sessionStore = new SnapshotBarrierFileSessionStore(dataDir, async (observedThreadId) => {
+        if (observedThreadId !== threadId) return
+        highestSeqSnapshot.resolve()
+        await allowEvent.promise
+      })
+      const eventBus = new InMemoryEventBus()
+      const turnLeases = new FileTurnLeaseStore({ dataDir, owner: 'delete-event-runtime' })
+      const threadMutations = new LeaseThreadMutationCoordinator({ turnLeases })
+      const eventMutations = new LeaseEventSequenceCoordinator({ turnLeases })
+      const events = new RuntimeEventRecorder({
+        eventBus,
+        sessionStore,
+        threadDeleted: async (threadId) => threadStore.isDeleted(threadId),
+        allocateSeq: (thread) => eventBus.allocateSeq(thread),
+        nowIso: () => '2026-08-03T00:00:00.000Z',
+        threadMutations,
+        eventMutations
+      })
+      const threads = new ThreadService({
+        threadStore,
+        sessionStore,
+        events,
+        ids: new SequentialIdGenerator(),
+        nowIso: () => '2026-08-03T00:00:00.000Z',
+        threadMutations,
+        eventMutations
+      })
+      await threadStore.upsert(createThreadRecord({
+        id: threadId,
+        title: 'Delete event fence',
+        workspace: '/tmp',
+        model: 'test-model'
+      }))
+
+      const eventWrite = events.record({ kind: 'thread_updated', threadId, title: 'before delete' })
+      await highestSeqSnapshot.promise
+      const deletion = threads.delete(threadId).then((result) => {
+        deletionCompleted = true
+        return result
+      })
+      const deletionBeforeEvent = await Promise.race([
+        deletion.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50))
+      ])
+      expect(deletionBeforeEvent).toBe(false)
+      expect(await threadStore.get(threadId)).not.toBeNull()
+
+      allowEvent.resolve()
+      await eventWrite
+      await expect(deletion).resolves.toBe(true)
+      expect(deletionCompleted).toBe(true)
+      expect(await threadStore.get(threadId)).toBeNull()
+
+      await expect(events.record({ kind: 'thread_updated', threadId, title: 'after delete' }))
+        .rejects.toThrow(`cannot record event for deleted thread: ${threadId}`)
+      const persisted = await new FileSessionStore({ dataDir }).loadEventsSince(threadId, 0)
+      expect(persisted).toEqual([])
+      expect(await threadStore.get(threadId)).toBeNull()
+    } finally {
+      allowEvent.resolve()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
   it('uses a full file-change digest so same-path same-byte edits are progress', () => {
     const sharedPrefix = 'x'.repeat(1_024)
     const items = [
@@ -797,6 +1069,30 @@ describe('runtime factory usage carryover', () => {
       noProgressWindow: 2,
       readRediscoveryThreshold: 3
     })).toBeNull()
+  })
+
+  it('feeds bounded tool outcome scores to the regression observer', () => {
+    const items = [
+      makeToolCallItem({
+        id: 'item_regression_call_1', threadId: 'thr_regression', turnId: 'turn_regression', callId: 'regression_1',
+        toolName: 'bash', arguments: { command: 'npm test' }
+      }),
+      makeToolResultItem({
+        id: 'item_regression_result_1', threadId: 'thr_regression', turnId: 'turn_regression', callId: 'regression_1',
+        toolName: 'bash', output: { exit_code: 0 }, isError: false
+      }),
+      makeToolCallItem({
+        id: 'item_regression_call_2', threadId: 'thr_regression', turnId: 'turn_regression', callId: 'regression_2',
+        toolName: 'bash', arguments: { command: 'npm test' }
+      }),
+      makeToolResultItem({
+        id: 'item_regression_result_2', threadId: 'thr_regression', turnId: 'turn_regression', callId: 'regression_2',
+        toolName: 'bash', output: { exit_code: 1 }, isError: true
+      })
+    ]
+    const observations = adaptiveObservationsForTurn(items, 'turn_regression')
+    expect(observations.map((observation) => observation.evalScore)).toEqual([1, 0])
+    expect(detectStall(observations, { repeatedActionThreshold: 3 })).toMatchObject({ reason: 'regression' })
   })
 
   it('includes a mutation in the 129th file-change edit in the progress fingerprint', () => {

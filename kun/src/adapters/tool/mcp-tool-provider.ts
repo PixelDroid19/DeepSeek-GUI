@@ -1,4 +1,6 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv'
+import type { JsonSchemaType, jsonSchemaValidator } from '@modelcontextprotocol/sdk/validation'
 import { createHash } from 'node:crypto'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
@@ -8,6 +10,11 @@ import type {
   McpCapabilityConfig,
   McpServerConfig
 } from '../../contracts/capabilities.js'
+import type {
+  McpToolCallResult,
+  McpToolOutcome
+} from '../../contracts/mcp-tool-outcome.js'
+import { createMcpToolOutcome } from '../../contracts/mcp-tool-outcome.js'
 import { redactSecretText } from '../../config/secret-redaction.js'
 import type { ToolHostContext } from '../../ports/tool-host.js'
 import type { CapabilityToolProvider } from './capability-registry.js'
@@ -19,6 +26,19 @@ import {
   type McpSearchCatalogState,
   type McpSearchRuntimeDiagnostic
 } from './mcp-tool-search.js'
+
+/**
+ * MCP servers control schemas. A fresh AJV provider per compilation prevents
+ * a server from reusing a `$id` and receiving another tool's cached validator.
+ */
+const MCP_SCHEMA_VALIDATOR: jsonSchemaValidator = {
+  getValidator<T>(schema: JsonSchemaType) {
+    return new AjvJsonSchemaValidator().getValidator<T>(schema)
+  }
+}
+
+type McpSchemaCheck = McpToolOutcome['postcondition']['inputSchema']
+type McpCatalogCheck = McpToolOutcome['postcondition']['catalog']
 
 export type McpToolDescriptor = {
   name: string
@@ -83,8 +103,6 @@ type McpConnectionState = {
   serverId: string
   server: McpServerConfig
   client: McpClientLike
-  clientFactory: (serverId: string, server: McpServerConfig) => Promise<McpClientLike>
-  nowIso: () => string
   catalogFingerprint?: string
   catalogDrift?: boolean
   lastConnectedAt?: string
@@ -139,8 +157,6 @@ export async function buildMcpToolProviders(
         serverId,
         server,
         client,
-        clientFactory,
-        nowIso,
         lastConnectedAt: nowIso()
       }
       connected.push(state)
@@ -163,24 +179,24 @@ export async function buildMcpToolProviders(
   const connectedServers = diagnostics.filter((diagnostic) => diagnostic.status === 'connected').length
   const toolCount = catalogState.records.length
   catalogState.lastRefreshedAt = nowIso()
-  catalogState.catalogFingerprint = catalogFingerprint(catalogState.records.map((record) => record.toolId))
+  catalogState.catalogFingerprint = searchCatalogFingerprint(catalogState.records)
   const searchActive = shouldUseMcpSearch(mcp.search, toolCount) && connectedServers > 0
   if (searchActive) {
     providers.push(createMcpSearchProvider({
       config: mcp.search,
       state: catalogState,
-      refreshCatalog: async () => {
+      refreshCatalog: async (signal) => {
         try {
           const records: McpSearchCatalogRecord[] = []
           const previousFingerprint = catalogState.catalogFingerprint
           for (const state of connected) {
-            const listed = await refreshMcpConnectionCatalog(state)
+            const listed = await refreshMcpConnectionCatalog(state, signal)
             records.push(...listed.map((tool) => createMcpSearchCatalogRecord(state, tool)))
           }
           catalogState.records = records
           catalogState.lastError = undefined
           catalogState.lastRefreshedAt = nowIso()
-          catalogState.catalogFingerprint = catalogFingerprint(records.map((record) => record.toolId))
+          catalogState.catalogFingerprint = searchCatalogFingerprint(records)
           catalogState.catalogDrift = Boolean(previousFingerprint && previousFingerprint !== catalogState.catalogFingerprint)
           return records
         } catch (error) {
@@ -226,7 +242,10 @@ export function isMcpServerTrusted(server: McpServerConfig, workspace: string): 
 }
 
 async function createSdkMcpClient(serverId: string, server: McpServerConfig): Promise<McpClientLike> {
-  const client = new Client({ name: `kun-${serverId}`, version: '0.1.0' })
+  const client = new Client(
+    { name: `kun-${serverId}`, version: '0.1.0' },
+    { jsonSchemaValidator: MCP_SCHEMA_VALIDATOR }
+  )
   const transport = createTransport(server)
   await client.connect(transport, { timeout: server.timeoutMs })
   return {
@@ -290,8 +309,9 @@ function createMcpLocalTool(
           isError: true
         }
       }
-      const result = await callMcpToolWithReconnect(
+      const execution = await executeMcpTool(
         state,
+        descriptor,
         { name: descriptor.name, arguments: args },
         context.abortSignal
       )
@@ -299,19 +319,24 @@ function createMcpLocalTool(
         output: {
           serverId: state.serverId,
           toolName: descriptor.name,
-          result
+          ...(execution.result !== undefined ? { result: execution.result } : {}),
+          mcp: execution.mcp
         },
-        isError: typeof result === 'object' && result !== null && (result as { isError?: boolean }).isError === true
+        isError: execution.isError
       }
     }
   })
 }
 
-async function listAllMcpTools(client: McpClientLike, timeout: number): Promise<McpToolDescriptor[]> {
+async function listAllMcpTools(
+  client: McpClientLike,
+  timeout: number,
+  signal?: AbortSignal
+): Promise<McpToolDescriptor[]> {
   const tools: McpToolDescriptor[] = []
   let cursor: string | undefined
   do {
-    const listed = await client.listTools({ cursor, timeout })
+    const listed = await client.listTools({ cursor, signal, timeout })
     tools.push(...listed.tools)
     cursor = listed.nextCursor
   } while (cursor)
@@ -328,7 +353,7 @@ function createMcpSearchCatalogRecord(
     server: state.server,
     client: {
       callTool: (input, options) =>
-        callMcpToolWithReconnect(state, input, options?.signal, options?.timeout)
+        executeMcpTool(state, descriptor, input, options?.signal, options?.timeout, options?.catalogFingerprint)
     },
     descriptor,
     normalizedName: normalizeMcpToolName(state.serverId, descriptor.name),
@@ -336,38 +361,229 @@ function createMcpSearchCatalogRecord(
   }
 }
 
-async function refreshMcpConnectionCatalog(state: McpConnectionState): Promise<McpToolDescriptor[]> {
-  const listed = await listAllMcpTools(state.client, state.server.timeoutMs)
-  const nextFingerprint = catalogFingerprint(listed.map((tool) => tool.name))
+async function refreshMcpConnectionCatalog(
+  state: McpConnectionState,
+  signal?: AbortSignal
+): Promise<McpToolDescriptor[]> {
+  const listed = await listAllMcpTools(state.client, state.server.timeoutMs, signal)
+  const nextFingerprint = serverCatalogFingerprint(listed)
   state.catalogDrift = Boolean(state.catalogFingerprint && state.catalogFingerprint !== nextFingerprint)
   state.catalogFingerprint = nextFingerprint
   state.lastError = undefined
   return listed
 }
 
-async function callMcpToolWithReconnect(
+async function executeMcpTool(
   state: McpConnectionState,
+  descriptor: McpToolDescriptor,
   input: { name: string; arguments: Record<string, unknown> },
   signal: AbortSignal | undefined,
-  timeout = state.server.timeoutMs
-): Promise<unknown> {
+  timeout = state.server.timeoutMs,
+  plannedCatalogFingerprint?: string
+): Promise<McpToolCallResult> {
+  const stateHistory: McpToolOutcome['stateHistory'] = ['planned', 'approved']
+  let attempt = 1
+  let catalog: McpCatalogCheck = 'not_checked'
+  let inputSchema: McpSchemaCheck = 'not_checked'
+  let outputSchema: McpSchemaCheck = 'not_checked'
+
+  const outcome = (
+    finalState: McpToolOutcome['state'],
+    response: McpToolOutcome['postcondition']['response'],
+    error?: string
+  ): McpToolOutcome => createMcpToolOutcome({
+    state: finalState,
+    stateHistory,
+    attempt,
+    arguments: input.arguments,
+    catalogFingerprint: state.catalogFingerprint ?? serverCatalogFingerprint([descriptor]),
+    ...(plannedCatalogFingerprint ? { plannedCatalogFingerprint } : {}),
+    permissions: mcpPermissions(state.server, descriptor),
+    timeoutMs: timeout,
+    ...(error ? { error: redactSecretText(error) } : {}),
+    postcondition: { catalog, inputSchema, outputSchema, response }
+  })
+
+  if (signal?.aborted) {
+    stateHistory.push('cancelled')
+    return { mcp: outcome('cancelled', 'cancelled'), isError: true }
+  }
+
+  const inputCheck = validateMcpSchema(descriptor.inputSchema, input.arguments)
+  inputSchema = inputCheck.status
+  if (inputCheck.status === 'invalid') {
+    stateHistory.push('failed_known')
+    return {
+      mcp: outcome('failed_known', 'not_sent', `MCP input schema validation failed: ${inputCheck.error}`),
+      isError: true
+    }
+  }
+
+  // MCP 1.29 advertises task support in the tool descriptor, but this
+  // ToolHost has no durable task lifecycle or streamed-result contract. Do
+  // not invent one here or leak it into bash/browser adapters: reject only
+  // tools that explicitly require task execution before sending a request.
+  if (requiresTaskBasedExecution(descriptor)) {
+    stateHistory.push('failed_known')
+    return {
+      mcp: outcome(
+        'failed_known',
+        'not_sent',
+        `MCP tool ${descriptor.name} requires task-based execution, which this tool host does not expose`
+      ),
+      isError: true
+    }
+  }
+
   try {
-    return await state.client.callTool(input, { signal, timeout })
+    await revalidateMcpToolCatalog(state, descriptor, signal)
+    catalog = 'matched'
   } catch (error) {
     state.lastError = redactSecretText(errorMessage(error))
-    if (signal?.aborted) throw error
-    const client = await reconnectMcpConnection(state)
-    return client.callTool(input, { signal, timeout })
+    if (signal?.aborted) {
+      stateHistory.push('cancelled')
+      return { mcp: outcome('cancelled', 'cancelled'), isError: true }
+    }
+    catalog = state.catalogDrift ? 'drifted' : 'not_checked'
+    stateHistory.push('failed_known')
+    return { mcp: outcome('failed_known', 'not_sent', errorMessage(error)), isError: true }
+  }
+
+  stateHistory.push('sent')
+  try {
+    const result = await state.client.callTool(input, { signal, timeout })
+    return completeMcpToolResult({
+      result,
+      descriptor,
+      outcome,
+      stateHistory,
+      setOutputSchema: (value) => { outputSchema = value }
+    })
+  } catch (error) {
+    state.lastError = redactSecretText(errorMessage(error))
+    if (signal?.aborted) {
+      stateHistory.push('failed_unknown')
+      return {
+        mcp: outcome('failed_unknown', 'unknown', 'MCP call was cancelled after dispatch; delivery is unknown'),
+        isError: true
+      }
+    }
+    // MCP 1.29 exposes cancellation but no client-visible proof that a
+    // request failed before dispatch. Never reconnect or resend based on an
+    // untrusted transport error object; recovery must start from a new plan.
+    stateHistory.push('failed_unknown')
+    return { mcp: outcome('failed_unknown', 'unknown', errorMessage(error)), isError: true }
   }
 }
 
-async function reconnectMcpConnection(state: McpConnectionState): Promise<McpClientLike> {
-  await state.client.close().catch(() => undefined)
-  const client = await state.clientFactory(state.serverId, state.server)
-  state.client = client
-  state.lastConnectedAt = state.nowIso()
-  state.lastError = undefined
-  return client
+async function revalidateMcpToolCatalog(
+  state: McpConnectionState,
+  descriptor: McpToolDescriptor,
+  signal?: AbortSignal
+): Promise<void> {
+  const listed = await refreshMcpConnectionCatalog(state, signal)
+  if (signal?.aborted) throw new Error('MCP catalog revalidation was cancelled')
+  const current = listed.find((tool) => tool.name === descriptor.name)
+  if (!current || state.catalogDrift || descriptorFingerprint(current) !== descriptorFingerprint(descriptor)) {
+    state.catalogDrift = true
+    throw new Error('MCP catalog changed before this call; run mcp_search and mcp_describe again')
+  }
+}
+
+function completeMcpToolResult(input: {
+  result: unknown
+  descriptor: McpToolDescriptor
+  outcome: (
+    finalState: McpToolOutcome['state'],
+    response: McpToolOutcome['postcondition']['response'],
+    error?: string
+  ) => McpToolOutcome
+  stateHistory: McpToolOutcome['stateHistory']
+  setOutputSchema: (value: McpSchemaCheck) => void
+}): McpToolCallResult {
+  const outputCheck = validateMcpOutput(input.descriptor.outputSchema, input.result)
+  input.setOutputSchema(outputCheck.status)
+  if (isMcpToolErrorResult(input.result)) {
+    input.stateHistory.push('failed_known')
+    return {
+      result: input.result,
+      mcp: input.outcome('failed_known', 'acknowledged', 'MCP tool reported an error'),
+      isError: true
+    }
+  }
+  if (outputCheck.status === 'invalid') {
+    input.stateHistory.push('failed_known')
+    return {
+      result: input.result,
+      mcp: input.outcome(
+        'failed_known',
+        'acknowledged',
+        `MCP output schema validation failed: ${outputCheck.error}`
+      ),
+      isError: true
+    }
+  }
+  input.stateHistory.push('acknowledged')
+  return {
+    result: input.result,
+    mcp: input.outcome('acknowledged', 'acknowledged'),
+    isError: false
+  }
+}
+
+function validateMcpSchema(
+  schema: Record<string, unknown> | undefined,
+  value: unknown
+): { status: McpSchemaCheck; error?: string } {
+  if (!schema) return { status: 'not_checked' }
+  try {
+    const result = MCP_SCHEMA_VALIDATOR.getValidator(schema as JsonSchemaType)(value)
+    return result.valid
+      ? { status: 'valid' }
+      : { status: 'invalid', error: redactSecretText(result.errorMessage) }
+  } catch {
+    // MCP schemas are server-controlled. Preserve compatibility with a schema
+    // that the current SDK validator cannot compile, while recording that it
+    // was not checked instead of treating an unsupported feature as success.
+    return { status: 'not_checked' }
+  }
+}
+
+function validateMcpOutput(
+  schema: Record<string, unknown> | undefined,
+  result: unknown
+): { status: McpSchemaCheck; error?: string } {
+  if (!schema || isMcpToolErrorResult(result)) return { status: 'not_checked' }
+  if (!isRecord(result) || !Object.hasOwn(result, 'structuredContent')) {
+    return { status: 'invalid', error: 'tool response did not include structuredContent' }
+  }
+  return validateMcpSchema(schema, result.structuredContent)
+}
+
+function isMcpToolErrorResult(result: unknown): boolean {
+  return isRecord(result) && result.isError === true
+}
+
+function requiresTaskBasedExecution(descriptor: McpToolDescriptor): boolean {
+  return isRecord(descriptor.execution) && descriptor.execution.taskSupport === 'required'
+}
+
+function mcpPermissions(
+  server: McpServerConfig,
+  descriptor: McpToolDescriptor
+): McpToolOutcome['permissions'] {
+  const annotations = descriptor.annotations
+  return {
+    workspaceTrusted: true,
+    trustScope: server.trustScope,
+    policy: policyFromAnnotations(annotations),
+    annotationHints: {
+      readOnly: annotations?.readOnlyHint === true,
+      idempotent: annotations?.idempotentHint === true,
+      destructive: annotations?.destructiveHint === true,
+      openWorld: annotations?.openWorldHint === true
+    }
+  }
 }
 
 function shouldUseMcpSearch(config: NonNullable<McpCapabilityConfig['search']>, toolCount: number): boolean {
@@ -405,11 +621,61 @@ function serverDiagnostic(
   }
 }
 
-function catalogFingerprint(values: readonly string[]): string {
+function serverCatalogFingerprint(tools: readonly McpToolDescriptor[]): string {
+  return catalogFingerprint(
+    tools
+      .map((tool) => catalogDescriptor(tool))
+      .sort((left, right) => left.name.localeCompare(right.name))
+  )
+}
+
+function searchCatalogFingerprint(records: readonly McpSearchCatalogRecord[]): string {
+  return catalogFingerprint(
+    records
+      .map((record) => ({ serverId: record.serverId, descriptor: catalogDescriptor(record.descriptor) }))
+      .sort((left, right) => `${left.serverId}/${left.descriptor.name}`.localeCompare(`${right.serverId}/${right.descriptor.name}`))
+  )
+}
+
+function descriptorFingerprint(descriptor: McpToolDescriptor): string {
+  return catalogFingerprint(catalogDescriptor(descriptor))
+}
+
+function catalogDescriptor(descriptor: McpToolDescriptor): {
+  name: string
+  title: string | null
+  description: string | null
+  inputSchema: Record<string, unknown>
+  outputSchema: Record<string, unknown> | null
+  annotations: McpToolDescriptor['annotations'] | null
+  execution: unknown
+} {
+  return {
+    name: descriptor.name,
+    title: descriptor.title ?? null,
+    description: descriptor.description ?? null,
+    inputSchema: descriptor.inputSchema ?? {},
+    outputSchema: descriptor.outputSchema ?? null,
+    annotations: descriptor.annotations ?? null,
+    execution: descriptor.execution ?? null
+  }
+}
+
+function catalogFingerprint(value: unknown): string {
   return createHash('sha256')
-    .update(JSON.stringify([...values].sort()))
+    .update(JSON.stringify(canonicalize(value)))
     .digest('hex')
     .slice(0, 16)
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize)
+  if (!isRecord(value)) return value
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, canonicalize(child)])
+  )
 }
 
 function slug(value: string): string {
@@ -422,4 +688,8 @@ function normalizePathForTrust(value: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }

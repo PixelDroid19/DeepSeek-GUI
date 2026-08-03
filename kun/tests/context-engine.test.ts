@@ -510,10 +510,12 @@ describe('context engine runtime safety', () => {
       errorsResolved: ['npm test fixed missing mock'],
       pending: []
     })
-    expect((await memory.list({ workspace })).map((item) => item.provenance?.kind).sort()).toEqual([
+    const formed = await memory.list({ workspace })
+    expect(formed.map((item) => item.provenance?.kind).sort()).toEqual([
       'model-inferred',
-      'verified-by-command'
+      'model-inferred'
     ])
+    expect(formed.map((item) => item.status)).toEqual(['candidate', 'candidate'])
 
     const disabled = new ContextEngineRuntime({
       dataDir: tempDir(),
@@ -550,7 +552,8 @@ describe('context engine runtime safety', () => {
         tombstoneCount: 0,
         lastInjectedIds: []
       }),
-      setLastInjected: () => undefined
+      setLastInjected: () => undefined,
+      promoteFromOutcome: async () => { throw new Error('not used') }
     }
     const runtime = new ContextEngineRuntime({
       dataDir: tempDir(),

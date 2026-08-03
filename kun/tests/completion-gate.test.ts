@@ -65,6 +65,26 @@ describe('completion gate', () => {
     })).toMatchObject({ verdict: 'fail' })
   })
 
+  it('fails when a changed path is outside the declared allowed scope', () => {
+    const result = evaluateCompletionGate({
+      outOfScopePaths: ['docs/README.md'],
+      verifierSaysShip: true,
+      allRequiredEvidencePass: true
+    })
+    expect(result.verdict).toBe('fail')
+    expect(result.reasons.join(' ')).toMatch(/outside allowed scope/i)
+  })
+
+  it('does not ship when a declared constraint has no enforcement owner', () => {
+    const result = evaluateCompletionGate({
+      unenforcedConstraints: ['network (sandbox/tool-policy): no outbound access'],
+      verifierSaysShip: true,
+      allRequiredEvidencePass: true
+    })
+    expect(result.verdict).toBe('inconclusive')
+    expect(result.reasons.join(' ')).toMatch(/unenforced harness constraints/i)
+  })
+
   it('fails when the captured workspace artifact hash changes', () => {
     expect(evaluateCompletionGate({
       workspaceHashBefore: 'sha256:before',
@@ -72,6 +92,16 @@ describe('completion gate', () => {
       verifierSaysShip: true,
       allRequiredEvidencePass: true
     })).toMatchObject({ verdict: 'fail' })
+  })
+
+  it('fails when the workspace HEAD changes during the turn', () => {
+    const result = evaluateCompletionGate({
+      workspaceHeadChanged: true,
+      verifierSaysShip: true,
+      allRequiredEvidencePass: true
+    })
+    expect(result.verdict).toBe('fail')
+    expect(result.reasons.join(' ')).toMatch(/HEAD changed/i)
   })
 
   it('fails when a captured verifier artifact hash changes', () => {

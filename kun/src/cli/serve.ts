@@ -21,7 +21,8 @@ import {
  */
 export function parseServeOptions(
   argv: readonly string[],
-  env: Record<string, string | undefined> = {}
+  env: Record<string, string | undefined> = {},
+  parseOptions: { loadConfig?: boolean } = {}
 ): ServeOptions {
   const raw: Record<string, string | boolean> = {}
   for (let i = 0; i < argv.length; i += 1) {
@@ -38,7 +39,7 @@ export function parseServeOptions(
     }
     raw[key] = value
   }
-  const loadedConfig = loadServeConfig(raw, env)
+  const loadedConfig = parseOptions.loadConfig === false ? null : loadServeConfig(raw, env)
   const configServe = loadedConfig?.config.serve ?? {}
   const portEnv = env.KUN_PORT
   const tokenEconomyMode =
@@ -129,6 +130,7 @@ export function parseServeOptions(
         storageBackendFromRawOrEnv(raw, env) ??
         configServe.storage?.backend ??
         DEFAULT_SERVE_OPTIONS.storage.backend,
+      deployment: configServe.storage?.deployment ?? DEFAULT_SERVE_OPTIONS.storage.deployment,
       ...((storageSqlitePathFromRawOrEnv(raw, env) ?? configServe.storage?.sqlitePath)
         ? { sqlitePath: storageSqlitePathFromRawOrEnv(raw, env) ?? configServe.storage?.sqlitePath }
         : {})
@@ -195,10 +197,11 @@ export type ParseServeResult =
 
 export function parseServeOptionsSafe(
   argv: readonly string[],
-  env: Record<string, string | undefined> = {}
+  env: Record<string, string | undefined> = {},
+  parseOptions: { loadConfig?: boolean } = {}
 ): ParseServeResult {
   try {
-    const parsed = parseServeOptions(argv, env)
+    const parsed = parseServeOptions(argv, env, parseOptions)
     if (!parsed.dataDir) {
       return {
         ok: false,

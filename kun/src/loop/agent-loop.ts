@@ -17,6 +17,10 @@ import type { UsageService } from '../services/usage-service.js'
 import type { UsageSnapshot } from '../contracts/usage.js'
 import type { TurnService } from '../services/turn-service.js'
 import type { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
+import {
+  getThreadMutationCoordinator,
+  type ThreadMutationCoordinator
+} from '../services/thread-mutation.js'
 import type { PipelineStage } from '../contracts/events.js'
 import type { IdGenerator } from '../ports/id-generator.js'
 import type { ImmutablePrefix } from '../cache/immutable-prefix.js'
@@ -84,6 +88,7 @@ import {
   type ToolCatalogSnapshot
 } from './tool-catalog-drift.js'
 import { effectiveHistoryAfterLatestCompaction } from './compaction-prompt.js'
+import { compactedItemsDigestSource, computeShortHash } from './compaction-marker.js'
 import {
   finishGoalElapsedTimer,
   startGoalElapsedTimer,
@@ -173,6 +178,8 @@ export type AgentLoopOptions = {
   usage: UsageService
   events: RuntimeEventRecorder
   turns: TurnService
+  /** Optional shared fence for direct session-store mutations. */
+  threadMutations?: ThreadMutationCoordinator
   inflight: InflightTracker
   steering: SteeringQueue
   compactor: ContextCompactor
@@ -223,6 +230,8 @@ type ModelStepResult = 'continue' | 'stop' | 'failed' | 'aborted' | 'escalated'
  * to a bounded controller without finalizing the turn in the normal loop.
  */
 export type AgentLoopRunOptions = {
+  /** Per-run sampling override for internal child roles; never persisted as a harness task. */
+  samplingSeed?: number
   onModelStep?: (input: {
     threadId: string
     turnId: string
@@ -288,6 +297,7 @@ type StreamedModelStep = {
  */
 export class AgentLoop {
   private readonly opts: AgentLoopOptions
+  private readonly threadMutations: ThreadMutationCoordinator
   private readonly autoModelRoutes = new Map<string, AutoModelRouteSelection>()
   private readonly promptTokenPressure = new Map<string, { model: string; promptTokens: number }>()
   private readonly toolStormBreakers = new Map<string, ToolStormBreaker>()
@@ -296,6 +306,10 @@ export class AgentLoop {
 
   constructor(opts: AgentLoopOptions) {
     this.opts = opts
+    this.threadMutations = getThreadMutationCoordinator({
+      threadStore: opts.threadStore,
+      coordinator: opts.threadMutations
+    })
   }
 
   /**
@@ -319,7 +333,7 @@ export class AgentLoop {
       await this.failTurn(threadId, turnId, 'no abort controller for turn')
       return 'failed'
     }
-    if (signal.aborted) {
+    if (await this.isTurnInvalidated(threadId, signal)) {
       await this.opts.turns.finishTurn({ threadId, turnId, status: 'aborted' })
       return 'aborted'
     }
@@ -342,6 +356,11 @@ export class AgentLoop {
       await this.finishContextEngineTurn(threadId, turnId, status)
       return status
     } catch (error) {
+      if (await this.isTurnInvalidated(threadId, signal)) {
+        await this.opts.turns.finishTurn({ threadId, turnId, status: 'aborted' })
+        await this.finishContextEngineTurn(threadId, turnId, 'aborted')
+        return 'aborted'
+      }
       await this.failTurn(threadId, turnId, this.describeTurnFailure(threadId, turnId, error))
       await this.finishContextEngineTurn(threadId, turnId, 'failed')
       return 'failed'
@@ -383,6 +402,16 @@ export class AgentLoop {
     return this.opts.nowMs?.() ?? Date.now()
   }
 
+  /** Fail closed when the durable deletion marker cannot be read. */
+  private async isTurnInvalidated(threadId: string, signal: AbortSignal): Promise<boolean> {
+    if (signal.aborted) return true
+    try {
+      return await this.opts.threadStore.isDeleted(threadId)
+    } catch {
+      return true
+    }
+  }
+
   private async startGoalElapsedTimer(threadId: string): Promise<GoalElapsedTimer | null> {
     return startGoalElapsedTimer({
       threadId,
@@ -401,7 +430,8 @@ export class AgentLoop {
       events: this.opts.events,
       timer,
       nowMs: () => this.nowMs(),
-      nowIso: this.opts.nowIso
+      nowIso: this.opts.nowIso,
+      threadMutations: this.threadMutations
     })
   }
 
@@ -429,8 +459,9 @@ export class AgentLoop {
     options: AgentLoopRunOptions
   ): Promise<TurnStatus | 'escalated'> {
     for (let step = 0; ; step += 1) {
-      if (signal.aborted) return 'aborted'
+      if (await this.isTurnInvalidated(threadId, signal)) return 'aborted'
       await this.drainSteering(threadId, turnId)
+      if (await this.isTurnInvalidated(threadId, signal)) return 'aborted'
       const stepResult = await this.modelStep(threadId, turnId, signal, step, options)
       if (stepResult === 'stop') return 'completed'
       if (stepResult === 'failed') return 'failed'
@@ -446,6 +477,7 @@ export class AgentLoop {
     stepIndex = 0,
     options: AgentLoopRunOptions = {}
   ): Promise<ModelStepResult> {
+    if (await this.isTurnInvalidated(threadId, signal)) return 'aborted'
     if (await this.shouldEscalateAfterModelStep({
       threadId,
       turnId,
@@ -453,7 +485,7 @@ export class AgentLoop {
       phase: 'before_model',
       onModelStep: options.onModelStep
     })) return 'escalated'
-    const prepared = await this.prepareModelStep(threadId, turnId, signal, stepIndex)
+    const prepared = await this.prepareModelStep(threadId, turnId, signal, stepIndex, options.samplingSeed)
     if (prepared.kind !== 'ready') return prepared.kind
 
     const streamed = await this.consumeModelStream(threadId, turnId, signal, prepared)
@@ -565,7 +597,8 @@ export class AgentLoop {
     threadId: string,
     turnId: string,
     signal: AbortSignal,
-    stepIndex: number
+    stepIndex: number,
+    samplingSeed?: number
   ): Promise<PrepareModelStepResult> {
     if (shouldVerifyImmutablePrefix()) {
       verifyImmutablePrefix(this.opts.prefix)
@@ -586,14 +619,18 @@ export class AgentLoop {
       threadStore: this.opts.threadStore,
       turns: this.opts.turns,
       events: this.opts.events,
-      nowIso: this.opts.nowIso
+      nowIso: this.opts.nowIso,
+      threadMutations: this.threadMutations
     })
     if (budgetGate === 'blocked') return { kind: 'stop' }
-    const loadedItems = await this.opts.sessionStore.loadItems(threadId)
-    const healed = healLoadedHistoryItems(loadedItems)
-    if (healed.changed) {
-      await this.opts.sessionStore.rewriteItems(threadId, healed.items)
-    }
+    const healed = await this.threadMutations.run(threadId, async () => {
+      const loadedItems = await this.opts.sessionStore.loadItems(threadId)
+      const repaired = healLoadedHistoryItems(loadedItems)
+      if (repaired.changed) {
+        await this.opts.sessionStore.rewriteItems(threadId, repaired.items)
+      }
+      return repaired
+    })
     await this.recordPipelineStage(
       threadId,
       turnId,
@@ -757,7 +794,7 @@ export class AgentLoop {
       if (stepIndex === 0) {
         await this.opts.contextEngine.onTurnStart({ threadId, turnId, workspace })
       }
-      const workspaceState = await this.opts.contextEngine.renderInjectionDetailed(workspace)
+      const workspaceState = await this.opts.contextEngine.renderInjectionDetailed(workspace, turn?.prompt ?? '')
       if (workspaceState) {
         contextInstructions.push(workspaceState.block)
         workspaceStateInjection = {
@@ -771,6 +808,7 @@ export class AgentLoop {
       contextInstructionCount: contextInstructions.length
     })
     const tokenEconomy = normalizeTokenEconomyConfig(this.opts.tokenEconomy)
+    const effectiveSamplingSeed = samplingSeed ?? turn?.harnessTask?.seed
     const baseRequest = buildModelStepRequest({
       threadId,
       turnId,
@@ -786,6 +824,9 @@ export class AgentLoop {
       tools: toolSpecs,
       requiredToolName,
       reasoningEffort: modelRoute.reasoningEffort,
+      ...(effectiveSamplingSeed === undefined
+        ? {}
+        : { seed: effectiveSamplingSeed }),
       abortSignal: signal
     })
     const rawInputTokens = tokenEconomy.enabled
@@ -872,6 +913,7 @@ export class AgentLoop {
     prepared: PreparedModelStep
   ): Promise<StreamedModelStep | 'aborted'> {
     const { request } = prepared
+    if (await this.isTurnInvalidated(threadId, signal)) return 'aborted'
     const assistantContent = createAssistantContentStreamState()
     const completedToolCalls: ToolCallLike[] = []
     let stopReason: StreamedModelStep['stopReason'] = 'stop'
@@ -879,7 +921,7 @@ export class AgentLoop {
       model: request.model
     })
     for await (const chunk of this.opts.model.stream(request)) {
-      if (signal.aborted) return 'aborted'
+      if (await this.isTurnInvalidated(threadId, signal)) return 'aborted'
       switch (chunk.kind) {
         case 'assistant_text_delta':
         case 'assistant_reasoning_delta': {
@@ -1023,7 +1065,7 @@ export class AgentLoop {
     let index = 0
 
     while (index < input.calls.length) {
-      if (input.signal.aborted) return 'aborted'
+      if (await this.isTurnInvalidated(input.threadId, input.signal)) return 'aborted'
 
       const dispatchPlan = planNextToolDispatch({
         calls: input.calls,
@@ -1195,6 +1237,9 @@ export class AgentLoop {
     call: ToolCallLike
     context: ToolHostContext
   }): Promise<ToolHostResult> {
+    if (await this.isTurnInvalidated(input.threadId, input.context.abortSignal)) {
+      throw new Error(`thread has been deleted: ${input.threadId}`)
+    }
     return this.opts.inflight.run(
       {
         id: `inflight_${input.call.callId}`,
@@ -1429,6 +1474,8 @@ export class AgentLoop {
     if (!plan) return items
     const threadId = context.threadId
     const turnId = context.turnId
+    const snapshotDigest = computeShortHash(compactedItemsDigestSource(items))
+    let extraction: ReturnType<typeof parseCompactionExtraction>['extraction']
     let result = this.opts.compactor.compact({
       threadId,
       turnId,
@@ -1457,7 +1504,8 @@ export class AgentLoop {
       })
       if (signal.aborted) return items
       if (modelSummary) {
-        const { summary, extraction } = parseCompactionExtraction(modelSummary)
+        const parsed = parseCompactionExtraction(modelSummary)
+        extraction = parsed.extraction
         result = this.opts.compactor.compact({
           threadId,
           turnId,
@@ -1466,16 +1514,8 @@ export class AgentLoop {
           reason: plan.reason,
           mode: plan.mode,
           keepRecent: plan.keepRecent,
-          summaryOverride: summary
+          summaryOverride: parsed.summary
         })
-        if (extraction && context.workspace && this.opts.contextEngine) {
-          await this.opts.contextEngine.onCompactionExtracted({
-            workspace: context.workspace,
-            sourceThreadId: threadId,
-            sourceTurnId: turnId,
-            ...extraction
-          })
-        }
       }
     }
     // Persist the new compaction summary so the on-disk history
@@ -1484,7 +1524,37 @@ export class AgentLoop {
     // skip when no items need summarisation.
     if (result.replacedTokens > 0) {
       this.opts.toolHost.clearReadTracker?.(threadId)
-      await this.opts.sessionStore.appendItem(threadId, result.summaryItem)
+      const persisted = await this.threadMutations.run(threadId, async () => {
+        const loaded = await this.opts.sessionStore.loadItems(threadId)
+        const repaired = healLoadedHistoryItems(loaded)
+        if (repaired.changed) {
+          await this.opts.sessionStore.rewriteItems(threadId, repaired.items)
+        }
+        const latestItems = repairModelHistoryItems(
+          effectiveHistoryAfterLatestCompaction(repaired.items)
+        )
+        const latestDigest = computeShortHash(compactedItemsDigestSource(latestItems))
+        if (latestDigest !== snapshotDigest) {
+          // A tool/result arrived while the optional model summary was being
+          // generated. Do not persist a stale compaction marker; the next
+          // model step will retry against the complete history.
+          return { history: latestItems, result: null as typeof result | null }
+        }
+        // Keep the session stream append-only. The compaction marker changes
+        // the model's effective boundary, but the pre-fold transcript remains
+        // available to UI/export/replay consumers and to a later fold.
+        await this.opts.sessionStore.appendItem(threadId, result.summaryItem)
+        return { history: result.next, result }
+      })
+      if (!persisted.result) return persisted.history
+      if (extraction && context.workspace && this.opts.contextEngine) {
+        await this.opts.contextEngine.onCompactionExtracted({
+          workspace: context.workspace,
+          sourceThreadId: threadId,
+          sourceTurnId: turnId,
+          ...extraction
+        })
+      }
       await this.opts.events.record({
         kind: 'compaction_completed',
         threadId,
@@ -1503,6 +1573,7 @@ export class AgentLoop {
           ? { sourceItemIds: result.summaryItem.sourceItemIds }
           : {})
       })
+      return persisted.history
     }
     return result.next
   }
@@ -1698,10 +1769,12 @@ export class AgentLoop {
     workspace: string
   }) {
     if (!this.opts.memoryStore) return []
+    const policy = this.opts.memoryStore.retrievalPolicy?.()
     const memories = await this.opts.memoryStore.retrieve({
       query: input.prompt,
       workspace: input.workspace,
-      limit: 8
+      limit: policy?.maxInjectedRecords ?? 8,
+      ...(policy ? { budgetBytes: policy.budgetBytes } : {})
     })
     this.opts.memoryStore.setLastInjected(memories.map((memory) => memory.id))
     return memories

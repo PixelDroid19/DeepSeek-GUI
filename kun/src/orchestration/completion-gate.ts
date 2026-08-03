@@ -25,10 +25,14 @@ export type CompletionGateInput = {
   suiteChanged?: boolean
   forbiddenPaths?: readonly string[]
   forbiddenPathCount?: number
+  outOfScopePaths?: readonly string[]
+  unenforcedConstraints?: readonly string[]
   artifactHashBefore?: string | null
   artifactHashAfter?: string | null
   workspaceHashBefore?: string | null
   workspaceHashAfter?: string | null
+  workspaceHeadChanged?: boolean
+  workspaceTreeChangedAfterEvidence?: boolean
   workspaceArtifactCaptureUnavailable?: boolean
   suiteArtifactCaptureUnavailable?: boolean
   trustedEvidence?: readonly TrustedEvidenceRecord[]
@@ -85,9 +89,13 @@ export function evaluateCompletionGate(input: CompletionGateInput): CompletionGa
   validateBoolean(input.verifierResultPresent, 'verifierResultPresent', invalidFields)
   validateBoolean(input.allRequiredEvidencePass, 'allRequiredEvidencePass', invalidFields)
   validateBoolean(input.workspaceArtifactCaptureUnavailable, 'workspaceArtifactCaptureUnavailable', invalidFields)
+  validateBoolean(input.workspaceHeadChanged, 'workspaceHeadChanged', invalidFields)
+  validateBoolean(input.workspaceTreeChangedAfterEvidence, 'workspaceTreeChangedAfterEvidence', invalidFields)
   validateBoolean(input.suiteArtifactCaptureUnavailable, 'suiteArtifactCaptureUnavailable', invalidFields)
   validateTrustedEvidence(input.trustedEvidence, invalidFields)
-  const forbiddenPaths = uniqueNonEmpty(input.forbiddenPaths, invalidFields)
+  const forbiddenPaths = uniqueNonEmpty(input.forbiddenPaths, invalidFields, 'forbiddenPaths')
+  const outOfScopePaths = uniqueNonEmpty(input.outOfScopePaths, invalidFields, 'outOfScopePaths')
+  const unenforcedConstraints = uniqueNonEmpty(input.unenforcedConstraints, invalidFields, 'unenforcedConstraints')
   const workspaceHash = compareHashPair(
     input.workspaceHashBefore,
     input.workspaceHashAfter,
@@ -105,14 +113,32 @@ export function evaluateCompletionGate(input: CompletionGateInput): CompletionGa
     return inconclusive(invalidFields.map((field) => `invalid completion evidence: ${field}`))
   }
 
-  if (input.suiteChanged || forbiddenPaths.length || forbiddenPathCount || workspaceHash === 'mismatch' || artifactHash === 'mismatch') {
+  if (
+    input.suiteChanged ||
+    forbiddenPaths.length ||
+    forbiddenPathCount ||
+    outOfScopePaths.length ||
+    workspaceHash === 'mismatch' ||
+    artifactHash === 'mismatch' ||
+    input.workspaceHeadChanged ||
+    input.workspaceTreeChangedAfterEvidence
+  ) {
     const reasons: string[] = []
     if (input.suiteChanged) reasons.push('evaluation suite changed during the turn')
     if (forbiddenPaths.length) reasons.push(`forbidden paths changed: ${forbiddenPaths.join(', ')}`)
     if (forbiddenPathCount) reasons.push(`${forbiddenPathCount} forbidden path changes detected`)
+    if (outOfScopePaths.length) reasons.push(`paths outside allowed scope changed: ${outOfScopePaths.join(', ')}`)
     if (workspaceHash === 'mismatch') reasons.push('workspace artifact hash changed after capture')
     if (artifactHash === 'mismatch') reasons.push('captured artifact hash changed after capture')
+    if (input.workspaceHeadChanged) reasons.push('workspace HEAD changed during the turn')
+    if (input.workspaceTreeChangedAfterEvidence) reasons.push('workspace tree changed after evidence capture')
     return { verdict: 'fail', reasons }
+  }
+
+  if (unenforcedConstraints.length) {
+    return inconclusive([
+      `unenforced harness constraints: ${unenforcedConstraints.join(', ')}`
+    ])
   }
 
   if (
@@ -222,16 +248,20 @@ function validateTrustedEvidence(value: readonly TrustedEvidenceRecord[] | undef
   }
 }
 
-function uniqueNonEmpty(paths: readonly string[] | undefined, invalidFields: string[]): string[] {
+function uniqueNonEmpty(
+  paths: readonly string[] | undefined,
+  invalidFields: string[],
+  fieldName: string
+): string[] {
   if (paths === undefined) return []
   if (!Array.isArray(paths)) {
-    invalidFields.push('forbiddenPaths')
+    invalidFields.push(fieldName)
     return []
   }
   const normalized: string[] = []
   for (const path of paths) {
     if (typeof path !== 'string') {
-      invalidFields.push('forbiddenPaths')
+      invalidFields.push(fieldName)
       continue
     }
     const trimmed = path.trim()

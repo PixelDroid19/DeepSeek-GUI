@@ -7,6 +7,7 @@ import {
   getReadClassification,
   isBinaryBuffer,
   normalizePositiveInteger,
+  assertWorkspacePathContained,
   resolveWorkspacePath,
   withToolBoundary
 } from './builtin-tool-utils.js'
@@ -36,6 +37,11 @@ export function createReadLocalTool(options: ReadLocalToolOptions = {}): LocalTo
       const rawPath = typeof args.path === 'string' ? args.path : ''
       if (!rawPath.trim()) return { output: { error: 'path is required' }, isError: true }
       const { absolutePath, relativePath } = resolveWorkspacePath(rawPath, context)
+      // Injected backends may intentionally address virtual paths; the default
+      // filesystem backend is the model-controlled boundary that needs sealing.
+      if (!options.operations?.stat && !options.operations?.readFile) {
+        await assertWorkspacePathContained(absolutePath, context.workspace)
+      }
       await statOp(absolutePath)
       const fileBuffer = await readFileOp(absolutePath)
       const classification = getReadClassification(absolutePath, context.workspace)

@@ -56,6 +56,8 @@ export const BenchmarkAdapterTrialOptionsSchema = z.object({
   harnessCommit: BenchmarkAdapterIdentifierSchema.default('unrecorded'),
   budgets: HarnessTrialBudgetsSchema.default(DEFAULT_BENCHMARK_TRIAL_BUDGETS),
   executionPolicy: HarnessExecutionPolicySchema.default('adaptive'),
+  workspaceSnapshotDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+  attemptId: BenchmarkAdapterIdentifierSchema.optional(),
   seed: z.number().int().nonnegative().max(2_147_483_647).optional()
 }).strict()
 export type BenchmarkAdapterTrialOptions = z.input<typeof BenchmarkAdapterTrialOptionsSchema>
@@ -128,6 +130,8 @@ export function createAdaptedBenchmarkTrial(input: {
       endpointFormat: options.endpointFormat,
       harnessCommit: options.harnessCommit,
       environmentDigest: input.environmentDigest,
+      ...(options.workspaceSnapshotDigest === undefined ? {} : { workspaceSnapshotDigest: options.workspaceSnapshotDigest }),
+      ...(options.attemptId === undefined ? {} : { attemptId: options.attemptId }),
       ...(options.seed === undefined ? {} : { seed: options.seed })
     })
   } catch (error) {

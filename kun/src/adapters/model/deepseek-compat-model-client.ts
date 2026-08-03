@@ -321,6 +321,9 @@ export class DeepseekCompatModelClient implements ModelClient {
     if (request.topP !== undefined) {
       body.top_p = request.topP
     }
+    if (request.seed !== undefined) {
+      body.seed = request.seed
+    }
     if (request.responseFormat === 'json_object') {
       body.response_format = { type: 'json_object' }
     }

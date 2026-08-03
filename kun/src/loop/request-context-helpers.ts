@@ -2,7 +2,9 @@ import type { PrefixVolatilityFinding } from '../cache/prefix-volatility.js'
 import {
   effectiveMemoryProvenance,
   isEvidenceLessModelInference,
-  type MemoryRecord
+  type MemoryKind,
+  type MemoryRecord,
+  type MemoryStatus
 } from '../contracts/memory.js'
 
 export function resolveModelMode(...candidates: Array<string | undefined>): { kind: 'fixed'; model: string } | { kind: 'auto' } {
@@ -24,23 +26,34 @@ export function normalizeRequestedReasoningEffort(effort: string | undefined): s
 export function memoryInstructions(memories: Array<Pick<
   MemoryRecord,
   'id' | 'content' | 'provenance'
-> & { scope: string; confidence?: number }>): string[] {
+> & { scope: string; confidence?: number; kind?: MemoryKind; status?: MemoryStatus }>): string[] {
   if (memories.length === 0) return []
-  const facts = memories.filter((memory) => !isEvidenceLessModelInference(memory))
-  const hypotheses = memories.filter((memory) => isEvidenceLessModelInference(memory))
+  const facts = memories.filter((memory) => !isCandidate(memory))
+  const hypotheses = memories.filter(isCandidate)
   const lines = ['Relevant long-term memories for this turn:']
   if (facts.length) {
-    lines.push(...facts.map((memory) => `- [${memory.id}] (${memory.scope}) ${memory.content}${renderProvenance(memory)}`))
+    lines.push(...facts.map((memory) => `- [${memory.id}] (${memoryLabel(memory)}) ${memory.content}${renderProvenance(memory)}`))
   }
   if (hypotheses.length) {
     lines.push('Prior hypotheses (unverified):')
     lines.push(...hypotheses.map((memory) =>
-      `- [${memory.id}] (${memory.scope}) hypothesis: ${memory.content} (confidence ${(memory.confidence ?? 0.5).toFixed(2)})`
+      `- [${memory.id}] (${memoryLabel(memory)}) hypothesis: ${memory.content} (confidence ${(memory.confidence ?? 0.5).toFixed(2)})`
     ))
   }
   return [
     lines.join('\n')
   ]
+}
+
+function isCandidate(memory: Pick<MemoryRecord, 'provenance'> & { status?: MemoryStatus }): boolean {
+  return memory.status === 'candidate' || isEvidenceLessModelInference(memory)
+}
+
+function memoryLabel(memory: { scope: string; kind?: MemoryKind; status?: MemoryStatus; provenance?: MemoryRecord['provenance'] }): string {
+  const candidate = isCandidate(memory)
+  const kind = memory.kind ?? (candidate ? 'hypothesis' : 'fact')
+  const status = memory.status ?? (candidate ? 'candidate' : 'verified')
+  return `${memory.scope}, ${kind}, ${status}`
 }
 
 function renderProvenance(memory: Pick<MemoryRecord, 'provenance'>): string {

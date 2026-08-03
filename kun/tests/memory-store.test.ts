@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -29,12 +29,13 @@ describe('Memory store and recall', () => {
 
   it('stores scoped memories, retrieves relevant records, and keeps tombstones', async () => {
     const store = createStore()
-    const memory = await store.create({
+    const memory = await createVerified(store, {
       content: 'User prefers pnpm for frontend projects',
       scope: 'workspace',
       workspace: '/tmp/ws',
       tags: ['frontend'],
-      confidence: 0.9
+      confidence: 0.9,
+      provenance: { kind: 'user-stated' }
     })
     await store.create({
       content: 'Unrelated backend preference',
@@ -52,6 +53,148 @@ describe('Memory store and recall', () => {
     await store.delete(memory.id)
     expect(await store.retrieve({ query: 'pnpm', workspace: '/tmp/ws', limit: 3 })).toEqual([])
     expect((await store.list({ workspace: '/tmp/ws', includeDeleted: true })).find((item) => item.id === memory.id)?.deletedAt).toBeTruthy()
+  })
+
+  it('keeps project-scoped memories out of unrelated projects', async () => {
+    const store = createStore()
+    const projectA = await createVerified(store, {
+      content: 'The deployment gate requires the release checklist',
+      scope: 'project',
+      project: 'project-a',
+      provenance: { kind: 'user-stated' }
+    })
+    await createVerified(store, {
+      content: 'The deployment gate requires the release checklist',
+      scope: 'project',
+      project: 'project-b',
+      provenance: { kind: 'user-stated' }
+    })
+
+    const recalled = await store.retrieve({
+      query: 'deployment release checklist',
+      workspace: '/tmp/ws',
+      project: 'project-a',
+      limit: 10
+    })
+
+    expect(recalled.map((record) => record.id)).toEqual([projectA.id])
+  })
+
+  it('rebuilds the SQLite FTS index and traces bounded verified retrieval', async () => {
+    const store = createStore({ maxInjectedRecords: 2 })
+    const procedure = await createVerified(store, {
+      content: 'Release checklist requires a migration dry run',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      kind: 'procedure',
+      provenance: {
+        kind: 'verified-by-command',
+        evidence: { command: 'pnpm test' },
+        verifiedAt: '2026-06-03T00:00:00.000Z'
+      }
+    })
+    const oversized = await createVerified(store, {
+      content: `Release checklist ${'requires documented validation '.repeat(8)}`,
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      kind: 'gotcha',
+      provenance: {
+        kind: 'observed-in-file',
+        evidence: { file: 'docs/release.md' },
+        verifiedAt: '2026-06-03T00:00:00.000Z'
+      }
+    })
+    await store.create({
+      content: 'Release checklist might require a manual approval',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      kind: 'hypothesis',
+      status: 'candidate',
+      provenance: { kind: 'model-inferred' }
+    })
+
+    const recalled = await store.retrieve({
+      query: 'release checklist',
+      workspace: '/tmp/ws',
+      limit: 10,
+      budgetBytes: 90
+    })
+
+    expect(recalled.map((record) => record.id)).toEqual([procedure.id])
+    const diagnostics = await store.diagnostics()
+    expect(diagnostics.index).toMatchObject({
+      backend: 'sqlite-fts5-bm25',
+      version: 1
+    })
+    expect(diagnostics.lastRetrieval).toMatchObject({
+      backend: 'sqlite-fts5-bm25',
+      maxInjectedRecords: 2,
+      budgetBytes: 90,
+      returnedIds: [procedure.id],
+      droppedByBudgetIds: [oversized.id],
+      filteredStatusCounts: { candidate: 1 }
+    })
+
+    const rebuilt = createStore({ maxInjectedRecords: 2 })
+    await rebuilt.rebuildIndex()
+    expect((await rebuilt.retrieve({
+      query: 'migration release',
+      workspace: '/tmp/ws',
+      limit: 10,
+      budgetBytes: 512
+    })).map((record) => record.id)).toContain(procedure.id)
+  })
+
+  it('starts new memories as candidates and requires an official outcome to promote them', async () => {
+    const store = createStore()
+    await expect(store.create({
+      content: 'Release validation completed',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      kind: 'fact',
+      status: 'verified',
+      provenance: {
+        kind: 'verified-by-command',
+        evidence: { command: 'pnpm test' },
+        verifiedAt: '2026-06-03T00:00:00.000Z'
+      }
+    })).rejects.toThrow('new memory cannot start as verified')
+
+    const candidate = await store.create({
+      content: 'Release validation completed',
+      scope: 'workspace',
+      workspace: '/tmp/ws',
+      kind: 'fact',
+      provenance: { kind: 'model-inferred' }
+    })
+    expect(candidate.status).toBe('candidate')
+    await expect(store.update(candidate.id, { status: 'verified' })).rejects.toThrow('official outcome')
+
+    const promoted = await store.promoteFromOutcome({
+      id: candidate.id,
+      officialOutcome: 'pass',
+      evidenceRefs: [{
+        source: 'command-outcome',
+        ref: 'tool_result:turn_1:call_1',
+        evidence: { command: 'pnpm test' }
+      }],
+      digests: [{
+        algorithm: 'sha256',
+        source: 'evidence',
+        value: 'a'.repeat(64)
+      }],
+      environment: { workspace: '/tmp/ws' }
+    })
+    expect(promoted).toMatchObject({
+      status: 'verified',
+      provenance: {
+        kind: 'verified-by-command',
+        evidence: { command: 'pnpm test' }
+      }
+    })
+    await expect(store.update(candidate.id, {
+      provenance: { kind: 'model-inferred' }
+    })).rejects.toThrow('verified memory requires independent evidence')
   })
 
   it('caps unverified inferred memory confidence and preserves verified provenance', async () => {
@@ -142,7 +285,7 @@ describe('Memory store and recall', () => {
 
   it('marks branch-sensitive memories stale when git observes a different branch', async () => {
     const store = createStore()
-    const memory = await store.create({
+    const memory = await createVerified(store, {
       content: 'Feature branch setup uses flag X',
       scope: 'workspace',
       workspace: '/tmp/ws',
@@ -191,7 +334,9 @@ describe('Memory store and recall', () => {
     })
 
     expect(created).toHaveLength(5)
-    expect(created.slice(0, 2).every((record) => record.provenance?.kind === 'verified-by-command')).toBe(true)
+    expect(created.slice(0, 2).every((record) => record.provenance?.kind === 'model-inferred')).toBe(true)
+    expect(created.slice(0, 2).every((record) => record.kind === 'gotcha' && record.status === 'candidate')).toBe(true)
+    expect(created.slice(2).every((record) => record.kind === 'hypothesis' && record.status === 'candidate')).toBe(true)
     expect(created.some((record) => record.content === 'use Zod for contracts')).toBe(false)
     expect(created.every((record) => record.sourceThreadId === 'thr_1' && record.sourceTurnId === 'turn_9')).toBe(true)
   })
@@ -213,6 +358,20 @@ describe('Memory store and recall', () => {
     )
     expect(created.status).toBe(201)
     const body = await readJson(created) as { memory: { id: string } }
+
+    const forgedHarnessOrigin = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/memory', {
+        method: 'POST',
+        headers: { authorization: 'Bearer tok-1', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          content: 'Attempt to forge a harness procedure',
+          workspace: '/tmp/ws',
+          harnessOrigin: { trialDigest: `sha256:${'a'.repeat(64)}`, taskId: 'forged' }
+        })
+      })
+    )
+    expect(forgedHarnessOrigin.status).toBe(400)
 
     const list = await dispatchRequest(
       h.router,
@@ -277,10 +436,11 @@ describe('Memory store and recall', () => {
 
   it('injects relevant memories into AgentLoop metadata and stops after deletion', async () => {
     const store = createStore()
-    const memory = await store.create({
+    const memory = await createVerified(store, {
       content: 'Use pnpm when touching frontend code',
       scope: 'workspace',
-      workspace: '/tmp/ws'
+      workspace: '/tmp/ws',
+      provenance: { kind: 'user-stated' }
     })
     const seenRequests: ModelRequest[] = []
     const model: ModelClient = {
@@ -309,6 +469,32 @@ describe('Memory store and recall', () => {
     expect(finalInstructions).toContain('Shell runtime:')
   })
 
+  it('uses the configured memory record cap when injecting loop context', async () => {
+    const store = createStore({ maxInjectedRecords: 9 })
+    const memories = []
+    for (let index = 0; index < 9; index += 1) {
+      memories.push(await createVerified(store, {
+        content: `Release procedure checkpoint ${index + 1}`,
+        scope: 'workspace',
+        workspace: '/tmp/ws',
+        provenance: { kind: 'user-stated' }
+      }))
+    }
+    const model: ModelClient = {
+      provider: 'fake',
+      model: 'fake',
+      async *stream() {
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }
+    const h = makeHarness(model, { memoryStore: store })
+    await bootstrapThread(h, { workspace: '/tmp/ws', request: { prompt: 'release procedure checkpoint' } })
+
+    await h.loop.runTurn(h.threadId, h.turnId)
+
+    expect((await h.turns.getTurn(h.threadId, h.turnId))?.injectedMemoryIds).toEqual(memories.map((memory) => memory.id))
+  })
+
   it('writes memory records atomically (no .tmp file left on success)', async () => {
     const store = createStore()
     await store.create({ content: 'atomic test memory' })
@@ -324,6 +510,14 @@ describe('Memory store and recall', () => {
     // No .tmp leftover from the atomic write.
     const entries = await readdir(join(dir, 'memory'))
     expect(entries.filter((entry) => entry.includes('.tmp'))).toEqual([])
+  })
+
+  it('fails loudly when a canonical memory record is malformed', async () => {
+    await mkdir(join(dir, 'memory'), { recursive: true })
+    await writeFile(join(dir, 'memory', 'broken.json'), '{not-json', 'utf8')
+    const store = createStore()
+
+    await expect(store.ready()).rejects.toThrow('memory record broken.json is invalid')
   })
 
   function createStore(overrides: Partial<MemoryCapabilityConfig> = {}) {
@@ -342,5 +536,37 @@ describe('Memory store and recall', () => {
         ...overrides
       }
     }).memory
+  }
+
+  async function createVerified(
+    store: FileMemoryStore,
+    input: Parameters<FileMemoryStore['create']>[0]
+  ) {
+    const candidate = await store.create(input)
+    const source = candidate.provenance?.kind === 'observed-in-file'
+      ? 'file-observation'
+      : candidate.provenance?.kind === 'user-stated'
+        ? 'user-confirmation'
+        : 'command-outcome'
+    return store.promoteFromOutcome({
+      id: candidate.id,
+      officialOutcome: 'pass',
+      evidenceRefs: [{
+        source,
+        ref: `tool_result:${candidate.id}`,
+        evidence: candidate.provenance?.evidence ?? { command: 'pnpm test' }
+      }],
+      digests: [{
+        algorithm: 'sha256',
+        source: 'evidence',
+        value: 'b'.repeat(64)
+      }],
+      environment: {
+        ...(candidate.workspace ? { workspace: candidate.workspace } : {}),
+        ...(candidate.project ? { project: candidate.project } : {}),
+        ...(candidate.provenance?.evidence?.branch ? { branch: candidate.provenance.evidence.branch } : {}),
+        ...(candidate.provenance?.evidence?.commit ? { commit: candidate.provenance.evidence.commit } : {})
+      }
+    })
   }
 })

@@ -22,6 +22,7 @@ export type RecoveryFailure =
   | 'max_recovery_rounds'
   | 'duplicate_action'
   | 'hypothesis_missing'
+  | 'guidance_rejected'
   | 'invalid_stage'
 
 export type RecoveryBudget = {

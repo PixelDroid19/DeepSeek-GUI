@@ -4,6 +4,7 @@ import type { ThreadStore } from '../ports/thread-store.js'
 import type { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
 import type { TurnService } from '../services/turn-service.js'
 import type { UsageService } from '../services/usage-service.js'
+import type { ThreadMutationCoordinator } from '../services/thread-mutation.js'
 
 export type BudgetGateResult = 'allow' | 'blocked'
 
@@ -12,10 +13,11 @@ export async function checkBudgetGate(input: {
   threadId: string
   turnId: string
   usage: Pick<UsageService, 'forThread'>
-  threadStore: Pick<ThreadStore, 'upsert'>
+  threadStore: Pick<ThreadStore, 'upsert'> & Partial<Pick<ThreadStore, 'get'>>
   turns: Pick<TurnService, 'applyItem'>
   events: Pick<RuntimeEventRecorder, 'record'>
   nowIso: () => string
+  threadMutations?: ThreadMutationCoordinator
 }): Promise<BudgetGateResult> {
   if (!input.thread) return 'allow'
   const budget = input.thread.costBudgetUsd
@@ -43,11 +45,35 @@ export async function checkBudgetGate(input: {
 
   if (spent >= budget * 0.8 && input.thread.costBudgetWarningSent !== true) {
     const message = `Cost budget warning: $${spent.toFixed(4)} used of $${budget.toFixed(4)}.`
-    await input.threadStore.upsert({
-      ...input.thread,
-      costBudgetWarningSent: true,
-      updatedAt: input.nowIso()
-    })
+    let warningRecorded = false
+    const persistWarning = async (): Promise<void> => {
+      const current = input.threadStore.get
+        ? await input.threadStore.get(input.threadId)
+        : input.thread
+      if (!current || current.costBudgetWarningSent === true) return
+      const currentBudget = current.costBudgetUsd
+      const currentSpent = input.usage.forThread(input.threadId).costUsd ?? 0
+      if (
+        typeof currentBudget !== 'number' ||
+        !Number.isFinite(currentBudget) ||
+        currentBudget <= 0 ||
+        currentSpent < currentBudget * 0.8
+      ) {
+        return
+      }
+      await input.threadStore.upsert({
+        ...current,
+        costBudgetWarningSent: true,
+        updatedAt: input.nowIso()
+      })
+      warningRecorded = true
+    }
+    if (input.threadMutations) {
+      await input.threadMutations.run(input.threadId, persistWarning)
+    } else {
+      await persistWarning()
+    }
+    if (!warningRecorded) return 'allow'
     await input.turns.applyItem(input.threadId, makeErrorItem({
       id: `item_${input.turnId}_budget_warning`,
       threadId: input.threadId,

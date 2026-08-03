@@ -31,8 +31,13 @@ import {
   type TurnLease,
   type TurnLeaseStore
 } from './adaptive-trial-lease.js'
+import {
+  LeaseThreadMutationCoordinator,
+  getThreadMutationCoordinator,
+  type ThreadMutationCoordinator
+} from './thread-mutation.js'
 
-const THREAD_MUTATION_RETRY_MS = 5
+const THREAD_DELETION_POLL_INTERVAL_MS = 50
 
 export type TurnServiceDeps = {
   threadStore: ThreadStore
@@ -49,6 +54,8 @@ export type TurnServiceDeps = {
    * serialized across runtimes and adaptive model dispatch stays exclusive.
    */
   turnLeases?: TurnLeaseStore
+  /** Optional shared fence for all durable read-mutate-write operations. */
+  threadMutations?: ThreadMutationCoordinator
   roles?: RolesConfig
 }
 
@@ -61,17 +68,28 @@ export type TurnServiceDeps = {
 export class TurnService {
   private readonly deps: TurnServiceDeps
   private readonly inflightTurns = new Map<string, AbortController>()
-  private readonly threadMutationQueues = new Map<string, Promise<void>>()
   private readonly turnLeases: TurnLeaseStore
+  private readonly threadMutations: ThreadMutationCoordinator
   private readonly activeAdaptiveTrialLeases = new Map<string, TurnLease>()
   private readonly retainedAdaptiveStartLeases = new Map<
     string,
     { turnId: string; lease: TurnLease }
   >()
+  private readonly deletionWatchers = new Map<string, ReturnType<typeof setInterval>>()
 
   constructor(deps: TurnServiceDeps) {
     this.deps = deps
-    this.turnLeases = deps.turnLeases ?? new InMemoryTurnLeaseStore()
+    const explicitTurnLeases = deps.turnLeases
+    this.threadMutations = getThreadMutationCoordinator({
+      threadStore: deps.threadStore,
+      ...(explicitTurnLeases ? { turnLeases: explicitTurnLeases } : {}),
+      coordinator: deps.threadMutations
+    })
+    this.turnLeases = explicitTurnLeases ?? (
+      this.threadMutations instanceof LeaseThreadMutationCoordinator
+        ? this.threadMutations.leaseStore
+        : new InMemoryTurnLeaseStore()
+    )
   }
 
   async startTurn(input: {
@@ -167,6 +185,7 @@ export class TurnService {
         item: started.userItem
       })
       this.inflightTurns.set(turnId, controller)
+      this.watchThreadDeletion(input.threadId, turnId, controller)
       this.deps.inflight.begin({
         id: turnId,
         kind: 'model',
@@ -247,6 +266,7 @@ export class TurnService {
     if (controller) controller.abort()
     this.deps.steering.clear()
     this.inflightTurns.delete(input.turnId)
+    this.stopThreadDeletionWatch(input.turnId)
     this.deps.inflight.end(input.turnId)
     const interrupted = await this.withThreadMutation(input.threadId, async (current, persist) => {
       if (!current) return false
@@ -292,11 +312,6 @@ export class TurnService {
   }
 
   async compact(input: { threadId: string; turnId?: string; request: CompactRequest }): Promise<CompactResponse> {
-    const thread = await this.deps.threadStore.get(input.threadId)
-    if (!thread) throw new Error(`thread not found: ${input.threadId}`)
-    const turnId = input.turnId ?? thread.turns[thread.turns.length - 1]?.id ?? this.deps.ids.next('turn')
-    const items = await this.deps.sessionStore.loadItems(input.threadId)
-    const history = items.filter((item) => !this.isSystemOnly(item))
     const prefix = {
       systemPrompt: '',
       tools: [],
@@ -305,17 +320,38 @@ export class TurnService {
       fingerprint: 'compact',
       revision: 0
     }
-    const result = this.deps.compactor.compact({
-      threadId: input.threadId,
-      turnId,
-      history,
-      prefix,
-      budgetTokens: input.request.budgetTokens,
-      reason: input.request.reason
+    const compacted = await this.threadMutations.run(input.threadId, async () => {
+      const thread = await this.deps.threadStore.get(input.threadId)
+      if (!thread) throw new Error(`thread not found: ${input.threadId}`)
+      const turnId = input.turnId ?? thread.turns[thread.turns.length - 1]?.id ?? this.deps.ids.next('turn')
+      const items = await this.deps.sessionStore.loadItems(input.threadId)
+      const history = items.filter((item) => !this.isSystemOnly(item))
+      const result = this.deps.compactor.compact({
+        threadId: input.threadId,
+        turnId,
+        history,
+        prefix,
+        budgetTokens: input.request.budgetTokens,
+        reason: input.request.reason
+      })
+      if (result.replacedTokens > 0) {
+        // Compaction is a new boundary for model context, not permission to
+        // destroy the append-only transcript used by UI/export/replay.
+        await this.deps.sessionStore.appendItem(input.threadId, result.summaryItem)
+        const turn = thread.turns.find((candidate) => candidate.id === turnId)
+        if (turn) {
+          const turns = thread.turns.map((candidate) =>
+            candidate.id === turnId ? appendTurnItem(candidate, result.summaryItem) : candidate
+          )
+          await this.deps.threadStore.upsert({
+            ...touchThread(thread, this.deps.nowIso()),
+            turns
+          })
+        }
+      }
+      return { result, turnId }
     })
-    if (result.replacedTokens > 0) {
-      await this.appendItem(input.threadId, result.summaryItem, { requiresRunning: false })
-    }
+    const { result, turnId } = compacted
     await this.deps.events.record({
       kind: 'compaction_completed',
       threadId: input.threadId,
@@ -362,6 +398,7 @@ export class TurnService {
     error?: string
   }): Promise<void> {
     this.inflightTurns.delete(input.turnId)
+    this.stopThreadDeletionWatch(input.turnId)
     this.deps.inflight.end(input.turnId)
     this.deps.steering.clear()
     const errorItem = input.error
@@ -552,35 +589,52 @@ export class TurnService {
       persist: (next: ThreadRecord) => Promise<void>
     ) => Promise<T>
   ): Promise<T> {
-    const previous = this.threadMutationQueues.get(threadId) ?? Promise.resolve()
-    const run = previous.catch(() => undefined).then(async () => {
-      const mutationLease = await this.acquireThreadMutationLease(threadId)
-      try {
-        const current = await this.deps.threadStore.get(threadId)
-        return await operation(current, async (next) => {
-          await this.deps.threadStore.upsert({ ...next, updatedAt: this.deps.nowIso() })
-        })
-      } finally {
-        await this.turnLeases.release(mutationLease).catch(() => undefined)
-      }
+    return this.threadMutations.run(threadId, async () => {
+      const current = await this.deps.threadStore.get(threadId)
+      return operation(current, async (next) => {
+        await this.deps.threadStore.upsert({ ...next, updatedAt: this.deps.nowIso() })
+      })
     })
-    const guard = run.then(() => undefined, () => undefined)
-    this.threadMutationQueues.set(threadId, guard)
-    try {
-      return await run
-    } finally {
-      if (this.threadMutationQueues.get(threadId) === guard) {
-        this.threadMutationQueues.delete(threadId)
-      }
-    }
   }
 
-  private async acquireThreadMutationLease(threadId: string): Promise<TurnLease> {
-    for (;;) {
-      const lease = await this.turnLeases.acquireMutation({ threadId })
-      if (lease) return lease
-      await new Promise<void>((resolve) => setTimeout(resolve, THREAD_MUTATION_RETRY_MS))
+  /**
+   * A remote runtime cannot reach this process's AbortController directly.
+   * Polling the durable tombstone while a turn is active makes deletion cancel
+   * the local model/tool signal as soon as the shared store observes it.
+   */
+  private watchThreadDeletion(threadId: string, turnId: string, controller: AbortController): void {
+    this.stopThreadDeletionWatch(turnId)
+    let checking = false
+    const check = async (): Promise<void> => {
+      if (checking || controller.signal.aborted) return
+      checking = true
+      try {
+        if (await this.deps.threadStore.isDeleted(threadId)) {
+          controller.abort()
+          this.stopThreadDeletionWatch(turnId)
+        }
+      } catch {
+        // Loss of the durable cancellation source must not leave an external
+        // tool running without a valid thread lifecycle.
+        controller.abort()
+        this.stopThreadDeletionWatch(turnId)
+      } finally {
+        checking = false
+      }
     }
+    void check()
+    const watcher = setInterval(() => {
+      void check()
+    }, THREAD_DELETION_POLL_INTERVAL_MS)
+    watcher.unref?.()
+    this.deletionWatchers.set(turnId, watcher)
+  }
+
+  private stopThreadDeletionWatch(turnId: string): void {
+    const watcher = this.deletionWatchers.get(turnId)
+    if (!watcher) return
+    clearInterval(watcher)
+    this.deletionWatchers.delete(turnId)
   }
 
   private async releaseAdaptiveTrialLease(turnId: string): Promise<void> {

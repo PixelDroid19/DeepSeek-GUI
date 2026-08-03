@@ -177,18 +177,37 @@ export const ContextEnginePlaybookConfigSchema = z
   })
   .strict()
 
+export const RepositoryRetrievalConfigSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    maxFiles: PositiveInt.default(6),
+    maxLinesPerFile: PositiveInt.default(80),
+    maxFileBytes: PositiveInt.default(128 * 1024),
+    maxQueryTokens: PositiveInt.default(32)
+  })
+  .strict()
+export type RepositoryRetrievalConfig = z.infer<typeof RepositoryRetrievalConfigSchema>
+
 export const ContextEngineConfigSchema = z
   .object({
     enabled: z.boolean().default(true),
     injectionTokenBudget: PositiveInt.default(2000),
-    playbook: ContextEnginePlaybookConfigSchema.default({ enabled: true })
+    playbook: ContextEnginePlaybookConfigSchema.default({ enabled: true }),
+    repositoryRetrieval: RepositoryRetrievalConfigSchema.optional()
   })
   .strict()
 
 export const DEFAULT_CONTEXT_ENGINE_CONFIG: ContextEngineConfig = {
   enabled: true,
   injectionTokenBudget: 2000,
-  playbook: { enabled: true }
+  playbook: { enabled: true },
+  repositoryRetrieval: {
+    enabled: false,
+    maxFiles: 6,
+    maxLinesPerFile: 80,
+    maxFileBytes: 128 * 1024,
+    maxQueryTokens: 32
+  }
 }
 
 export const MemoryConfigSchema = z
@@ -246,12 +265,15 @@ export const DEFAULT_ROLES_CONFIG: RolesConfig = {
 export const StorageConfigSchema = z
   .object({
     backend: z.enum(['hybrid', 'file']).default('hybrid'),
-    sqlitePath: z.string().min(1).optional()
+    sqlitePath: z.string().min(1).optional(),
+    /** File fencing is local-host only; multi-host fails closed without an injected distributed coordinator. */
+    deployment: z.enum(['single-host', 'multi-host']).default('single-host')
   })
   .strict()
 
 export const DEFAULT_STORAGE_CONFIG: StorageConfig = {
-  backend: 'hybrid'
+  backend: 'hybrid',
+  deployment: 'single-host'
 }
 
 export const KunServeConfigSchema = z

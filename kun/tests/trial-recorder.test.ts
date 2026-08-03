@@ -9,6 +9,7 @@ import {
 import {
   TrialRecorder,
   replayTrialResult,
+  TrialResultSchema,
   trialResultFromJsonl,
   type TrialCausalTraceRecord,
   trialResultToJsonl,
@@ -249,6 +250,47 @@ describe('benchmark manifests and trial traces', () => {
     expect(failed.falseCompletion).toBe(true)
     expect(inconclusive.internalOutcome).toBe('inconclusive')
     expect(inconclusive.records.at(-1)).toMatchObject({ kind: 'outcome', gateVerdict: 'inconclusive' })
+  })
+
+  it('round-trips historical v1/v2 JSONL without treating it as current replayable evidence', () => {
+    const recorder = new TrialRecorder(parseBenchmarkManifest(manifest))
+    const current = recorder.record({
+      runtimeStatus: 'completed',
+      gate: { verdict: 'ship' },
+      usage,
+      wallTimeMs: 10,
+      items: trialItems({ callId: 'legacy-call', createdAt: '2026-08-03T10:00:00.000Z', secret: 'sk-legacy' }),
+      events: trialEvents('2026-08-03T10:00:00.000Z')
+    })
+    const toHistorical = (version: 1 | 2) => TrialResultSchema.parse({
+      version,
+      manifestHash: current.manifestHash,
+      identity: current.identity,
+      runtimeStatus: current.runtimeStatus,
+      gateVerdict: current.gateVerdict,
+      officialOutcome: current.internalOutcome,
+      falseCompletion: current.falseCompletion,
+      wallTimeMs: current.wallTimeMs,
+      usage: current.usage,
+      records: current.records
+        .filter((record) => version === 2 || record.kind !== 'causal')
+        .map((record) => record.kind === 'outcome'
+          ? (({ internalOutcome: _internalOutcome, ...legacy }) => ({ ...legacy, officialOutcome: current.internalOutcome }))(record)
+          : record),
+      stableDigest: current.stableDigest,
+      volatile: current.volatile
+    })
+
+    for (const version of [1, 2] as const) {
+      const historical = toHistorical(version)
+      const parsed = trialResultFromJsonl(trialResultToJsonl(historical))
+      expect(parsed.version).toBe(version)
+      if (parsed.version === version) expect(parsed.officialOutcome).toBe('pass')
+      expect(replayTrialResult(parsed)).toMatchObject({
+        valid: false,
+        reasons: expect.arrayContaining([expect.stringContaining('legacy')])
+      })
+    }
   })
 
   it('rejects forged causal parents and a changed stable digest', () => {

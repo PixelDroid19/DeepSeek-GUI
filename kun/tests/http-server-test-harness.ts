@@ -9,6 +9,10 @@ import { LocalToolHost, defaultLocalTools } from '../src/adapters/tool/local-too
 import { LocalWorkspaceInspector } from '../src/adapters/workspace/local-workspace-inspector.js'
 import { TurnService } from '../src/services/turn-service.js'
 import { ThreadService } from '../src/services/thread-service.js'
+import {
+  LeaseEventSequenceCoordinator,
+  LeaseThreadMutationCoordinator
+} from '../src/services/thread-mutation.js'
 import { UsageService } from '../src/services/usage-service.js'
 import { RuntimeEventRecorder } from '../src/services/runtime-event-recorder.js'
 import { InflightTracker } from '../src/loop/inflight-tracker.js'
@@ -89,13 +93,23 @@ export function buildHarness(): Harness {
   const sessionStore = new InMemorySessionStore()
   const inflight = new InflightTracker()
   const steering = new SteeringQueue()
+  const threadMutations = new LeaseThreadMutationCoordinator()
+  const eventMutations = new LeaseEventSequenceCoordinator({ turnLeases: threadMutations.leaseStore })
   const compactor = new ContextCompactor()
   const toolHost = new LocalToolHost({ tools: defaultLocalTools })
   const usage = new UsageService()
   const prefix = createImmutablePrefix({ systemPrompt: 'be brief' })
   const nowIso = () => new Date().toISOString()
   const allocateSeq = (threadId: string) => bus.allocateSeq(threadId)
-  const events = new RuntimeEventRecorder({ eventBus: bus, sessionStore, allocateSeq, nowIso })
+  const events = new RuntimeEventRecorder({
+    eventBus: bus,
+    sessionStore,
+    threadDeleted: async (threadId) => threadStore.isDeleted(threadId),
+    allocateSeq,
+    nowIso,
+    threadMutations,
+    eventMutations
+  })
   const ids = new SequentialIdGenerator()
   const turnService = new TurnService({
     threadStore,
@@ -106,9 +120,18 @@ export function buildHarness(): Harness {
     compactor,
     ids,
     nowIso,
-    usage
+    usage,
+    threadMutations
   })
-  const threadService = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
+  const threadService = new ThreadService({
+    threadStore,
+    sessionStore,
+    events,
+    ids,
+    nowIso,
+    threadMutations,
+    eventMutations
+  })
   const model = makeModel([{ kind: 'completed', stopReason: 'stop' }])
   const loop = new AgentLoop({
     threadStore,
@@ -120,6 +143,7 @@ export function buildHarness(): Harness {
     usage,
     events,
     turns: turnService,
+    threadMutations,
     inflight,
     steering,
     compactor,

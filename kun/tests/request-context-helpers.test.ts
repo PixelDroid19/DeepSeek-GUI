@@ -14,6 +14,8 @@ describe('request context helpers', () => {
         id: 'mem_1',
         scope: 'project',
         content: 'Use Kun runtime only.',
+        kind: 'procedure',
+        status: 'verified',
         confidence: 0.9,
         provenance: {
           kind: 'verified-by-command',
@@ -21,12 +23,19 @@ describe('request context helpers', () => {
           verifiedAt: '2026-06-11T00:00:00.000Z'
         }
       },
-      { id: 'mem_2', scope: 'global', content: 'Keep changes small.', confidence: 0.5 }
+      {
+        id: 'mem_2',
+        scope: 'global',
+        content: 'Keep changes small.',
+        kind: 'hypothesis',
+        status: 'candidate',
+        confidence: 0.5
+      }
     ])).toEqual([[
       'Relevant long-term memories for this turn:',
-      '- [mem_1] (project) Use Kun runtime only. (verified-by-command: command `npm test`, verified 2026-06-11T00:00:00.000Z)',
+      '- [mem_1] (project, procedure, verified) Use Kun runtime only. (verified-by-command: command `npm test`, verified 2026-06-11T00:00:00.000Z)',
       'Prior hypotheses (unverified):',
-      '- [mem_2] (global) hypothesis: Keep changes small. (confidence 0.50)'
+      '- [mem_2] (global, hypothesis, candidate) hypothesis: Keep changes small. (confidence 0.50)'
     ].join('\n')])
   })
 

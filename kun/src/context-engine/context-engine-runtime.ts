@@ -20,6 +20,8 @@ import { redactSensitiveText } from '../telemetry/target-normalization.js'
 import type { MemoryStore } from '../memory/memory-store.js'
 import { MemoryStalenessMonitor } from '../memory/memory-staleness.js'
 import { formMemoriesFromCompaction } from '../memory/memory-formation.js'
+import { estimateTextTokens } from '../loop/context-estimator.js'
+import { retrieveRepositoryContext } from './repository-retrieval.js'
 
 const execFileAsync = promisify(execFile)
 const READ_CLASS_TOOLS = new Set(['read', 'grep', 'find', 'ls'])
@@ -159,20 +161,49 @@ export class ContextEngineRuntime implements ToolExecutionObserver {
   }
 
   /** Renders the workspace-state injection block, or null when disabled/empty. */
-  async renderInjection(workspace: string): Promise<string | null> {
-    return (await this.renderInjectionDetailed(workspace))?.block ?? null
+  async renderInjection(workspace: string, query?: string): Promise<string | null> {
+    return (await this.renderInjectionDetailed(workspace, query))?.block ?? null
   }
 
   /** Renders the injection block plus included/dropped section names. */
-  async renderInjectionDetailed(workspace: string): Promise<WorkspaceStateBlockResult | null> {
+  async renderInjectionDetailed(workspace: string, query = ''): Promise<WorkspaceStateBlockResult | null> {
     try {
       if (!hasWorkspace(workspace)) return null
       if (!this.opts.contextEngine.enabled) return null
       const ledger = await this.ledgerFor(workspace).load()
-      return await renderWorkspaceState(ledger, {
+      const state = await renderWorkspaceState(ledger, {
         tokenBudget: this.opts.contextEngine.injectionTokenBudget,
         playbook: await this.playbookFor(workspace)
       })
+      const retrievalConfig = this.opts.contextEngine.repositoryRetrieval ?? {
+        enabled: false,
+        maxFiles: 6,
+        maxLinesPerFile: 80,
+        maxFileBytes: 128 * 1024,
+        maxQueryTokens: 32
+      }
+      const repository = retrievalConfig.enabled && query.trim()
+        ? await retrieveRepositoryContext({
+            workspace,
+            query,
+            tokenBudget: Math.max(64, Math.floor(this.opts.contextEngine.injectionTokenBudget * 0.45)),
+            config: retrievalConfig
+          })
+        : null
+      if (!state && !repository?.block) return null
+      const included = state?.included ? [...state.included] : []
+      const droppedByBudget = state?.droppedByBudget ? [...state.droppedByBudget] : []
+      let block = state?.block ?? ''
+      if (repository?.block) {
+        const combined = block ? `${block}\n\n${repository.block}` : repository.block
+        if (estimateTextTokens(combined) <= this.opts.contextEngine.injectionTokenBudget) {
+          block = combined
+          included.push('repository-context')
+        } else {
+          droppedByBudget.push('repository-context')
+        }
+      }
+      return { block, included, droppedByBudget }
     } catch {
       return null
     }

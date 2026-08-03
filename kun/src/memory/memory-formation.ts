@@ -42,13 +42,11 @@ function buildCandidates(input: CompactionMemoryFormationInput): MemoryCreateReq
       workspace: input.workspace,
       sourceThreadId: input.sourceThreadId,
       sourceTurnId: input.sourceTurnId,
+      kind: 'gotcha' as const,
+      status: 'candidate' as const,
       tags: ['compaction', 'error-resolved'],
-      confidence: 0.9,
-      provenance: {
-        kind: 'verified-by-command' as const,
-        evidence: { command: inferCommand(content) ?? content },
-        verifiedAt: input.nowIso ?? new Date().toISOString()
-      }
+      confidence: 0.5,
+      provenance: { kind: 'model-inferred' as const }
     }))
   const decisions = input.decisions
     .map((text) => text.trim())
@@ -59,6 +57,8 @@ function buildCandidates(input: CompactionMemoryFormationInput): MemoryCreateReq
       workspace: input.workspace,
       sourceThreadId: input.sourceThreadId,
       sourceTurnId: input.sourceTurnId,
+      kind: 'hypothesis' as const,
+      status: 'candidate' as const,
       tags: ['compaction', 'decision'],
       confidence: 0.5,
       provenance: { kind: 'model-inferred' as const }
@@ -68,9 +68,4 @@ function buildCandidates(input: CompactionMemoryFormationInput): MemoryCreateReq
 
 function normalizeMemoryContent(content: string): string {
   return content.toLowerCase().replace(/\s+/g, ' ').trim()
-}
-
-function inferCommand(text: string): string | undefined {
-  const match = text.match(/\b(?:npm|pnpm|yarn|vitest|jest|cargo|make|tsc|eslint)\b[^\n.;]*/)
-  return match?.[0]?.trim()
 }

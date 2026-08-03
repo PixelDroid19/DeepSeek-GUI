@@ -1,4 +1,6 @@
 export * from './benchmark-manifest.js'
 export * from './trial-recorder.js'
 export * from './compare.js'
+export * from './experience-memory.js'
+export * from './change-manifest.js'
 export * from './adapters/index.js'

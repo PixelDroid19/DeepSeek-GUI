@@ -429,7 +429,8 @@ describe('cli', () => {
       })
       expect(parsed.storage).toEqual({
         backend: 'hybrid',
-        sqlitePath: join(dir, 'data', 'index.sqlite3')
+        sqlitePath: join(dir, 'data', 'index.sqlite3'),
+        deployment: 'single-host'
       })
       expect(parsed.contextCompaction?.defaultSoftThreshold).toBe(32_000)
       expect(parsed.contextCompaction?.summaryMode).toBe('model')

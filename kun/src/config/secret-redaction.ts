@@ -2,7 +2,8 @@ const SECRET_KEY_PATTERN = /(api[-_]?key|authorization|bearer|client[-_]?secret|
 const SECRET_FIELD_NAME_PATTERN = '(?:authorization|api[-_]?key|client[-_]?secret|password|(?:[a-z0-9]+[-_]?)?(?:token|secret))'
 const SECRET_TEXT_PATTERNS = [
   new RegExp(`\\b(${SECRET_FIELD_NAME_PATTERN})\\s*[:=]\\s*((?:Bearer\\s+)?[^\\s,;]+)`, 'gi'),
-  /\bbearer\s+([^\s,;]+)/gi
+  /\bbearer\s+([^\s,;]+)/gi,
+  /\b(?:sk|rk|pk)-[a-z0-9_-]{8,}\b/gi
 ]
 const QUOTED_JSON_FIELD_PATTERN = new RegExp(
   `((["'])((?:\\\\.|(?!\\2)[\\s\\S])*)\\2\\s*:\\s*(["']))(?:\\\\.|(?!\\4)[\\s\\S])*(\\4|$)`,
@@ -38,9 +39,9 @@ export function redactSecretText(value: string): string {
       SECRET_KEY_PATTERN.test(key) ? `${prefix}${REDACTED_SECRET}${closing}` : match
   )
   return SECRET_TEXT_PATTERNS.reduce((current, pattern) =>
-    current.replace(pattern, (match, key) =>
-      match.toLowerCase().startsWith('bearer ')
-        ? `Bearer ${REDACTED_SECRET}`
-        : `${key}=${REDACTED_SECRET}`
-    ), quotedFieldsRedacted)
+    current.replace(pattern, (match, key) => {
+      if (match.toLowerCase().startsWith('bearer ')) return `Bearer ${REDACTED_SECRET}`
+      if (typeof key !== 'string') return REDACTED_SECRET
+      return `${key}=${REDACTED_SECRET}`
+    }), quotedFieldsRedacted)
 }

@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { lstat, readFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
+import { relative, resolve, sep } from 'node:path'
 import type { ApprovalGate } from '../ports/approval-gate.js'
 import type { ThreadStore } from '../ports/thread-store.js'
 import type { ChildRunExecutor } from '../delegation/delegation-runtime.js'
@@ -49,8 +51,17 @@ import {
 } from './adaptive-policy.js'
 import { ROLE_PROFILES, resolveRoleModel, roleEnabled } from './role-profiles.js'
 import type { StallSignal } from './stall-detector.js'
+import {
+  parseRecoveryArtifact,
+  renderRecoveryArtifact,
+  type RecoveryArtifact
+} from './recovery-artifact.js'
+import { evaluateGuidanceGate } from './guidance-gate.js'
 
 const execFileAsync = promisify(execFile)
+const MAX_CAPTURED_UNTRACKED_PATHS = 512
+const MAX_CAPTURED_TREE_FILES = 4_096
+const MAX_CAPTURED_TREE_BYTES = 256 * 1024 * 1024
 
 type PipelineStatus = 'completed' | 'failed' | 'aborted' | 'fallback'
 
@@ -80,6 +91,10 @@ type WorkspaceArtifactCapture = {
   text: string
   hash: string | null
   available: boolean
+  paths: string[]
+  head: string | null
+  fileDigests: ReadonlyMap<string, string>
+  treeComplete: boolean
 }
 
 type GitCaptureOutput =
@@ -87,7 +102,7 @@ type GitCaptureOutput =
   | { ok: false }
 
 type AdaptiveRecoveryResult =
-  | { status: 'completed'; hypothesis: string }
+  | { status: 'completed'; artifact: RecoveryArtifact }
   | { status: 'aborted' }
   | { status: 'failed'; failure: RecoveryFailure }
 
@@ -154,6 +169,7 @@ export class RigorousPipeline {
       const workspace = thread.workspace ?? ''
       const request = turn.prompt
       const pinnedHarnessModel = turn.harnessTask ? turn.model?.trim() : undefined
+      const samplingSeed = turn.harnessTask?.seed
       if (turn.harnessTask && !pinnedHarnessModel) {
         await this.deps.turns.finishTurn({
           threadId,
@@ -210,6 +226,7 @@ export class RigorousPipeline {
           prompt: plannerPrompt(request),
           threadModel: roleModel,
           ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
+          ...(samplingSeed === undefined ? {} : { samplingSeed }),
           threadId,
           turnId,
           workspace,
@@ -239,12 +256,14 @@ export class RigorousPipeline {
       // Snapshot the eval suite BEFORE any role can mutate it, so the
       // before/after hash exposes tampering by executor or verifier.
       const suiteBefore = await this.loadEvalSuite(workspace)
+      const initialWorkspaceCapture = await captureWorkspaceArtifact(workspace, turn.harnessTask)
       const firstExecution = await this.runExecutor({
         threadId,
         turnId,
         workspace,
         threadModel: roleModel,
         ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
+        ...(samplingSeed === undefined ? {} : { samplingSeed }),
         request,
         plan,
         signal,
@@ -268,6 +287,7 @@ export class RigorousPipeline {
         diff: firstDiff,
         evalSuite: suiteBefore?.suite,
         harnessTask: turn.harnessTask,
+        ...(samplingSeed === undefined ? {} : { samplingSeed }),
         signal,
         ...(adaptiveBudget ? { adaptiveBudget } : {})
       })
@@ -291,6 +311,7 @@ export class RigorousPipeline {
         workspace,
         threadModel: roleModel,
         ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
+        ...(samplingSeed === undefined ? {} : { samplingSeed }),
         plan,
         verification: firstVerification.artifact,
         verificationRawText: firstVerification.rawText,
@@ -323,9 +344,16 @@ export class RigorousPipeline {
         diff: firstDiff,
         workspaceHashBefore: firstWorkspaceCapture.hash,
         workspaceHashAfter: firstGateWorkspaceCapture.hash,
+        workspaceHeadChanged: workspaceHeadChanged(initialWorkspaceCapture, firstGateWorkspaceCapture),
+        workspaceTreeChangedAfterEvidence: changedWorkspaceTreePaths(firstWorkspaceCapture, firstGateWorkspaceCapture).length > 0,
         workspaceArtifactCaptureUnavailable: turn.harnessTask
-          ? !firstWorkspaceCapture.available || !firstGateWorkspaceCapture.available
+          ? !initialWorkspaceCapture.available || !firstGateWorkspaceCapture.available ||
+            !initialWorkspaceCapture.treeComplete || !firstGateWorkspaceCapture.treeComplete
           : undefined,
+        changedPaths: [
+          ...firstGateWorkspaceCapture.paths,
+          ...changedWorkspaceTreePaths(initialWorkspaceCapture, firstGateWorkspaceCapture)
+        ],
         suiteArtifactCaptureUnavailable: this.deps.evals?.enabled
           ? !suiteBefore || !firstGateSuite
           : undefined,
@@ -334,7 +362,7 @@ export class RigorousPipeline {
       })
       await this.persistCompletionGate(threadId, turnId, completionGate, firstTrustedEvidence, 'initial')
 
-      let recoveryHypothesis: string | undefined
+      let recoveryHypothesis: RecoveryArtifact | undefined
       if (
         completionGate.verdict === 'fix' &&
         turn.harnessTask?.executionPolicy === 'adaptive' &&
@@ -349,8 +377,10 @@ export class RigorousPipeline {
           verification: firstVerification.artifact,
           diff: firstDiff,
           priorReviewerReasons: review.artifact.reasons,
+          trustedEvidence: firstTrustedEvidence,
           threadModel: roleModel,
           ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
+          ...(samplingSeed === undefined ? {} : { samplingSeed }),
           adaptiveBudget: requireAdaptiveBudget(adaptiveBudget),
           abortSignal: signal
         })
@@ -364,7 +394,7 @@ export class RigorousPipeline {
             reasons: [...completionGate.reasons, `adaptive recovery stopped: ${recovered.failure}`]
           }
         } else {
-          recoveryHypothesis = recovered.hypothesis
+          recoveryHypothesis = recovered.artifact
         }
       }
 
@@ -375,6 +405,7 @@ export class RigorousPipeline {
           workspace,
           threadModel: roleModel,
           ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
+          ...(samplingSeed === undefined ? {} : { samplingSeed }),
           request,
           plan,
           priorFindings: firstVerification.artifact.findings,
@@ -400,6 +431,7 @@ export class RigorousPipeline {
           diff: finalDiff,
           evalSuite: suiteBefore?.suite,
           harnessTask: turn.harnessTask,
+          ...(samplingSeed === undefined ? {} : { samplingSeed }),
           signal,
           ...(adaptiveBudget ? { adaptiveBudget } : {})
         })
@@ -423,6 +455,7 @@ export class RigorousPipeline {
           workspace,
           threadModel: roleModel,
           ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
+          ...(samplingSeed === undefined ? {} : { samplingSeed }),
           plan,
           verification: finalVerification.artifact,
           verificationRawText: finalVerification.rawText,
@@ -456,9 +489,16 @@ export class RigorousPipeline {
           diff: finalDiff,
           workspaceHashBefore: finalWorkspaceCapture.hash,
           workspaceHashAfter: finalGateWorkspaceCapture.hash,
+          workspaceHeadChanged: workspaceHeadChanged(initialWorkspaceCapture, finalGateWorkspaceCapture),
+          workspaceTreeChangedAfterEvidence: changedWorkspaceTreePaths(finalWorkspaceCapture, finalGateWorkspaceCapture).length > 0,
           workspaceArtifactCaptureUnavailable: turn.harnessTask
-            ? !finalWorkspaceCapture.available || !finalGateWorkspaceCapture.available
+            ? !initialWorkspaceCapture.available || !finalGateWorkspaceCapture.available ||
+              !initialWorkspaceCapture.treeComplete || !finalGateWorkspaceCapture.treeComplete
             : undefined,
+          changedPaths: [
+            ...finalGateWorkspaceCapture.paths,
+            ...changedWorkspaceTreePaths(initialWorkspaceCapture, finalGateWorkspaceCapture)
+          ],
           suiteArtifactCaptureUnavailable: this.deps.evals?.enabled
             ? !suiteBefore || !finalGateSuite
             : undefined,
@@ -509,15 +549,17 @@ export class RigorousPipeline {
     verification: VerificationArtifact
     diff: string
     priorReviewerReasons: readonly string[]
+    trustedEvidence: readonly TrustedEvidenceRecord[]
     threadModel: string
     pinnedModel?: string
+    samplingSeed?: number
     adaptiveBudget: AdaptiveTrialBudgetTracker
     abortSignal: AbortSignal
   }): Promise<AdaptiveRecoveryResult> {
     const takeAction = (): RecoveryAction =>
       chooseRecovery(input.signal, this.recoveryBudget(input.threadId, input.adaptiveBudget))
-    const acceptAction = async (action: RecoveryAction): Promise<void> => {
-      await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+    const acceptAction = async (action: RecoveryAction, artifact?: RecoveryArtifact): Promise<void> => {
+      await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action, artifact)
       input.adaptiveBudget.trial.recovery = advanceAdaptiveRecoveryState(
         input.adaptiveBudget.trial.recovery,
         action
@@ -544,12 +586,14 @@ export class RigorousPipeline {
       workspace: input.workspace,
       threadModel: input.threadModel,
       ...(input.pinnedModel ? { pinnedModel: input.pinnedModel } : {}),
+      ...(input.samplingSeed === undefined ? {} : { samplingSeed: input.samplingSeed }),
       plan: input.plan,
       verification: input.verification,
       verificationRawText: '',
       diff: input.diff,
       signal: input.abortSignal,
       recoveryCritic: true,
+      recoveryEvidenceIds: new Set(input.trustedEvidence.map((record) => record.id)),
       adaptiveBudget: input.adaptiveBudget
     })
     if (critic.status === 'aborted') return { status: 'aborted' }
@@ -562,13 +606,30 @@ export class RigorousPipeline {
       await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
       return { status: 'failed', failure: action.failure ?? 'invalid_stage' }
     }
-    const hypothesis = firstNewHypothesis(critic.artifact.reasons, input.priorReviewerReasons)
-    if (!hypothesis) {
+    const artifact = parseRecoveryArtifact(
+      critic.artifact.reasons,
+      input.signal,
+      new Set(input.trustedEvidence.map((record) => record.id))
+    )
+    const priorHypotheses = new Set(input.priorReviewerReasons.map(normalizeHypothesis).filter(Boolean))
+    const guidance = evaluateGuidanceGate({
+      signal: input.signal,
+      artifact,
+      trustedEvidenceIds: new Set(input.trustedEvidence.map((record) => record.id)),
+      priorHypotheses,
+      attemptedActionSignatures: input.adaptiveBudget.trial.recovery.attemptedActionSignatures
+    })
+    if (!guidance.allowed) {
+      const failure = guidanceFailureAction(input.signal)
+      await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, failure)
+      return { status: 'failed', failure: 'guidance_rejected' }
+    }
+    if (!artifact || priorHypotheses.has(normalizeHypothesis(artifact.whyDifferent))) {
       const failure = missingHypothesisAction(input.signal)
       await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, failure)
       return { status: 'failed', failure: 'hypothesis_missing' }
     }
-    await acceptAction(action)
+    await acceptAction(action, artifact)
 
     action = takeAction()
     if (action.kind === 'fail') {
@@ -576,13 +637,14 @@ export class RigorousPipeline {
       return { status: 'failed', failure: action.failure ?? 'invalid_stage' }
     }
     await acceptAction(action)
-    return { status: 'completed', hypothesis }
+    return { status: 'completed', artifact }
   }
 
   private async persistAdaptiveRecoveryAction(
     threadId: string,
     turnId: string,
-    action: RecoveryAction
+    action: RecoveryAction,
+    artifact?: RecoveryArtifact
   ): Promise<void> {
     await this.deps.turns.applyItem(threadId, makeReviewItem({
       id: `item_${turnId}_adaptive_recovery_${action.kind}_${action.actionSignature.slice(-12)}`,
@@ -591,7 +653,7 @@ export class RigorousPipeline {
       target: { kind: 'custom', instructions: 'bounded adaptive recovery checkpoint' },
       title: recoveryActionTitle(action),
       status: 'completed',
-      reviewText: renderAdaptiveRecoveryAction(action),
+      reviewText: renderAdaptiveRecoveryAction(action, artifact),
       finishedAt: this.deps.nowIso()
     }))
   }
@@ -602,10 +664,11 @@ export class RigorousPipeline {
     workspace: string
     threadModel: string
     pinnedModel?: string
+    samplingSeed?: number
     request: string
     plan: PlannerArtifact
     priorFindings?: VerificationArtifact['findings']
-    recoveryHypothesis?: string
+    recoveryHypothesis?: RecoveryArtifact
     signal: AbortSignal
     adaptiveBudget?: AdaptiveTrialBudgetTracker
   }): Promise<{ status: 'completed' | 'aborted'; artifact: ExecutionArtifact; rawText: string }> {
@@ -615,6 +678,7 @@ export class RigorousPipeline {
       prompt: executorPrompt(input.request, input.plan, input.priorFindings, input.recoveryHypothesis),
       threadModel: input.threadModel,
       ...(input.pinnedModel ? { pinnedModel: input.pinnedModel } : {}),
+      ...(input.samplingSeed === undefined ? {} : { samplingSeed: input.samplingSeed }),
       threadId: input.threadId,
       turnId: input.turnId,
       workspace: input.workspace,
@@ -641,6 +705,7 @@ export class RigorousPipeline {
     diff: string
     evalSuite?: EvalSuite
     harnessTask?: HarnessTaskSpec
+    samplingSeed?: number
     signal: AbortSignal
     adaptiveBudget?: AdaptiveTrialBudgetTracker
   }): Promise<{ status: 'completed' | 'aborted'; artifact: VerificationArtifact; artifactPresent: boolean; rawText: string }> {
@@ -657,6 +722,7 @@ export class RigorousPipeline {
       ),
       threadModel: input.threadModel,
       ...(input.pinnedModel ? { pinnedModel: input.pinnedModel } : {}),
+      ...(input.samplingSeed === undefined ? {} : { samplingSeed: input.samplingSeed }),
       threadId: input.threadId,
       turnId: input.turnId,
       workspace: input.workspace,
@@ -680,6 +746,7 @@ export class RigorousPipeline {
     workspace: string
     threadModel: string
     pinnedModel?: string
+    samplingSeed?: number
     plan: PlannerArtifact
     verification: VerificationArtifact
     verificationRawText: string
@@ -687,16 +754,18 @@ export class RigorousPipeline {
     signal: AbortSignal
     finalRound?: boolean
     recoveryCritic?: boolean
+    recoveryEvidenceIds?: ReadonlySet<string>
     adaptiveBudget?: AdaptiveTrialBudgetTracker
   }): Promise<{ status: 'completed' | 'aborted'; artifact: VerdictArtifact; rawText: string }> {
     const result = await this.runRole({
       role: 'reviewer',
       kind: 'verdict',
       prompt: input.recoveryCritic
-        ? recoveryCriticPrompt(input.plan, input.verification, input.diff)
+        ? recoveryCriticPrompt(input.plan, input.verification, input.diff, input.recoveryEvidenceIds)
         : reviewerPrompt(input.plan, input.verification, input.verificationRawText, input.diff, Boolean(input.finalRound)),
       threadModel: input.threadModel,
       ...(input.pinnedModel ? { pinnedModel: input.pinnedModel } : {}),
+      ...(input.samplingSeed === undefined ? {} : { samplingSeed: input.samplingSeed }),
       threadId: input.threadId,
       turnId: input.turnId,
       workspace: input.workspace,
@@ -726,6 +795,7 @@ export class RigorousPipeline {
     prompt: string
     threadModel: string
     pinnedModel?: string
+    samplingSeed?: number
     threadId: string
     turnId: string
     workspace: string
@@ -763,6 +833,7 @@ export class RigorousPipeline {
         workspace: input.workspace,
         model: route.model,
         reasoningEffort: route.reasoningEffort,
+        ...(input.samplingSeed === undefined ? {} : { samplingSeed: input.samplingSeed }),
         allowedToolNames: profile.allowedToolNames,
         sandboxMode: profile.sandboxMode,
         systemPromptAddendum: profile.promptAddendum,
@@ -986,6 +1057,9 @@ export class RigorousPipeline {
     diff: string
     workspaceHashBefore: string | null
     workspaceHashAfter: string | null
+    workspaceHeadChanged?: boolean
+    workspaceTreeChangedAfterEvidence?: boolean
+    changedPaths?: readonly string[]
     workspaceArtifactCaptureUnavailable?: boolean
     suiteArtifactCaptureUnavailable?: boolean
     trustedEvidence: readonly TrustedEvidenceRecord[]
@@ -996,6 +1070,10 @@ export class RigorousPipeline {
     const optionalWarningCount = input.verification.findings.filter((finding) =>
       /^(info|low|warn|warning)$/i.test(finding.severity.trim())
     ).length + mechanicalChecks.optionalFailures
+    const changedPaths = [...new Set([
+      ...(input.changedPaths ?? []),
+      ...input.execution.filesChanged
+    ])]
 
     return evaluateCompletionGate({
       requiredChecksFailed: mechanicalChecks.failed,
@@ -1008,9 +1086,13 @@ export class RigorousPipeline {
       requiredCriterionAmbiguous: criteria.ambiguousResults,
       optionalWarningCount,
       suiteChanged: suiteChangedDuringTurn(input.suiteBefore, input.evalRun, input.suiteAtGate),
-      forbiddenPaths: findForbiddenPaths(input.task, input.execution, input.diff),
+      forbiddenPaths: findForbiddenPaths(input.task, input.execution, input.diff, changedPaths),
+      outOfScopePaths: findOutOfScopePaths(input.task, input.execution, input.diff, changedPaths),
+      unenforcedConstraints: unenforcedConstraintDescriptions(input.task),
       workspaceHashBefore: input.workspaceHashBefore,
       workspaceHashAfter: input.workspaceHashAfter,
+      workspaceHeadChanged: input.workspaceHeadChanged,
+      workspaceTreeChangedAfterEvidence: input.workspaceTreeChangedAfterEvidence,
       workspaceArtifactCaptureUnavailable: input.workspaceArtifactCaptureUnavailable,
       suiteArtifactCaptureUnavailable: input.suiteArtifactCaptureUnavailable,
       trustedEvidence: input.trustedEvidence,
@@ -1323,18 +1405,60 @@ function summarizeMechanicalChecks(
 function findForbiddenPaths(
   task: HarnessTaskSpec | undefined,
   execution: ExecutionArtifact,
-  diff: string
+  diff: string,
+  changedPaths?: readonly string[]
 ): string[] {
-  const patterns = forbiddenPathPatterns(task)
-  if (!patterns.length) return []
+  return enforceHarnessPathConstraints(task, changedPaths ?? changedWorkspacePaths(execution, diff)).forbiddenPaths
+}
 
-  const changed = new Set([
+function findOutOfScopePaths(
+  task: HarnessTaskSpec | undefined,
+  execution: ExecutionArtifact,
+  diff: string,
+  changedPaths?: readonly string[]
+): string[] {
+  return enforceHarnessPathConstraints(task, changedPaths ?? changedWorkspacePaths(execution, diff)).outOfScopePaths
+}
+
+export function enforceHarnessPathConstraints(
+  task: HarnessTaskSpec | undefined,
+  changedPaths: readonly string[]
+): { forbiddenPaths: string[]; outOfScopePaths: string[] } {
+  const changed = [...new Set(changedPaths.map(normalizeWorkspacePath).filter(Boolean))]
+  const forbiddenPatterns = forbiddenPathPatterns(task)
+  const allowedPatterns = allowedPathPatterns(task)
+  return {
+    forbiddenPaths: changed
+      .filter((path) => forbiddenPatterns.some((pattern) => matchesWorkspacePath(path, pattern)))
+      .sort(),
+    outOfScopePaths: allowedPatterns.length
+      ? changed.filter((path) => !allowedPatterns.some((pattern) => matchesWorkspacePath(path, pattern))).sort()
+      : []
+  }
+}
+
+function changedWorkspacePaths(execution: ExecutionArtifact, diff: string): string[] {
+  return [...new Set([
     ...execution.filesChanged.map(normalizeWorkspacePath),
     ...pathsFromGitDiff(diff).map(normalizeWorkspacePath)
-  ].filter(Boolean))
-  return [...changed]
-    .filter((path) => patterns.some((pattern) => matchesWorkspacePath(path, pattern)))
-    .sort()
+  ].filter(Boolean))]
+}
+
+function allowedPathPatterns(task: HarnessTaskSpec | undefined): string[] {
+  return task?.constraints
+    .filter((constraint) => constraint.kind === 'allowed-path')
+    .map((constraint) => normalizeWorkspacePath(constraint.value))
+    .filter(Boolean) ?? []
+}
+
+function unenforcedConstraintDescriptions(task: HarnessTaskSpec | undefined): string[] {
+  return task?.constraints
+    .filter((constraint) => constraint.kind === 'network' || constraint.kind === 'custom')
+    .map((constraint) => {
+      const owner = constraint.kind === 'network' ? 'sandbox/tool-policy' : 'registered-mechanical-evaluator'
+      return `${constraint.kind} (${owner}): ${constraint.value}`
+    })
+    .filter(Boolean) ?? []
 }
 
 function forbiddenPathPatterns(task: HarnessTaskSpec | undefined): string[] {
@@ -1355,6 +1479,11 @@ function normalizeWorkspacePath(value: string): string {
 function pathsFromGitDiff(diff: string): string[] {
   const paths: string[] = []
   for (const line of diff.split('\n')) {
+    const canonical = /^workspace-path: (.+)$/.exec(line)
+    if (canonical) {
+      paths.push(canonical[1])
+      continue
+    }
     const untracked = /^untracked: (.+)$/.exec(line)
     if (untracked) {
       paths.push(untracked[1])
@@ -1540,6 +1669,15 @@ function missingHypothesisAction(signal: StallSignal): RecoveryAction {
   }
 }
 
+function guidanceFailureAction(signal: StallSignal): RecoveryAction {
+  return {
+    kind: 'fail',
+    actionSignature: `recovery:fail:guidance_rejected:${signal.signature}`,
+    reason: signal.reason,
+    failure: 'guidance_rejected'
+  }
+}
+
 function recoveryActionTitle(action: RecoveryAction): string {
   switch (action.kind) {
     case 'checkpoint': return 'Adaptive recovery checkpoint'
@@ -1550,10 +1688,11 @@ function recoveryActionTitle(action: RecoveryAction): string {
   }
 }
 
-function renderAdaptiveRecoveryAction(action: RecoveryAction): string {
-  return action.kind === 'fail'
+function renderAdaptiveRecoveryAction(action: RecoveryAction, artifact?: RecoveryArtifact): string {
+  const base = action.kind === 'fail'
     ? `Adaptive recovery stopped: ${action.failure ?? 'invalid_stage'}.`
     : `Adaptive recovery action: ${action.kind}; signal: ${action.reason}; signature: ${action.actionSignature}.`
+  return artifact ? `${base}\n\n${renderRecoveryArtifact(artifact)}` : base
 }
 
 function plannerPrompt(request: string): string {
@@ -1570,7 +1709,7 @@ function executorPrompt(
   request: string,
   plan: PlannerArtifact,
   priorFindings?: VerificationArtifact['findings'],
-  recoveryHypothesis?: string
+  recoveryHypothesis?: RecoveryArtifact
 ): string {
   return [
     'User request:',
@@ -1586,8 +1725,8 @@ function executorPrompt(
       : '',
     recoveryHypothesis
       ? ['',
-          'Adaptive recovery hypothesis (test this new hypothesis; do not repeat the stalled action):',
-          recoveryHypothesis
+          'Adaptive recovery artifact (follow its bounded action and verification; do not repeat the stalled action):',
+          JSON.stringify(recoveryHypothesis, null, 2)
         ].join('\n')
       : '',
     '',
@@ -1671,12 +1810,21 @@ function reviewerPrompt(
 function recoveryCriticPrompt(
   plan: PlannerArtifact,
   verification: VerificationArtifact,
-  diff: string
+  diff: string,
+  trustedEvidenceIds?: ReadonlySet<string>
 ): string {
   return [
     'Adaptive recovery critic: remain isolated and read-only.',
-    'Provide exactly one new, falsifiable hypothesis for the stalled execution. Do not propose a retry of the same action.',
-    'Return the hypothesis as one reason in the required verdict artifact.',
+    'Provide exactly one new, falsifiable, evidence-grounded recovery artifact. Do not propose a retry of the same action.',
+    'Return exactly these tagged lines as reasons in the verdict artifact:',
+    'ANCHOR: <first concrete failure or stall evidence>',
+    `EVIDENCE: <comma-separated trusted ids${trustedEvidenceIds?.size ? `; choose only from ${[...trustedEvidenceIds].join(', ')}` : ''}>`,
+    'TARGET: <file, tool, or bounded workspace scope>',
+    'ACTION: <one precise operation different from the previous attempt>',
+    'OPERATION_SIGNATURE: <sha256 digest of the exact proposed tool action when available; omit only when no structured action exists>',
+    'VERIFY: <mechanical check or evidence that must pass>',
+    'STOP: <when to stop instead of retrying>',
+    'WHY_DIFFERENT: <why this is not the previous hypothesis>',
     '',
     'Planner artifact:',
     JSON.stringify(plan, null, 2),
@@ -1787,50 +1935,156 @@ async function captureWorkspaceArtifact(
   if (!workspace.trim()) return unavailableWorkspaceArtifactCapture()
   const worktree = await captureGitOutput(workspace, ['rev-parse', '--is-inside-work-tree'])
   if (!worktree.ok || worktree.stdout !== 'true') return unavailableWorkspaceArtifactCapture()
+  const head = await captureGitOutput(workspace, ['rev-parse', 'HEAD'])
 
-  const forbiddenPatterns = forbiddenPathPatterns(task)
-  const [unstaged, staged, untracked, ignored] = await Promise.all([
-    captureGitOutput(workspace, ['diff', '--no-ext-diff']),
-    captureGitOutput(workspace, ['diff', '--cached', '--no-ext-diff']),
-    captureGitOutput(workspace, ['ls-files', '--others', '--exclude-standard']),
-    forbiddenPatterns.length
-      ? captureGitOutput(workspace, ['ls-files', '--others', '--ignored', '--exclude-standard'])
-      : Promise.resolve<GitCaptureOutput>({ ok: true, stdout: '' })
+  const hasPathConstraints = Boolean(task?.constraints.some((constraint) =>
+    constraint.kind === 'allowed-path' || constraint.kind === 'forbidden-path'
+  ))
+  const captureTree = Boolean(task)
+  const [unstaged, staged, untracked, ignored, unstagedPaths, stagedPaths] = await Promise.all([
+    captureGitOutput(workspace, ['diff', '--no-ext-diff'], false),
+    captureGitOutput(workspace, ['diff', '--cached', '--no-ext-diff'], false),
+    captureGitPaths(workspace, ['ls-files', '--others', '--exclude-standard']),
+    captureTree
+      ? captureGitPaths(workspace, ['ls-files', '--others', '--ignored', '--exclude-standard'])
+      : Promise.resolve<GitPathCapture>({ ok: true, paths: [] }),
+    captureGitChangedPaths(workspace, ['diff', '--no-ext-diff']),
+    captureGitChangedPaths(workspace, ['diff', '--cached', '--no-ext-diff'])
   ])
-  if (!unstaged.ok || !staged.ok || !untracked.ok || !ignored.ok) return unavailableWorkspaceArtifactCapture()
-
-  const untrackedPaths = new Set(
-    untracked.stdout
-      .split('\n')
-      .map((path) => path.trim())
-      .filter(Boolean)
-  )
-  for (const path of ignored.stdout.split('\n').map((candidate) => candidate.trim()).filter(Boolean)) {
-    if (forbiddenPatterns.some((pattern) => matchesWorkspacePath(normalizeWorkspacePath(path), pattern))) {
-      untrackedPaths.add(path)
-    }
+  if (!unstaged.ok || !staged.ok || !untracked.ok || !ignored.ok || !unstagedPaths.ok || !stagedPaths.ok) {
+    return unavailableWorkspaceArtifactCapture()
   }
-  const untrackedMarkers = await Promise.all([...untrackedPaths].sort().map(async (path) => {
+  if (untracked.paths.length + ignored.paths.length > MAX_CAPTURED_UNTRACKED_PATHS) {
+    return unavailableWorkspaceArtifactCapture()
+  }
+  const tree = captureTree
+    ? await captureWorkspaceTree(workspace, untracked.paths, ignored.paths)
+    : { complete: true, fileDigests: new Map<string, string>() }
+
+  const untrackedPaths = new Set(untracked.paths)
+  for (const path of ignored.paths) untrackedPaths.add(path)
+  const untrackedMarkers: Array<string | null> = []
+  for (const path of [...untrackedPaths].sort()) {
     const hash = await captureGitOutput(workspace, ['hash-object', '--', path])
-    if (!hash.ok) return null
-    return `untracked: ${path}\nuntracked-hash: ${hash.stdout}`
-  }))
+    untrackedMarkers.push(hash.ok ? `untracked: ${path}\nuntracked-hash: ${hash.stdout}` : null)
+  }
   if (untrackedMarkers.some((marker) => marker === null)) return unavailableWorkspaceArtifactCapture()
 
-  const text = [unstaged.stdout, staged.stdout, ...untrackedMarkers].filter(Boolean).join('\n').trim()
-  return { text, hash: hashCapturedArtifact(text), available: true }
+  const paths = [...new Set([
+    ...unstagedPaths.paths,
+    ...stagedPaths.paths,
+    ...untracked.paths,
+    ...ignored.paths
+  ])].sort()
+  const workspacePathMarkers = paths.map((path) => `workspace-path: ${path}`)
+  const text = [unstaged.stdout, staged.stdout, ...workspacePathMarkers, ...untrackedMarkers].filter(Boolean).join('\n')
+  return {
+    text,
+    hash: hashCapturedArtifact(text),
+    available: true,
+    paths,
+    head: head.ok ? head.stdout : null,
+    fileDigests: tree.fileDigests,
+    treeComplete: tree.complete
+  }
 }
 
 function unavailableWorkspaceArtifactCapture(): WorkspaceArtifactCapture {
-  return { text: '', hash: null, available: false }
+  return {
+    text: '',
+    hash: null,
+    available: false,
+    paths: [],
+    head: null,
+    fileDigests: new Map(),
+    treeComplete: false
+  }
 }
 
-async function captureGitOutput(workspace: string, args: string[]): Promise<GitCaptureOutput> {
+function workspaceHeadChanged(before: WorkspaceArtifactCapture, after: WorkspaceArtifactCapture): boolean {
+  return before.available && after.available && before.head !== after.head && (before.head !== null || after.head !== null)
+}
+
+function changedWorkspaceTreePaths(
+  before: WorkspaceArtifactCapture,
+  after: WorkspaceArtifactCapture
+): string[] {
+  const paths = new Set([...before.fileDigests.keys(), ...after.fileDigests.keys()])
+  return [...paths].filter((path) => before.fileDigests.get(path) !== after.fileDigests.get(path)).sort()
+}
+
+async function captureWorkspaceTree(
+  workspace: string,
+  untrackedPaths: readonly string[],
+  ignoredPaths: readonly string[]
+): Promise<{ complete: boolean; fileDigests: Map<string, string> }> {
+  const tracked = await captureGitPaths(workspace, ['ls-files', '--cached'])
+  if (!tracked.ok) return { complete: false, fileDigests: new Map() }
+  const paths = [...new Set([...tracked.paths, ...untrackedPaths, ...ignoredPaths])].sort()
+  if (paths.length > MAX_CAPTURED_TREE_FILES) return { complete: false, fileDigests: new Map() }
+  const digests = new Map<string, string>()
+  let totalBytes = 0
+  for (const path of paths) {
+    const absolute = resolve(workspace, path)
+    const relativePath = relative(resolve(workspace), absolute)
+    if (!relativePath || relativePath === '..' || relativePath.startsWith(`..${sep}`)) {
+      return { complete: false, fileDigests: new Map() }
+    }
+    try {
+      const stats = await lstat(absolute)
+      if (!stats.isFile() || stats.isSymbolicLink()) return { complete: false, fileDigests: new Map() }
+      totalBytes += stats.size
+      if (totalBytes > MAX_CAPTURED_TREE_BYTES) return { complete: false, fileDigests: new Map() }
+      const content = await readFile(absolute)
+      digests.set(path, createHash('sha256').update(content).digest('hex'))
+    } catch {
+      return { complete: false, fileDigests: new Map() }
+    }
+  }
+  return { complete: true, fileDigests: digests }
+}
+
+async function captureGitOutput(workspace: string, args: string[], trimOutput = true): Promise<GitCaptureOutput> {
   try {
     const { stdout } = await execFileAsync('git', ['-C', workspace, ...args], {
       maxBuffer: 2 * 1024 * 1024
     })
-    return { ok: true, stdout: stdout.trim() }
+    return { ok: true, stdout: trimOutput ? stdout.trim() : stdout }
+  } catch {
+    return { ok: false }
+  }
+}
+
+type GitPathCapture =
+  | { ok: true; paths: string[] }
+  | { ok: false; paths?: never }
+
+async function captureGitPaths(workspace: string, args: string[]): Promise<GitPathCapture> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', workspace, ...args, '-z'], {
+      maxBuffer: 2 * 1024 * 1024
+    })
+    return { ok: true, paths: stdout.split('\0').filter(Boolean) }
+  } catch {
+    return { ok: false }
+  }
+}
+
+async function captureGitChangedPaths(workspace: string, args: string[]): Promise<GitPathCapture> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', workspace, ...args, '--name-status', '-z'], {
+      maxBuffer: 2 * 1024 * 1024
+    })
+    const tokens = stdout.split('\0').filter(Boolean)
+    const paths: string[] = []
+    for (let index = 0; index < tokens.length;) {
+      const status = tokens[index++] ?? ''
+      const pathCount = status.startsWith('R') || status.startsWith('C') ? 2 : 1
+      for (let pathIndex = 0; pathIndex < pathCount && index < tokens.length; pathIndex += 1) {
+        paths.push(tokens[index++] ?? '')
+      }
+    }
+    return { ok: true, paths: [...new Set(paths.filter(Boolean))] }
   } catch {
     return { ok: false }
   }
