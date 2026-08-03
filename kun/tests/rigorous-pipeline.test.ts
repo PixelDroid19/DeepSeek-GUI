@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { InMemoryEventBus } from '../src/adapters/in-memory-event-bus.js'
 import { InMemorySessionStore } from '../src/adapters/in-memory-session-store.js'
 import { InMemoryThreadStore } from '../src/adapters/in-memory-thread-store.js'
@@ -19,6 +21,33 @@ import { UsageService } from '../src/services/usage-service.js'
 import { RigorousPipeline } from '../src/orchestration/rigorous-pipeline.js'
 import { EvalSuiteStore } from '../src/evals/eval-suite-store.js'
 import { LocalToolHost } from '../src/adapters/tool/local-tool-host.js'
+import { VerificationCriterionResultSchema } from '../src/contracts/roles.js'
+import type { HarnessTaskSpec } from '../src/contracts/harness.js'
+
+const REQUIRED_HARNESS_TASK: HarnessTaskSpec = {
+  version: 1,
+  id: 'completion-gate-task',
+  objective: 'Prove required completion evidence before shipping.',
+  acceptanceCriteria: [{
+    id: 'acceptance',
+    description: 'The required acceptance criterion passes.',
+    required: true,
+    acceptedEvidenceKinds: ['command']
+  }],
+  verification: [],
+  constraints: [],
+  budgets: {
+    wallTimeMs: 60_000,
+    maxModelSteps: 10,
+    maxInputTokens: 1_000,
+    maxOutputTokens: 1_000,
+    maxCostUsd: 1,
+    maxRecoveryRounds: 1
+  },
+  executionPolicy: 'rigorous'
+}
+
+const execFileAsync = promisify(execFile)
 
 function makeRuntime(
   childExecutor: ChildRunExecutor,
@@ -111,6 +140,17 @@ function makeTurnRuntimeWithRoles(enabled: boolean) {
 }
 
 describe('rigorous pipeline', () => {
+  it('keeps legacy verifier criteria parseable with empty evidence IDs', () => {
+    expect(VerificationCriterionResultSchema.parse({
+      criterion: 'focused tests pass',
+      pass: true
+    })).toEqual({
+      criterion: 'focused tests pass',
+      pass: true,
+      evidenceIds: []
+    })
+  })
+
   it('rejects rigorous starts on plan threads or when roles are disabled', async () => {
     const planRuntime = makeTurnRuntimeWithRoles(true)
     const planThread = await planRuntime.threads.create({
@@ -438,6 +478,170 @@ describe('rigorous pipeline', () => {
     await rm(workspace, { recursive: true, force: true })
   })
 
+  it('does not ship a harness task when required verifier evidence is absent', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-harness-evidence-'))
+    let executorRuns = 0
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        executorRuns += 1
+        return { summary: 'execution', artifact: { summary: 's', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return {
+          summary: 'verification',
+          artifact: {
+            findings: [],
+            criteriaResults: [{ criterion: 'acceptance', pass: true }],
+            commandsRun: ['npm test']
+          }
+        }
+      }
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({
+      title: 'Harness evidence', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work',
+        mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
+        harnessTask: REQUIRED_HARNESS_TASK
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect(executorRuns).toBe(2)
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'review',
+        title: 'Rigorous completion gate (final)',
+        reviewText: expect.stringContaining('fix')
+      }),
+      expect.objectContaining({
+        kind: 'assistant_text',
+        status: 'failed',
+        text: expect.stringContaining('completion gate verdict: fix')
+      })
+    ]))
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('fails before a fix round when a harness turn changes a forbidden path', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-harness-path-'))
+    let executorRuns = 0
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        executorRuns += 1
+        return {
+          summary: 'execution',
+          artifact: { summary: 's', filesChanged: ['kun/src/generated/unsafe.ts'], deviationsFromPlan: [] }
+        }
+      }
+      if (input.artifactKind === 'verification') {
+        return {
+          summary: 'verification',
+          artifact: {
+            findings: [],
+            criteriaResults: [{ criterion: 'acceptance', pass: true, evidenceIds: ['check:acceptance'] }],
+            commandsRun: ['npm test']
+          }
+        }
+      }
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({
+      title: 'Harness paths', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work',
+        mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
+        harnessTask: {
+          ...REQUIRED_HARNESS_TASK,
+          constraints: [{ kind: 'forbidden-path', value: 'kun/src/generated/**' }]
+        }
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect(executorRuns).toBe(1)
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'review',
+        title: 'Rigorous completion gate',
+        reviewText: expect.stringContaining('forbidden paths changed')
+      })
+    ]))
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('detects an ignored forbidden path from the captured workspace diff', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-harness-untracked-'))
+    await execFileAsync('git', ['init', '--quiet', workspace])
+    await writeFile(join(workspace, '.gitignore'), 'kun/src/generated/\n', 'utf8')
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        await mkdir(join(workspace, 'kun/src/generated'), { recursive: true })
+        await writeFile(join(workspace, 'kun/src/generated/unsafe.ts'), 'unsafe\n', 'utf8')
+        // The executor artifact intentionally omits the changed file; the
+        // gate must use the independently captured workspace diff instead.
+        return { summary: 'execution', artifact: { summary: 's', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return {
+          summary: 'verification',
+          artifact: {
+            findings: [],
+            criteriaResults: [{ criterion: 'acceptance', pass: true, evidenceIds: ['check:acceptance'] }],
+            commandsRun: ['npm test']
+          }
+        }
+      }
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({
+      title: 'Harness untracked paths', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work',
+        mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
+        harnessTask: {
+          ...REQUIRED_HARNESS_TASK,
+          constraints: [{ kind: 'forbidden-path', value: 'kun/src/generated/**' }]
+        }
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'review',
+        title: 'Rigorous completion gate',
+        reviewText: expect.stringContaining('kun/src/generated/unsafe.ts')
+      })
+    ]))
+    await rm(workspace, { recursive: true, force: true })
+  })
+
   it('falls back to the normal loop when the planner artifact is missing', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-'))
     const child: ChildRunExecutor = async () => ({ summary: 'planner prose without json' })
@@ -576,7 +780,7 @@ describe('rigorous pipeline', () => {
       request: { prompt: 'do work', mode: 'rigorous' }
     })
     const status = await runtime.pipeline.run(thread.id, turn.turnId)
-    expect(status).toBe('completed')
+    expect(status).toBe('failed')
     expect(verifierPromptSeen).toContain('Workspace eval suite')
     expect(verifierPromptSeen).toContain('smoke')
     const items = await runtime.sessionStore.loadItems(thread.id)
@@ -631,7 +835,7 @@ describe('rigorous pipeline', () => {
       request: { prompt: 'do work', mode: 'rigorous' }
     })
     const status = await runtime.pipeline.run(thread.id, turn.turnId)
-    expect(status).toBe('completed')
+    expect(status).toBe('failed')
     const items = await runtime.sessionStore.loadItems(thread.id)
     const report = items.find(
       (item) => item.kind === 'review' && 'roleName' in item && item.roleName === 'verifier'

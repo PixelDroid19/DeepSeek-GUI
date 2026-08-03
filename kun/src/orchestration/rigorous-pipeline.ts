@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { promisify } from 'node:util'
 import type { ApprovalGate } from '../ports/approval-gate.js'
 import type { ThreadStore } from '../ports/thread-store.js'
@@ -12,6 +13,7 @@ import type { UsageSnapshot } from '../contracts/usage.js'
 import type { RolesConfig } from '../config/kun-config.js'
 import type { ToolHost, ToolHostContext } from '../ports/tool-host.js'
 import type { EvalSuite } from '../contracts/evals.js'
+import type { HarnessTaskSpec } from '../contracts/harness.js'
 import { EvalSuiteStore, evalSuiteHash } from '../evals/eval-suite-store.js'
 import { runEvalSuite, type EvalRunOutcome } from '../evals/eval-runner.js'
 import {
@@ -28,6 +30,7 @@ import {
   type VerificationArtifact,
   type VerdictArtifact
 } from '../contracts/roles.js'
+import { evaluateCompletionGate, type CompletionGateResult } from './completion-gate.js'
 import { ROLE_PROFILES, resolveRoleModel, roleEnabled } from './role-profiles.js'
 
 const execFileAsync = promisify(execFile)
@@ -116,7 +119,8 @@ export class RigorousPipeline {
         await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
         return 'aborted'
       }
-      const firstDiff = await captureGitDiff(workspace)
+      const firstDiff = await captureGitDiff(workspace, turn.harnessTask)
+      const firstWorkspaceHashBefore = hashCapturedArtifact(firstDiff)
       const firstVerification = await this.runVerifier({
         threadId,
         turnId,
@@ -127,6 +131,7 @@ export class RigorousPipeline {
         execution: firstExecution.artifact,
         diff: firstDiff,
         evalSuite: suiteBefore?.suite,
+        harnessTask: turn.harnessTask,
         signal
       })
       if (firstVerification.status === 'aborted') {
@@ -135,6 +140,7 @@ export class RigorousPipeline {
       }
       const firstEvalRun = await this.runEvalsMechanically(threadId, turnId, workspace, suiteBefore, signal)
       await this.persistVerification(threadId, turnId, firstVerification.artifact, firstVerification.rawText, 'initial', firstEvalRun)
+      const firstWorkspaceHashAfter = hashCapturedArtifact(await captureGitDiff(workspace, turn.harnessTask))
       let review = await this.runReviewer({
         threadId,
         turnId,
@@ -150,8 +156,21 @@ export class RigorousPipeline {
         await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
         return 'aborted'
       }
+      let completionGate = this.evaluateGate({
+        task: turn.harnessTask,
+        execution: firstExecution.artifact,
+        verification: firstVerification.artifact,
+        verifierResultPresent: firstVerification.artifactPresent,
+        evalRun: firstEvalRun,
+        suiteBefore,
+        diff: firstDiff,
+        workspaceHashBefore: firstWorkspaceHashBefore,
+        workspaceHashAfter: firstWorkspaceHashAfter,
+        reviewerVerdict: review.artifact.verdict
+      })
+      await this.persistCompletionGate(threadId, turnId, completionGate, 'initial')
 
-      if (review.artifact.verdict === 'fix') {
+      if (completionGate.verdict === 'fix') {
         const fixedExecution = await this.runExecutor({
           threadId,
           turnId,
@@ -166,7 +185,8 @@ export class RigorousPipeline {
           await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
           return 'aborted'
         }
-        const finalDiff = await captureGitDiff(workspace)
+        const finalDiff = await captureGitDiff(workspace, turn.harnessTask)
+        const finalWorkspaceHashBefore = hashCapturedArtifact(finalDiff)
         const finalVerification = await this.runVerifier({
           threadId,
           turnId,
@@ -177,6 +197,7 @@ export class RigorousPipeline {
           execution: fixedExecution.artifact,
           diff: finalDiff,
           evalSuite: suiteBefore?.suite,
+          harnessTask: turn.harnessTask,
           signal
         })
         if (finalVerification.status === 'aborted') {
@@ -185,6 +206,7 @@ export class RigorousPipeline {
         }
         const finalEvalRun = await this.runEvalsMechanically(threadId, turnId, workspace, suiteBefore, signal)
         await this.persistVerification(threadId, turnId, finalVerification.artifact, finalVerification.rawText, 'final', finalEvalRun)
+        const finalWorkspaceHashAfter = hashCapturedArtifact(await captureGitDiff(workspace, turn.harnessTask))
         review = await this.runReviewer({
           threadId,
           turnId,
@@ -201,18 +223,41 @@ export class RigorousPipeline {
           await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
           return 'aborted'
         }
+        completionGate = this.evaluateGate({
+          task: turn.harnessTask,
+          execution: fixedExecution.artifact,
+          verification: finalVerification.artifact,
+          verifierResultPresent: finalVerification.artifactPresent,
+          evalRun: finalEvalRun,
+          suiteBefore,
+          diff: finalDiff,
+          workspaceHashBefore: finalWorkspaceHashBefore,
+          workspaceHashAfter: finalWorkspaceHashAfter,
+          reviewerVerdict: review.artifact.verdict
+        })
+        await this.persistCompletionGate(threadId, turnId, completionGate, 'final')
       }
 
       await this.persistVerdict(threadId, turnId, review.artifact)
+      const completionStatus = isShippingVerdict(completionGate.verdict) ? 'completed' : 'failed'
       await this.deps.turns.applyItem(threadId, makeAssistantTextItem({
         id: `item_${turnId}_rigorous_summary`,
         threadId,
         turnId,
-        status: 'completed',
-        text: renderFinalSummary(review.artifact)
+        status: completionStatus,
+        text: renderFinalSummary(completionGate, review.artifact)
       }))
-      await this.deps.turns.finishTurn({ threadId, turnId, status: 'completed' })
-      return 'completed'
+      if (completionStatus === 'completed') {
+        await this.deps.turns.finishTurn({ threadId, turnId, status: 'completed' })
+        return 'completed'
+      }
+      await this.deps.turns.finishTurn({
+        threadId,
+        turnId,
+        status: 'failed',
+        error: renderCompletionGateFailure(completionGate)
+      })
+      return 'failed'
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       await this.deps.turns.finishTurn({
@@ -263,22 +308,33 @@ export class RigorousPipeline {
     execution: ExecutionArtifact
     diff: string
     evalSuite?: EvalSuite
+    harnessTask?: HarnessTaskSpec
     signal: AbortSignal
-  }): Promise<{ status: 'completed' | 'aborted'; artifact: VerificationArtifact; rawText: string }> {
+  }): Promise<{ status: 'completed' | 'aborted'; artifact: VerificationArtifact; artifactPresent: boolean; rawText: string }> {
     const result = await this.runRole({
       role: 'verifier',
       kind: 'verification',
-      prompt: verifierPrompt(input.request, input.plan, input.execution.filesChanged, input.diff, input.evalSuite),
+      prompt: verifierPrompt(
+        input.request,
+        input.plan,
+        input.execution.filesChanged,
+        input.diff,
+        input.evalSuite,
+        input.harnessTask
+      ),
       threadModel: input.threadModel,
       threadId: input.threadId,
       turnId: input.turnId,
       workspace: input.workspace,
       signal: input.signal
     })
-    if (result.status === 'aborted') return { status: 'aborted', artifact: emptyVerification(), rawText: result.rawText }
+    if (result.status === 'aborted') {
+      return { status: 'aborted', artifact: emptyVerification(), artifactPresent: false, rawText: result.rawText }
+    }
     return {
       status: 'completed',
       artifact: result.artifact ? VerificationArtifactSchema.parse(result.artifact) : emptyVerification(),
+      artifactPresent: result.artifact !== undefined,
       rawText: result.rawText
     }
   }
@@ -500,6 +556,41 @@ export class RigorousPipeline {
     }
   }
 
+  private evaluateGate(input: {
+    task?: HarnessTaskSpec
+    execution: ExecutionArtifact
+    verification: VerificationArtifact
+    verifierResultPresent: boolean
+    evalRun: { outcome: EvalRunOutcome; hashBefore: string; hashAfter: string } | null
+    suiteBefore: { suite: EvalSuite; hash: string } | null
+    diff: string
+    workspaceHashBefore: string
+    workspaceHashAfter: string
+    reviewerVerdict: VerdictArtifact['verdict']
+  }): CompletionGateResult {
+    const criteria = summarizeRequiredCriteria(input.task, input.verification)
+    const mechanicalChecks = summarizeMechanicalChecks(input.task, input.suiteBefore, input.evalRun)
+    const optionalWarningCount = input.verification.findings.filter((finding) =>
+      /^(info|low|warn|warning)$/i.test(finding.severity.trim())
+    ).length + mechanicalChecks.optionalFailures
+
+    return evaluateCompletionGate({
+      requiredChecksFailed: mechanicalChecks.failed,
+      requiredChecksMissing: mechanicalChecks.missing,
+      requiredVerifierResultsMissing: criteria.missingResults,
+      requiredCriterionFailed: criteria.failed,
+      requiredCriterionWithoutEvidence: criteria.withoutEvidence,
+      optionalWarningCount,
+      suiteChanged: Boolean(input.evalRun && input.evalRun.hashBefore !== input.evalRun.hashAfter),
+      forbiddenPaths: findForbiddenPaths(input.task, input.execution, input.diff),
+      workspaceHashBefore: input.workspaceHashBefore,
+      workspaceHashAfter: input.workspaceHashAfter,
+      verifierResultPresent: input.verifierResultPresent,
+      allRequiredEvidencePass: criteria.allPassed,
+      reviewerVerdict: input.reviewerVerdict
+    })
+  }
+
   private async persistVerification(
     threadId: string,
     turnId: string,
@@ -520,6 +611,24 @@ export class RigorousPipeline {
         renderVerificationReport(artifact, rawText),
         ...(evalRun ? ['', renderEvalRun(evalRun)] : [])
       ].join('\n'),
+      finishedAt: this.deps.nowIso()
+    }))
+  }
+
+  private async persistCompletionGate(
+    threadId: string,
+    turnId: string,
+    result: CompletionGateResult,
+    suffix: 'initial' | 'final'
+  ): Promise<void> {
+    await this.deps.turns.applyItem(threadId, makeReviewItem({
+      id: `item_${turnId}_completion_gate_${suffix}`,
+      threadId,
+      turnId,
+      target: { kind: 'custom', instructions: 'deterministic rigorous completion gate report' },
+      title: suffix === 'final' ? 'Rigorous completion gate (final)' : 'Rigorous completion gate',
+      status: 'completed',
+      reviewText: renderCompletionGate(result),
       finishedAt: this.deps.nowIso()
     }))
   }
@@ -548,6 +657,154 @@ export class RigorousPipeline {
       severity: 'warning'
     })
   }
+}
+
+type RequiredCriterionSummary = {
+  failed: number
+  missingResults: number
+  withoutEvidence: number
+  allPassed: boolean
+}
+
+function summarizeRequiredCriteria(
+  task: HarnessTaskSpec | undefined,
+  verification: VerificationArtifact
+): RequiredCriterionSummary {
+  const required = task?.acceptanceCriteria.filter((criterion) => criterion.required) ?? []
+  let failed = 0
+  let missingResults = 0
+  let withoutEvidence = 0
+
+  for (const criterion of required) {
+    const acceptedNames = new Set([criterion.id, criterion.description].map(normalizeCriterionName))
+    const result = verification.criteriaResults.find((candidate) =>
+      acceptedNames.has(normalizeCriterionName(candidate.criterion))
+    )
+    if (!result) {
+      missingResults += 1
+      continue
+    }
+    if (!result.pass) {
+      failed += 1
+      continue
+    }
+    if (!result.evidenceIds.some((id) => id.trim().length > 0)) withoutEvidence += 1
+  }
+
+  return {
+    failed,
+    missingResults,
+    withoutEvidence,
+    allPassed: failed === 0 && missingResults === 0 && withoutEvidence === 0
+  }
+}
+
+function summarizeMechanicalChecks(
+  task: HarnessTaskSpec | undefined,
+  suiteBefore: { suite: EvalSuite; hash: string } | null,
+  evalRun: { outcome: EvalRunOutcome; hashBefore: string; hashAfter: string } | null
+): { failed: number; missing: number; optionalFailures: number } {
+  const requiredNames = new Set<string>()
+  const optionalNames = new Set<string>()
+  for (const check of suiteBefore?.suite.checks ?? []) requiredNames.add(check.name)
+  for (const check of task?.verification ?? []) {
+    if (check.required) requiredNames.add(check.id)
+    else optionalNames.add(check.id)
+  }
+
+  const resultsByName = new Map((evalRun?.outcome.results ?? []).map((result) => [result.name, result]))
+  let failed = 0
+  let missing = 0
+  for (const name of requiredNames) {
+    const result = resultsByName.get(name)
+    if (!result) missing += 1
+    else if (!result.pass) failed += 1
+  }
+  let optionalFailures = 0
+  for (const name of optionalNames) {
+    const result = resultsByName.get(name)
+    if (result && !result.pass) optionalFailures += 1
+  }
+  return { failed, missing, optionalFailures }
+}
+
+function findForbiddenPaths(
+  task: HarnessTaskSpec | undefined,
+  execution: ExecutionArtifact,
+  diff: string
+): string[] {
+  const patterns = forbiddenPathPatterns(task)
+  if (!patterns.length) return []
+
+  const changed = new Set([
+    ...execution.filesChanged.map(normalizeWorkspacePath),
+    ...pathsFromGitDiff(diff).map(normalizeWorkspacePath)
+  ].filter(Boolean))
+  return [...changed]
+    .filter((path) => patterns.some((pattern) => matchesWorkspacePath(path, pattern)))
+    .sort()
+}
+
+function forbiddenPathPatterns(task: HarnessTaskSpec | undefined): string[] {
+  return task?.constraints
+    .filter((constraint) => constraint.kind === 'forbidden-path')
+    .map((constraint) => normalizeWorkspacePath(constraint.value))
+    .filter(Boolean) ?? []
+}
+
+function normalizeCriterionName(value: string): string {
+  return value.trim().toLowerCase()
+}
+
+function normalizeWorkspacePath(value: string): string {
+  return value.trim().replaceAll('\\', '/').replace(/^(?:a|b)\//, '').replace(/^\.\//, '')
+}
+
+function pathsFromGitDiff(diff: string): string[] {
+  const paths: string[] = []
+  for (const line of diff.split('\n')) {
+    const untracked = /^untracked: (.+)$/.exec(line)
+    if (untracked) {
+      paths.push(untracked[1])
+      continue
+    }
+    const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line)
+    if (!match) continue
+    if (match[1] !== '/dev/null') paths.push(match[1])
+    if (match[2] !== '/dev/null') paths.push(match[2])
+  }
+  return paths
+}
+
+function matchesWorkspacePath(path: string, pattern: string): boolean {
+  if (path === pattern || path.startsWith(`${pattern}/`)) return true
+  let expression = '^'
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index]
+    if (character === '*') {
+      if (pattern[index + 1] === '*') {
+        expression += '.*'
+        index += 1
+      } else {
+        expression += '[^/]*'
+      }
+      continue
+    }
+    if (character === '?') {
+      expression += '[^/]'
+      continue
+    }
+    expression += character.replace(/[|\\{}()[\]^$+?.]/g, '\\$&')
+  }
+  return new RegExp(`${expression}$`).test(path)
+}
+
+function hashCapturedArtifact(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function isShippingVerdict(verdict: CompletionGateResult['verdict']): boolean {
+  return verdict === 'ship' || verdict === 'ship_with_warnings'
 }
 
 function toUsageSnapshot(usage: NonNullable<Awaited<ReturnType<ChildRunExecutor>>['usage']>): UsageSnapshot {
@@ -607,13 +864,21 @@ export function verifierPrompt(
   plan: PlannerArtifact,
   filesChanged: readonly string[],
   diff: string,
-  evalSuite?: EvalSuite
+  evalSuite?: EvalSuite,
+  harnessTask?: HarnessTaskSpec
 ): string {
   return [
     ...(evalSuite?.checks.length
       ? [
           'Workspace eval suite (run these checks and account for them):',
           JSON.stringify(evalSuite.checks.map(({ name, command, expect }) => ({ name, command, expect })), null, 2),
+          ''
+        ]
+      : []),
+    ...(harnessTask
+      ? [
+          'Harness acceptance criteria (for every required criterion, report its ID and non-empty durable evidenceIds when it passes):',
+          JSON.stringify(harnessTask.acceptanceCriteria, null, 2),
           ''
         ]
       : []),
@@ -634,6 +899,7 @@ export function verifierPrompt(
     fenced(diff || '(no git diff captured)'),
     '',
     'Verify against the criteria and actual diff. Do not rely on executor narrative.',
+    'Each criteriaResults entry must include criterion, pass, and evidenceIds.',
     'End with the required fenced JSON artifact.'
   ].join('\n')
 }
@@ -690,7 +956,9 @@ function renderVerificationReport(artifact: VerificationArtifact, rawText: strin
     `Commands run: ${artifact.commandsRun.join(', ') || 'none reported'}`
   ]
   for (const result of artifact.criteriaResults) {
-    lines.push(`- ${result.pass ? 'PASS' : 'FAIL'} ${result.criterion}`)
+    lines.push(
+      `- ${result.pass ? 'PASS' : 'FAIL'} ${result.criterion} Evidence IDs: ${result.evidenceIds.join(', ') || 'none'}`
+    )
   }
   if (artifact.findings.length) {
     lines.push('', 'Findings:')
@@ -718,17 +986,57 @@ function renderVerdict(artifact: VerdictArtifact): string {
   return [`Verdict: ${artifact.verdict}`, '', ...artifact.reasons.map((reason) => `- ${reason}`)].join('\n').trim()
 }
 
-function renderFinalSummary(artifact: VerdictArtifact): string {
+function renderCompletionGate(result: CompletionGateResult): string {
   return [
-    `Rigorous pipeline verdict: ${artifact.verdict}.`,
-    ...artifact.reasons.map((reason) => `- ${reason}`)
+    `Completion gate verdict: ${result.verdict}.`,
+    ...result.reasons.map((reason) => `- ${reason}`)
   ].join('\n')
 }
 
-async function captureGitDiff(workspace: string): Promise<string> {
+function renderFinalSummary(result: CompletionGateResult, reviewer: VerdictArtifact): string {
+  return [
+    `Rigorous completion gate verdict: ${result.verdict}.`,
+    ...result.reasons.map((reason) => `- ${reason}`),
+    `Reviewer advisory: ${reviewer.verdict}.`
+  ].join('\n')
+}
+
+function renderCompletionGateFailure(result: CompletionGateResult): string {
+  return `rigorous completion gate ${result.verdict}: ${result.reasons.join('; ') || 'completion evidence did not support shipping'}`
+}
+
+async function captureGitDiff(workspace: string, task?: HarnessTaskSpec): Promise<string> {
   if (!workspace.trim()) return ''
+  const forbiddenPatterns = forbiddenPathPatterns(task)
+  const [unstaged, staged, untracked, ignored] = await Promise.all([
+    captureGitOutput(workspace, ['diff', '--no-ext-diff']),
+    captureGitOutput(workspace, ['diff', '--cached', '--no-ext-diff']),
+    captureGitOutput(workspace, ['ls-files', '--others', '--exclude-standard']),
+    forbiddenPatterns.length
+      ? captureGitOutput(workspace, ['ls-files', '--others', '--ignored', '--exclude-standard'])
+      : Promise.resolve('')
+  ])
+  const untrackedPaths = new Set(
+    untracked
+      .split('\n')
+      .map((path) => path.trim())
+      .filter(Boolean)
+  )
+  for (const path of ignored.split('\n').map((candidate) => candidate.trim()).filter(Boolean)) {
+    if (forbiddenPatterns.some((pattern) => matchesWorkspacePath(normalizeWorkspacePath(path), pattern))) {
+      untrackedPaths.add(path)
+    }
+  }
+  const untrackedMarkers = await Promise.all([...untrackedPaths].sort().map(async (path) => {
+    const hash = await captureGitOutput(workspace, ['hash-object', '--', path])
+    return hash ? `untracked: ${path}\nuntracked-hash: ${hash}` : `untracked: ${path}`
+  }))
+  return [unstaged, staged, ...untrackedMarkers].filter(Boolean).join('\n').trim()
+}
+
+async function captureGitOutput(workspace: string, args: string[]): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('git', ['-C', workspace, 'diff', '--no-ext-diff'], {
+    const { stdout } = await execFileAsync('git', ['-C', workspace, ...args], {
       maxBuffer: 2 * 1024 * 1024
     })
     return stdout.trim()

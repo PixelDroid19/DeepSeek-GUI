@@ -30,7 +30,9 @@ export type VerificationFinding = z.infer<typeof VerificationFindingSchema>
 
 export const VerificationCriterionResultSchema = z.object({
   criterion: z.string().default(''),
-  pass: z.boolean().default(false)
+  pass: z.boolean().default(false),
+  /** Durable evidence references backing this verifier claim. */
+  evidenceIds: z.array(z.string()).default([])
 })
 export type VerificationCriterionResult = z.infer<typeof VerificationCriterionResultSchema>
 
@@ -40,6 +42,8 @@ export const VerificationArtifactSchema = z.object({
   commandsRun: z.array(z.string()).default([])
 })
 export type VerificationArtifact = z.infer<typeof VerificationArtifactSchema>
+/** Raw role output may omit fields that the schema fills with defaults. */
+export type VerificationArtifactInput = z.input<typeof VerificationArtifactSchema>
 
 export const VerdictArtifactSchema = z.object({
   verdict: z.enum(['ship', 'fix', 'replan']),
@@ -50,7 +54,7 @@ export type VerdictArtifact = z.infer<typeof VerdictArtifactSchema>
 export type StageArtifact =
   | PlannerArtifact
   | ExecutionArtifact
-  | VerificationArtifact
+  | VerificationArtifactInput
   | VerdictArtifact
 
 export type StageArtifactForKind<Kind extends StageArtifactKind> =
