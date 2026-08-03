@@ -12,8 +12,8 @@ import type { UsageService } from '../services/usage-service.js'
 import type { UsageSnapshot } from '../contracts/usage.js'
 import type { RolesConfig } from '../config/kun-config.js'
 import type { ToolHost, ToolHostContext } from '../ports/tool-host.js'
-import type { EvalSuite } from '../contracts/evals.js'
-import type { HarnessTaskSpec } from '../contracts/harness.js'
+import type { EvalCheckResult, EvalExpectation, EvalSuite } from '../contracts/evals.js'
+import type { HarnessTaskSpec, HarnessVerificationCheck } from '../contracts/harness.js'
 import { EvalSuiteStore, evalSuiteHash } from '../evals/eval-suite-store.js'
 import { runEvalSuite, type EvalRunOutcome } from '../evals/eval-runner.js'
 import {
@@ -36,6 +36,33 @@ import { ROLE_PROFILES, resolveRoleModel, roleEnabled } from './role-profiles.js
 const execFileAsync = promisify(execFile)
 
 type PipelineStatus = 'completed' | 'failed' | 'aborted' | 'fallback'
+
+type MechanicalEvalResult = EvalCheckResult & {
+  origin: 'suite' | 'harness'
+  checkId: string
+}
+
+type MechanicalEvalOutcome = Omit<EvalRunOutcome, 'results'> & {
+  results: MechanicalEvalResult[]
+}
+
+type MechanicalEvalRun = {
+  outcome: MechanicalEvalOutcome
+  hashBefore: string
+  hashAfter: string
+  suiteChecksBefore: number
+  suiteChecksAfter: number
+}
+
+type WorkspaceArtifactCapture = {
+  text: string
+  hash: string | null
+  available: boolean
+}
+
+type GitCaptureOutput =
+  | { ok: true; stdout: string }
+  | { ok: false }
 
 export type RigorousPipelineDeps = {
   threadStore: ThreadStore
@@ -119,8 +146,8 @@ export class RigorousPipeline {
         await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
         return 'aborted'
       }
-      const firstDiff = await captureGitDiff(workspace, turn.harnessTask)
-      const firstWorkspaceHashBefore = hashCapturedArtifact(firstDiff)
+      const firstWorkspaceCapture = await captureWorkspaceArtifact(workspace, turn.harnessTask)
+      const firstDiff = firstWorkspaceCapture.text
       const firstVerification = await this.runVerifier({
         threadId,
         turnId,
@@ -138,9 +165,16 @@ export class RigorousPipeline {
         await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
         return 'aborted'
       }
-      const firstEvalRun = await this.runEvalsMechanically(threadId, turnId, workspace, suiteBefore, signal)
+      const firstEvalRun = await this.runEvalsMechanically(
+        threadId,
+        turnId,
+        workspace,
+        suiteBefore,
+        turn.harnessTask,
+        signal
+      )
       await this.persistVerification(threadId, turnId, firstVerification.artifact, firstVerification.rawText, 'initial', firstEvalRun)
-      const firstWorkspaceHashAfter = hashCapturedArtifact(await captureGitDiff(workspace, turn.harnessTask))
+      const firstWorkspaceCaptureAfter = await captureWorkspaceArtifact(workspace, turn.harnessTask)
       let review = await this.runReviewer({
         threadId,
         turnId,
@@ -164,8 +198,11 @@ export class RigorousPipeline {
         evalRun: firstEvalRun,
         suiteBefore,
         diff: firstDiff,
-        workspaceHashBefore: firstWorkspaceHashBefore,
-        workspaceHashAfter: firstWorkspaceHashAfter,
+        workspaceHashBefore: firstWorkspaceCapture.hash,
+        workspaceHashAfter: firstWorkspaceCaptureAfter.hash,
+        workspaceArtifactCaptureUnavailable: turn.harnessTask
+          ? !firstWorkspaceCapture.available || !firstWorkspaceCaptureAfter.available
+          : undefined,
         reviewerVerdict: review.artifact.verdict
       })
       await this.persistCompletionGate(threadId, turnId, completionGate, 'initial')
@@ -185,8 +222,8 @@ export class RigorousPipeline {
           await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
           return 'aborted'
         }
-        const finalDiff = await captureGitDiff(workspace, turn.harnessTask)
-        const finalWorkspaceHashBefore = hashCapturedArtifact(finalDiff)
+        const finalWorkspaceCapture = await captureWorkspaceArtifact(workspace, turn.harnessTask)
+        const finalDiff = finalWorkspaceCapture.text
         const finalVerification = await this.runVerifier({
           threadId,
           turnId,
@@ -204,9 +241,16 @@ export class RigorousPipeline {
           await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
           return 'aborted'
         }
-        const finalEvalRun = await this.runEvalsMechanically(threadId, turnId, workspace, suiteBefore, signal)
+        const finalEvalRun = await this.runEvalsMechanically(
+          threadId,
+          turnId,
+          workspace,
+          suiteBefore,
+          turn.harnessTask,
+          signal
+        )
         await this.persistVerification(threadId, turnId, finalVerification.artifact, finalVerification.rawText, 'final', finalEvalRun)
-        const finalWorkspaceHashAfter = hashCapturedArtifact(await captureGitDiff(workspace, turn.harnessTask))
+        const finalWorkspaceCaptureAfter = await captureWorkspaceArtifact(workspace, turn.harnessTask)
         review = await this.runReviewer({
           threadId,
           turnId,
@@ -231,8 +275,11 @@ export class RigorousPipeline {
           evalRun: finalEvalRun,
           suiteBefore,
           diff: finalDiff,
-          workspaceHashBefore: finalWorkspaceHashBefore,
-          workspaceHashAfter: finalWorkspaceHashAfter,
+          workspaceHashBefore: finalWorkspaceCapture.hash,
+          workspaceHashAfter: finalWorkspaceCaptureAfter.hash,
+          workspaceArtifactCaptureUnavailable: turn.harnessTask
+            ? !finalWorkspaceCapture.available || !finalWorkspaceCaptureAfter.available
+            : undefined,
           reviewerVerdict: review.artifact.verdict
         })
         await this.persistCompletionGate(threadId, turnId, completionGate, 'final')
@@ -524,16 +571,12 @@ export class RigorousPipeline {
     turnId: string,
     workspace: string,
     suiteBefore: { suite: EvalSuite; hash: string } | null,
+    harnessTask: HarnessTaskSpec | undefined,
     signal: AbortSignal
-  ): Promise<{ outcome: EvalRunOutcome; hashBefore: string; hashAfter: string } | null> {
+  ): Promise<MechanicalEvalRun | null> {
     const evals = this.deps.evals
     if (!evals?.enabled || !suiteBefore) return null
     try {
-      const current = await evals.store.load(workspace)
-      // Only skip when there was nothing to run before AND after the
-      // turn. A suite emptied mid-turn must still surface its tamper
-      // hashes rather than silently vanish.
-      if (!current.checks.length && !suiteBefore.suite.checks.length) return null
       const context: ToolHostContext = {
         threadId,
         turnId,
@@ -544,8 +587,38 @@ export class RigorousPipeline {
         awaitApproval: (approval) => this.approvalBridge(threadId, turnId, 'verifier')(approval)
           .then((resolution) => (typeof resolution === 'string' ? resolution : resolution.decision))
       }
-      const outcome = await runEvalSuite(current, evals.toolHost, context)
-      return { outcome, hashBefore: suiteBefore.hash, hashAfter: evalSuiteHash(current) }
+      const suiteOutcome = suiteBefore.suite.checks.length
+        ? await runEvalSuite(suiteBefore.suite, evals.toolHost, context)
+        : emptyEvalOutcome()
+      const harnessResults = await runHarnessVerificationChecks(
+        harnessTask?.verification ?? [],
+        evals.toolHost,
+        context
+      )
+      // Re-load only after every mechanical command has completed. The
+      // execution snapshot remains immutable while this detects any suite
+      // mutation made by a command, executor, or verifier during the pass.
+      const suiteAfter = await evals.store.load(workspace)
+      const results: MechanicalEvalResult[] = [
+        ...suiteOutcome.results.map((result) => ({ ...result, origin: 'suite' as const, checkId: result.name })),
+        ...harnessResults
+      ]
+      const outcome: MechanicalEvalOutcome = {
+        results,
+        passed: results.filter((result) => result.pass).length,
+        failed: results.filter((result) => !result.pass).length
+      }
+      const run: MechanicalEvalRun = {
+        outcome,
+        hashBefore: suiteBefore.hash,
+        hashAfter: evalSuiteHash(suiteAfter),
+        suiteChecksBefore: suiteBefore.suite.checks.length,
+        suiteChecksAfter: suiteAfter.checks.length
+      }
+      if (!suiteBefore.suite.checks.length && !harnessResults.length && run.hashBefore === run.hashAfter) {
+        return null
+      }
+      return run
     } catch (error) {
       await this.recordWarning(
         threadId,
@@ -561,11 +634,12 @@ export class RigorousPipeline {
     execution: ExecutionArtifact
     verification: VerificationArtifact
     verifierResultPresent: boolean
-    evalRun: { outcome: EvalRunOutcome; hashBefore: string; hashAfter: string } | null
+    evalRun: MechanicalEvalRun | null
     suiteBefore: { suite: EvalSuite; hash: string } | null
     diff: string
-    workspaceHashBefore: string
-    workspaceHashAfter: string
+    workspaceHashBefore: string | null
+    workspaceHashAfter: string | null
+    workspaceArtifactCaptureUnavailable?: boolean
     reviewerVerdict: VerdictArtifact['verdict']
   }): CompletionGateResult {
     const criteria = summarizeRequiredCriteria(input.task, input.verification)
@@ -585,6 +659,7 @@ export class RigorousPipeline {
       forbiddenPaths: findForbiddenPaths(input.task, input.execution, input.diff),
       workspaceHashBefore: input.workspaceHashBefore,
       workspaceHashAfter: input.workspaceHashAfter,
+      workspaceArtifactCaptureUnavailable: input.workspaceArtifactCaptureUnavailable,
       verifierResultPresent: input.verifierResultPresent,
       allRequiredEvidencePass: criteria.allPassed,
       reviewerVerdict: input.reviewerVerdict
@@ -597,7 +672,7 @@ export class RigorousPipeline {
     artifact: VerificationArtifact,
     rawText: string,
     suffix = 'initial',
-    evalRun?: { outcome: EvalRunOutcome; hashBefore: string; hashAfter: string } | null
+    evalRun?: MechanicalEvalRun | null
   ): Promise<void> {
     await this.deps.turns.applyItem(threadId, makeReviewItem({
       id: `item_${turnId}_verification_${suffix}`,
@@ -659,6 +734,123 @@ export class RigorousPipeline {
   }
 }
 
+function emptyEvalOutcome(): EvalRunOutcome {
+  return { results: [], passed: 0, failed: 0 }
+}
+
+async function runHarnessVerificationChecks(
+  checks: readonly HarnessVerificationCheck[],
+  toolHost: ToolHost,
+  context: ToolHostContext
+): Promise<MechanicalEvalResult[]> {
+  const results: MechanicalEvalResult[] = []
+  for (const check of checks) {
+    if (context.abortSignal.aborted) break
+    results.push(await runHarnessVerificationCheck(check, toolHost, context))
+  }
+  return results
+}
+
+async function runHarnessVerificationCheck(
+  check: HarnessVerificationCheck,
+  toolHost: ToolHost,
+  context: ToolHostContext
+): Promise<MechanicalEvalResult> {
+  const startedAt = performance.now()
+  const timeoutSeconds = Math.max(1, Math.ceil(check.timeoutMs / 1_000))
+  let output = ''
+  let isError = true
+  try {
+    const result = await toolHost.execute(
+      {
+        callId: `harness_eval_${check.id.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Math.floor(startedAt)}`,
+        toolName: 'bash',
+        toolKind: 'command_execution',
+        arguments: { command: check.command, timeout: timeoutSeconds }
+      },
+      context
+    )
+    if (result.item.kind === 'tool_result') {
+      const sessionId = runningSessionId(result.item.output)
+      isError = result.item.isError === true || sessionId !== null
+      output = stringifyMechanicalOutput(result.item.output)
+      if (sessionId) {
+        await stopHarnessCheckSession(toolHost, context, check.id, sessionId)
+        output = `${output}\nmechanical command did not complete before evidence collection`
+      }
+    } else if (result.item.kind === 'approval') {
+      output = `approval denied for: ${check.id}`
+    }
+  } catch (error) {
+    output = error instanceof Error ? error.message : String(error)
+  }
+  return {
+    name: `harness:${check.id}`,
+    checkId: check.id,
+    origin: 'harness',
+    command: check.command,
+    pass: evaluateMechanicalExpectation(check.expectation, output, isError),
+    expectation: renderExpectation(check.expectation),
+    output: output.slice(0, 1_000),
+    durationMs: Math.max(0, performance.now() - startedAt)
+  }
+}
+
+function evaluateMechanicalExpectation(expectation: EvalExpectation, output: string, isError: boolean): boolean {
+  if (isError) return false
+  return expectation.kind === 'contains' ? output.includes(expectation.text) : true
+}
+
+function renderExpectation(expectation: EvalExpectation): string {
+  return expectation.kind === 'contains' ? `contains "${expectation.text}"` : 'exit-zero'
+}
+
+function stringifyMechanicalOutput(output: unknown): string {
+  if (typeof output === 'string') return output
+  if (output && typeof output === 'object' && 'output' in output) {
+    const inner = (output as { output?: unknown }).output
+    if (typeof inner === 'string') return inner
+  }
+  try {
+    return JSON.stringify(output)
+  } catch {
+    return String(output)
+  }
+}
+
+function runningSessionId(output: unknown): string | null {
+  if (!output || typeof output !== 'object') return null
+  const candidate = output as { status?: unknown; session_id?: unknown; output?: unknown }
+  if (candidate.status === 'running') {
+    return typeof candidate.session_id === 'string' && candidate.session_id.trim()
+      ? candidate.session_id
+      : ''
+  }
+  return runningSessionId(candidate.output)
+}
+
+async function stopHarnessCheckSession(
+  toolHost: ToolHost,
+  context: ToolHostContext,
+  checkId: string,
+  sessionId: string
+): Promise<void> {
+  try {
+    await toolHost.execute(
+      {
+        callId: `harness_eval_stop_${checkId.replace(/[^a-zA-Z0-9_-]/g, '_')}`,
+        toolName: 'bash',
+        toolKind: 'command_execution',
+        arguments: { action: 'stop', session_id: sessionId }
+      },
+      context
+    )
+  } catch {
+    // The failed evidence result remains authoritative even if a remote tool
+    // cannot confirm session cleanup.
+  }
+}
+
 type RequiredCriterionSummary = {
   failed: number
   missingResults: number
@@ -702,28 +894,25 @@ function summarizeRequiredCriteria(
 function summarizeMechanicalChecks(
   task: HarnessTaskSpec | undefined,
   suiteBefore: { suite: EvalSuite; hash: string } | null,
-  evalRun: { outcome: EvalRunOutcome; hashBefore: string; hashAfter: string } | null
+  evalRun: MechanicalEvalRun | null
 ): { failed: number; missing: number; optionalFailures: number } {
-  const requiredNames = new Set<string>()
-  const optionalNames = new Set<string>()
-  for (const check of suiteBefore?.suite.checks ?? []) requiredNames.add(check.name)
-  for (const check of task?.verification ?? []) {
-    if (check.required) requiredNames.add(check.id)
-    else optionalNames.add(check.id)
-  }
-
-  const resultsByName = new Map((evalRun?.outcome.results ?? []).map((result) => [result.name, result]))
   let failed = 0
   let missing = 0
-  for (const name of requiredNames) {
-    const result = resultsByName.get(name)
+  let optionalFailures = 0
+  const results = evalRun?.outcome.results ?? []
+  for (const check of suiteBefore?.suite.checks ?? []) {
+    const result = results.find((candidate) => candidate.origin === 'suite' && candidate.checkId === check.name)
     if (!result) missing += 1
     else if (!result.pass) failed += 1
   }
-  let optionalFailures = 0
-  for (const name of optionalNames) {
-    const result = resultsByName.get(name)
-    if (result && !result.pass) optionalFailures += 1
+  for (const check of task?.verification ?? []) {
+    const result = results.find((candidate) => candidate.origin === 'harness' && candidate.checkId === check.id)
+    if (!result) {
+      if (check.required) missing += 1
+    } else if (!result.pass) {
+      if (check.required) failed += 1
+      else optionalFailures += 1
+    }
   }
   return { failed, missing, optionalFailures }
 }
@@ -970,13 +1159,15 @@ function renderVerificationReport(artifact: VerificationArtifact, rawText: strin
   return lines.join('\n').trim()
 }
 
-function renderEvalRun(evalRun: { outcome: EvalRunOutcome; hashBefore: string; hashAfter: string }): string {
+function renderEvalRun(evalRun: MechanicalEvalRun): string {
   const lines = [
     `Eval suite (mechanical run): ${evalRun.outcome.passed} passed, ${evalRun.outcome.failed} failed`,
+    `Initial suite checks: ${evalRun.suiteChecksBefore}; Final suite checks: ${evalRun.suiteChecksAfter}`,
     `Suite hash before/after turn: ${evalRun.hashBefore} / ${evalRun.hashAfter}${evalRun.hashBefore !== evalRun.hashAfter ? ' (SUITE CHANGED DURING TURN)' : ''}`
   ]
   for (const result of evalRun.outcome.results) {
-    lines.push(`- ${result.pass ? 'PASS' : 'FAIL'} ${result.name} (${result.expectation}): \`${result.command}\``)
+    const name = result.origin === 'harness' ? `harness:${result.checkId}` : result.name
+    lines.push(`- ${result.pass ? 'PASS' : 'FAIL'} ${name} (${result.expectation}): \`${result.command}\``)
     if (!result.pass && result.output) lines.push(`  output: ${result.output.slice(0, 200)}`)
   }
   return lines.join('\n')
@@ -1005,8 +1196,14 @@ function renderCompletionGateFailure(result: CompletionGateResult): string {
   return `rigorous completion gate ${result.verdict}: ${result.reasons.join('; ') || 'completion evidence did not support shipping'}`
 }
 
-async function captureGitDiff(workspace: string, task?: HarnessTaskSpec): Promise<string> {
-  if (!workspace.trim()) return ''
+async function captureWorkspaceArtifact(
+  workspace: string,
+  task?: HarnessTaskSpec
+): Promise<WorkspaceArtifactCapture> {
+  if (!workspace.trim()) return unavailableWorkspaceArtifactCapture()
+  const worktree = await captureGitOutput(workspace, ['rev-parse', '--is-inside-work-tree'])
+  if (!worktree.ok || worktree.stdout !== 'true') return unavailableWorkspaceArtifactCapture()
+
   const forbiddenPatterns = forbiddenPathPatterns(task)
   const [unstaged, staged, untracked, ignored] = await Promise.all([
     captureGitOutput(workspace, ['diff', '--no-ext-diff']),
@@ -1014,33 +1211,43 @@ async function captureGitDiff(workspace: string, task?: HarnessTaskSpec): Promis
     captureGitOutput(workspace, ['ls-files', '--others', '--exclude-standard']),
     forbiddenPatterns.length
       ? captureGitOutput(workspace, ['ls-files', '--others', '--ignored', '--exclude-standard'])
-      : Promise.resolve('')
+      : Promise.resolve<GitCaptureOutput>({ ok: true, stdout: '' })
   ])
+  if (!unstaged.ok || !staged.ok || !untracked.ok || !ignored.ok) return unavailableWorkspaceArtifactCapture()
+
   const untrackedPaths = new Set(
-    untracked
+    untracked.stdout
       .split('\n')
       .map((path) => path.trim())
       .filter(Boolean)
   )
-  for (const path of ignored.split('\n').map((candidate) => candidate.trim()).filter(Boolean)) {
+  for (const path of ignored.stdout.split('\n').map((candidate) => candidate.trim()).filter(Boolean)) {
     if (forbiddenPatterns.some((pattern) => matchesWorkspacePath(normalizeWorkspacePath(path), pattern))) {
       untrackedPaths.add(path)
     }
   }
   const untrackedMarkers = await Promise.all([...untrackedPaths].sort().map(async (path) => {
     const hash = await captureGitOutput(workspace, ['hash-object', '--', path])
-    return hash ? `untracked: ${path}\nuntracked-hash: ${hash}` : `untracked: ${path}`
+    if (!hash.ok) return null
+    return `untracked: ${path}\nuntracked-hash: ${hash.stdout}`
   }))
-  return [unstaged, staged, ...untrackedMarkers].filter(Boolean).join('\n').trim()
+  if (untrackedMarkers.some((marker) => marker === null)) return unavailableWorkspaceArtifactCapture()
+
+  const text = [unstaged.stdout, staged.stdout, ...untrackedMarkers].filter(Boolean).join('\n').trim()
+  return { text, hash: hashCapturedArtifact(text), available: true }
 }
 
-async function captureGitOutput(workspace: string, args: string[]): Promise<string> {
+function unavailableWorkspaceArtifactCapture(): WorkspaceArtifactCapture {
+  return { text: '', hash: null, available: false }
+}
+
+async function captureGitOutput(workspace: string, args: string[]): Promise<GitCaptureOutput> {
   try {
     const { stdout } = await execFileAsync('git', ['-C', workspace, ...args], {
       maxBuffer: 2 * 1024 * 1024
     })
-    return stdout.trim()
+    return { ok: true, stdout: stdout.trim() }
   } catch {
-    return ''
+    return { ok: false }
   }
 }

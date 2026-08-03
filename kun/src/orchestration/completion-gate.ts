@@ -20,6 +20,7 @@ export type CompletionGateInput = {
   artifactHashAfter?: string | null
   workspaceHashBefore?: string | null
   workspaceHashAfter?: string | null
+  workspaceArtifactCaptureUnavailable?: boolean
   verifierResultPresent?: boolean
   allRequiredEvidencePass?: boolean
   /** Reviewer output is advisory: it cannot override mechanical evidence. */
@@ -57,6 +58,7 @@ export function evaluateCompletionGate(input: CompletionGateInput): CompletionGa
   validateBoolean(input.suiteChanged, 'suiteChanged', invalidFields)
   validateBoolean(input.verifierResultPresent, 'verifierResultPresent', invalidFields)
   validateBoolean(input.allRequiredEvidencePass, 'allRequiredEvidencePass', invalidFields)
+  validateBoolean(input.workspaceArtifactCaptureUnavailable, 'workspaceArtifactCaptureUnavailable', invalidFields)
   const forbiddenPaths = uniqueNonEmpty(input.forbiddenPaths, invalidFields)
   const workspaceHash = compareHashPair(
     input.workspaceHashBefore,
@@ -100,12 +102,19 @@ export function evaluateCompletionGate(input: CompletionGateInput): CompletionGa
   if (input.verifierResultPresent === false) {
     return inconclusive(['verifier did not produce a parseable verification result'])
   }
-  if (requiredChecksMissing || requiredVerifierResultsMissing || workspaceHash === 'missing' || artifactHash === 'missing') {
+  if (
+    requiredChecksMissing ||
+    requiredVerifierResultsMissing ||
+    workspaceHash === 'missing' ||
+    artifactHash === 'missing' ||
+    input.workspaceArtifactCaptureUnavailable
+  ) {
     const reasons: string[] = []
     if (requiredChecksMissing) reasons.push(`${requiredChecksMissing} required mechanical checks did not run`)
     if (requiredVerifierResultsMissing) reasons.push(`${requiredVerifierResultsMissing} required verifier results are missing`)
     if (workspaceHash === 'missing') reasons.push('workspace artifact hash is incomplete')
     if (artifactHash === 'missing') reasons.push('captured artifact hash is incomplete')
+    if (input.workspaceArtifactCaptureUnavailable) reasons.push('workspace artifact capture unavailable')
     return inconclusive(reasons)
   }
   if (input.allRequiredEvidencePass === false) {

@@ -66,4 +66,12 @@ describe('completion gate', () => {
       allRequiredEvidencePass: true
     })).toMatchObject({ verdict: 'inconclusive' })
   })
+
+  it('is inconclusive when a required workspace artifact capture is unavailable', () => {
+    expect(evaluateCompletionGate({
+      workspaceArtifactCaptureUnavailable: true,
+      verifierSaysShip: true,
+      allRequiredEvidencePass: true
+    })).toMatchObject({ verdict: 'inconclusive' })
+  })
 })
