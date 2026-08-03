@@ -478,7 +478,7 @@ async function runHarnessTrial(argv: readonly string[], io: CliIo): Promise<numb
       request: {
         prompt: manifest.manifest.task.objective,
         model: manifest.manifest.model,
-        mode: 'rigorous',
+        mode: manifest.manifest.task.executionPolicy === 'normal' ? 'agent' : 'rigorous',
         harnessTask: manifest.manifest.task
       }
     })
