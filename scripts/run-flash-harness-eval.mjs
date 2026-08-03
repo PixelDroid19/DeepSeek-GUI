@@ -22,6 +22,8 @@ const MAX_OUTPUT_BYTES = 64_000
 const PREFLIGHT_TIMEOUT_MS = 15 * 60_000
 const CLI_GRACE_MS = 30_000
 const REPORT_VERSION = 1
+const HOST_VERIFIER_ISOLATION = 'separate-process'
+const MINIMAL_VERIFIER_ENV_KEYS = ['PATH', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'TZ']
 
 const FIXTURES = {
   smoke: [
@@ -517,12 +519,23 @@ async function runTrial(prepared, harness, config, apiKey) {
     record.externalVerifier = { status: 'not-provided', outputRedacted: true }
     return record
   }
+  if (prepared.verifier.isolation !== HOST_VERIFIER_ISOLATION) {
+    // `container` and `remote` describe real benchmark boundaries, but this
+    // runner has no Docker or remote dispatcher. Never reinterpret either as
+    // permission to run an arbitrary verifier command on the host.
+    record.externalVerifier = {
+      status: 'unsupported-isolation',
+      isolation: prepared.verifier.isolation,
+      outputRedacted: true
+    }
+    return record
+  }
 
   const verifierResult = await runSubprocess('bash', ['-lc', prepared.verifier.command], {
     cwd: prepared.loaded.manifest.workspaceRoot,
-    // The verifier never receives the model credential. Its controller may
-    // supply its own isolated credentials outside this runner if required.
-    env: withoutDeepseekKey(process.env),
+    // A host verifier receives only process-liveness locale/path values, never
+    // the model key or the caller's broader environment.
+    env: minimalVerifierEnvironment(process.env),
     timeoutMs: prepared.verifier.timeoutMs
   })
   record.externalVerifier = {
@@ -634,6 +647,15 @@ function assertNoSensitiveFields(value, seen = new WeakSet()) {
 function withoutDeepseekKey(environment) {
   const { DEEPSEEK_API_KEY: _ignored, ...rest } = environment
   return rest
+}
+
+function minimalVerifierEnvironment(environment) {
+  const minimal = {}
+  for (const key of MINIMAL_VERIFIER_ENV_KEYS) {
+    const value = environment[key]
+    if (typeof value === 'string' && value) minimal[key] = value
+  }
+  return minimal
 }
 
 function summarizeComparison(trials) {

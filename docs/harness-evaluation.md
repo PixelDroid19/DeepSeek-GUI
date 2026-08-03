@@ -79,7 +79,7 @@ than in the manifest:
   "check": {
     "id": "official-verifier:example-task",
     "command": "<isolated verifier command>",
-    "isolation": "container",
+    "isolation": "separate-process",
     "timeoutMs": 300000
   }
 }
@@ -89,6 +89,15 @@ The file must be named `<manifest>.verifier.json`. It is strict and rejects
 credential/oracle/solution-shaped fields. If it is absent or the isolated
 verifier cannot complete, a model-side `pass` is reported as **inconclusive**,
 not as an official benchmark pass.
+
+The local runner dispatches only `separate-process` sidecars. It accepts
+`container` and `remote` as valid adapter metadata but records them as
+`unsupported-isolation` and exits inconclusively without running their command
+on the host. A Harbor/Docker or remote benchmark controller must run those
+verifiers through its real isolation boundary and publish the resulting record
+outside this runner. Host-dispatched verifiers receive only a minimal `PATH`,
+temporary-directory, locale, and timezone environment; no model key or broader
+caller environment is forwarded.
 
 ## Reports and fair comparisons
 
