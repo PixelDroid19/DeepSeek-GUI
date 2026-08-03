@@ -1706,7 +1706,7 @@ describe('rigorous pipeline', () => {
 
     expect(status).toBe('failed')
     expect(childCalls).toBe(0)
-    expect((await runtime.turns.getTurn(thread.id, turn.turnId))?.error).toContain('adaptive trial state is unavailable')
+    expect((await runtime.turns.getTurn(thread.id, turn.turnId))?.status).toBe('running')
   })
 
   it('atomically refuses concurrent starts when one turn is adaptive', async () => {

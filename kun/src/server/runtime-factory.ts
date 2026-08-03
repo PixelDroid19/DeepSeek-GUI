@@ -68,6 +68,7 @@ import { KUN_SYSTEM_PROMPT } from '../prompt/kun-system-prompt.js'
 import { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
 import { ThreadService } from '../services/thread-service.js'
 import { TurnService } from '../services/turn-service.js'
+import { FileAdaptiveTrialLeaseStore } from '../services/adaptive-trial-lease.js'
 import { ReviewService } from '../services/review-service.js'
 import { UsageService } from '../services/usage-service.js'
 import type { UsageEvent } from '../contracts/events.js'
@@ -137,6 +138,12 @@ const MAX_ADAPTIVE_ARGUMENT_TEXT = 256
 const MAX_ADAPTIVE_OBSERVATION_KEY = 128
 const MAX_ADAPTIVE_OBSERVATION_COLLECTION = 4
 const MAX_ADAPTIVE_OBSERVATION_DEPTH = 2
+const MAX_ADAPTIVE_DIGEST_DEPTH = 64
+const MAX_ADAPTIVE_DIGEST_ITEMS = 2_048
+const MAX_ADAPTIVE_DIGEST_COLLECTION = 128
+const MAX_ADAPTIVE_DIGEST_BYTES = 128 * 1_024
+const MAX_ADAPTIVE_DIGEST_STRING_SAMPLE_BYTES = 4 * 1_024
+const ADAPTIVE_DIGEST_OVERFLOW_RESERVE_BYTES = 128
 
 export type AdaptiveTrialRuntimeState = {
   trial: AdaptiveTrialState
@@ -251,6 +258,7 @@ export async function createKunServeRuntime(
     ids,
     nowIso,
     usage: usageService,
+    adaptiveTrialLeases: new FileAdaptiveTrialLeaseStore({ dataDir: options.dataDir }),
     roles: rolesConfig
   })
   const threadService = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
@@ -525,12 +533,8 @@ export async function createKunServeRuntime(
           return 'failed'
         }
         if (claim.kind === 'reentry_state_unavailable') {
-          await turnService.finishTurn({
-            threadId,
-            turnId,
-            status: 'failed',
-            error: 'adaptive recovery state is unavailable for re-entry'
-          })
+          // Another runtime can own the durable `running` marker. Do not let
+          // this rejected invocation terminally mutate that owner's turn.
           return 'failed'
         }
         const adaptiveRuntime = claim.state
@@ -557,12 +561,9 @@ export async function createKunServeRuntime(
         try {
           const activation = await turnService.activateAdaptiveTrial({ threadId, turnId })
           if (activation !== 'activated') {
-            await turnService.finishTurn({
-              threadId,
-              turnId,
-              status: 'failed',
-              error: 'adaptive trial state is unavailable before model dispatch'
-            })
+            // A persistent lease is held by another runtime, or the marker is
+            // no longer fresh. Fail this invocation closed without changing
+            // the shared turn state before that owner can dispatch its model.
             return 'failed'
           }
           const decision = decideForCurrentTurn()
@@ -765,27 +766,30 @@ function adaptiveObservation(input: {
 }
 
 /**
- * Hashes the full file-change request and any returned diff/hash artifact
- * without retaining raw file content in adaptive observations. Unlike the
- * bounded action summary, this digest changes when edits differ after a long
- * shared prefix or have the same path and byte count.
+ * Hashes a bounded structural sample of the file-change request and returned
+ * diff/hash artifact without retaining raw file content in observations.
+ * Traversal is iterative so hostile nested tool arguments cannot overflow the
+ * runtime stack; depth, items, and hashed bytes each have a deterministic
+ * overflow marker.
  */
 function fileChangeDiffFingerprint(
   contentDigest: string,
   output: unknown
 ): string {
-  const hash = createHash('sha256')
-  appendDigestText(hash, 'content_digest', contentDigest)
+  const writer = new BoundedDigestWriter(createHash('sha256'))
+  writer.append('content_digest', contentDigest)
   const artifact = fileChangeArtifact(output)
-  if (artifact !== undefined) appendStableDigestValue(hash, 'artifact', artifact)
-  return `sha256:${hash.digest('hex')}`
+  if (artifact !== undefined) appendStableDigestValue(writer, 'artifact', artifact)
+  writer.finish()
+  return `sha256:${writer.digest('hex')}`
 }
 
 function fileChangeContentDigest(toolName: string, argumentsValue: Record<string, unknown>): string {
-  const hash = createHash('sha256')
-  appendStableDigestValue(hash, 'tool', toolName)
-  appendStableDigestValue(hash, 'arguments', argumentsValue)
-  return `sha256:${hash.digest('hex')}`
+  const writer = new BoundedDigestWriter(createHash('sha256'))
+  appendStableDigestValue(writer, 'tool', toolName)
+  appendStableDigestValue(writer, 'arguments', argumentsValue)
+  writer.finish()
+  return `sha256:${writer.digest('hex')}`
 }
 
 function boundedFileChangeArguments(
@@ -819,72 +823,185 @@ function fileChangeArtifact(output: unknown): Record<string, unknown> | undefine
   return Object.keys(artifact).length > 0 ? artifact : undefined
 }
 
+type DigestFrame =
+  | { kind: 'value'; label: string; value: unknown; depth: number }
+  | { kind: 'text'; tag: string; value: string; sampled?: boolean }
+
 function appendStableDigestValue(
-  hash: ReturnType<typeof createHash>,
+  writer: BoundedDigestWriter,
   label: string,
-  value: unknown,
-  seen = new WeakSet<object>()
+  value: unknown
 ): void {
-  appendDigestText(hash, 'label', label)
-  if (value === null) {
-    appendDigestText(hash, 'null', '')
-    return
-  }
-  if (value === undefined) {
-    appendDigestText(hash, 'undefined', '')
-    return
-  }
-  if (typeof value === 'string') {
-    appendDigestText(hash, 'string', value)
-    return
-  }
-  if (typeof value === 'boolean') {
-    appendDigestText(hash, 'boolean', value ? 'true' : 'false')
-    return
-  }
-  if (typeof value === 'number') {
-    appendDigestText(hash, 'number', Number.isFinite(value) ? String(value) : '<non-finite>')
-    return
-  }
-  if (typeof value === 'bigint') {
-    appendDigestText(hash, 'bigint', value.toString())
-    return
-  }
-  if (typeof value !== 'object') {
-    appendDigestText(hash, 'other', typeof value)
-    return
-  }
-  if (seen.has(value)) {
-    appendDigestText(hash, 'cycle', '')
-    return
-  }
-  seen.add(value)
-  if (Array.isArray(value)) {
-    appendDigestText(hash, 'array', String(value.length))
-    for (let index = 0; index < value.length; index += 1) {
-      appendDigestText(hash, 'index', String(index))
-      if (index in value) appendStableDigestValue(hash, 'value', value[index], seen)
-      else appendDigestText(hash, 'hole', '')
+  const seen = new WeakSet<object>()
+  const frames: DigestFrame[] = [{ kind: 'value', label, value, depth: 0 }]
+  let items = 0
+  while (frames.length > 0 && !writer.exhausted) {
+    const frame = frames.pop()
+    if (!frame) continue
+    if (frame.kind === 'text') {
+      if (frame.sampled) appendSampledDigestText(writer, frame.tag, frame.value)
+      else writer.append(frame.tag, frame.value)
+      continue
     }
-    return
-  }
-  const record = value as Record<string, unknown>
-  const keys = Object.keys(record).sort()
-  appendDigestText(hash, 'object', String(keys.length))
-  for (const key of keys) {
-    appendDigestText(hash, 'key', key)
-    appendStableDigestValue(hash, 'value', record[key], seen)
+    if (items >= MAX_ADAPTIVE_DIGEST_ITEMS) {
+      writer.append('traversal_overflow', `item_limit:${MAX_ADAPTIVE_DIGEST_ITEMS}`)
+      break
+    }
+    items += 1
+    writer.append('label', frame.label)
+    if (frame.value === null) {
+      writer.append('null', '')
+      continue
+    }
+    if (frame.value === undefined) {
+      writer.append('undefined', '')
+      continue
+    }
+    if (typeof frame.value === 'string') {
+      appendSampledDigestText(writer, 'string', frame.value)
+      continue
+    }
+    if (typeof frame.value === 'boolean') {
+      writer.append('boolean', frame.value ? 'true' : 'false')
+      continue
+    }
+    if (typeof frame.value === 'number') {
+      writer.append('number', Number.isFinite(frame.value) ? String(frame.value) : '<non-finite>')
+      continue
+    }
+    if (typeof frame.value === 'bigint') {
+      writer.append('bigint', frame.value.toString())
+      continue
+    }
+    if (typeof frame.value !== 'object') {
+      writer.append('other', typeof frame.value)
+      continue
+    }
+    if (frame.depth >= MAX_ADAPTIVE_DIGEST_DEPTH) {
+      writer.append('depth_overflow', `depth_limit:${MAX_ADAPTIVE_DIGEST_DEPTH}`)
+      continue
+    }
+    if (seen.has(frame.value)) {
+      writer.append('cycle', '')
+      continue
+    }
+    seen.add(frame.value)
+    if (Array.isArray(frame.value)) {
+      const count = Math.min(frame.value.length, MAX_ADAPTIVE_DIGEST_COLLECTION)
+      writer.append('array', String(frame.value.length))
+      if (frame.value.length > count) {
+        writer.append('collection_overflow', `array_items:${frame.value.length - count}`)
+      }
+      for (let index = count - 1; index >= 0; index -= 1) {
+        if (index in frame.value) {
+          frames.push({ kind: 'value', label: 'value', value: frame.value[index], depth: frame.depth + 1 })
+        } else {
+          frames.push({ kind: 'text', tag: 'hole', value: '' })
+        }
+        frames.push({ kind: 'text', tag: 'index', value: String(index) })
+      }
+      continue
+    }
+    const keys = boundedDigestKeys(frame.value as Record<string, unknown>)
+    writer.append('object', String(keys.values.length))
+    if (keys.truncated) {
+      writer.append('collection_overflow', `object_items:${MAX_ADAPTIVE_DIGEST_COLLECTION}`)
+    }
+    for (let index = keys.values.length - 1; index >= 0; index -= 1) {
+      const key = keys.values[index]!
+      frames.push({ kind: 'value', label: 'value', value: (frame.value as Record<string, unknown>)[key], depth: frame.depth + 1 })
+      frames.push({ kind: 'text', tag: 'key', value: key, sampled: true })
+    }
   }
 }
 
-function appendDigestText(
-  hash: ReturnType<typeof createHash>,
-  kind: string,
-  value: string
-): void {
-  hash.update(`${kind}:${Buffer.byteLength(value, 'utf8')}:`)
-  hash.update(value)
-  hash.update('\n')
+function boundedDigestKeys(value: Record<string, unknown>): { values: string[]; truncated: boolean } {
+  const values: string[] = []
+  let truncated = false
+  for (const key in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue
+    if (values.length >= MAX_ADAPTIVE_DIGEST_COLLECTION) {
+      truncated = true
+      break
+    }
+    values.push(key)
+  }
+  values.sort()
+  return { values, truncated }
+}
+
+function appendSampledDigestText(writer: BoundedDigestWriter, tag: string, value: string): void {
+  const head = boundedUtf8Prefix(value, MAX_ADAPTIVE_DIGEST_STRING_SAMPLE_BYTES)
+  if (!head.truncated) {
+    writer.append(tag, head.value)
+    return
+  }
+  const tail = boundedUtf8Suffix(value, MAX_ADAPTIVE_DIGEST_STRING_SAMPLE_BYTES)
+  writer.append(`${tag}_head`, head.value)
+  writer.append(`${tag}_tail`, tail.value)
+  writer.append(`${tag}_overflow`, `utf16_length:${value.length}`)
+}
+
+function boundedUtf8Prefix(value: string, maxBytes: number): { value: string; truncated: boolean } {
+  const length = boundedUtf8Length(value, maxBytes, (count) => value.slice(0, count))
+  return { value: value.slice(0, length), truncated: length < value.length }
+}
+
+function boundedUtf8Suffix(value: string, maxBytes: number): { value: string; truncated: boolean } {
+  const length = boundedUtf8Length(value, maxBytes, (count) => value.slice(value.length - count))
+  return { value: value.slice(value.length - length), truncated: length < value.length }
+}
+
+function boundedUtf8Length(
+  value: string,
+  maxBytes: number,
+  sample: (length: number) => string
+): number {
+  let low = 0
+  let high = Math.min(value.length, maxBytes)
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (Buffer.byteLength(sample(middle), 'utf8') <= maxBytes) low = middle
+    else high = middle - 1
+  }
+  return low
+}
+
+class BoundedDigestWriter {
+  private bytesWritten = 0
+  private byteLimitReached = false
+
+  constructor(private readonly hash: ReturnType<typeof createHash>) {}
+
+  get exhausted(): boolean {
+    return this.byteLimitReached
+  }
+
+  append(kind: string, value: string): void {
+    if (this.byteLimitReached) return
+    const prefix = `${kind}\u0000`
+    const suffix = '\u0000'
+    const overhead = Buffer.byteLength(prefix, 'utf8') + Buffer.byteLength(suffix, 'utf8')
+    const available = MAX_ADAPTIVE_DIGEST_BYTES - ADAPTIVE_DIGEST_OVERFLOW_RESERVE_BYTES - this.bytesWritten - overhead
+    if (available <= 0) {
+      this.byteLimitReached = true
+      return
+    }
+    const bounded = boundedUtf8Prefix(value, available)
+    const serialized = `${prefix}${bounded.value}${suffix}`
+    this.hash.update(serialized)
+    this.bytesWritten += Buffer.byteLength(serialized, 'utf8')
+    if (bounded.truncated) this.byteLimitReached = true
+  }
+
+  finish(): void {
+    if (!this.byteLimitReached) return
+    this.hash.update('overflow\u0000byte_limit\u0000')
+  }
+
+  digest(encoding: 'hex'): string {
+    return this.hash.digest(encoding)
+  }
 }
 
 function adaptiveRecoveryBudget(

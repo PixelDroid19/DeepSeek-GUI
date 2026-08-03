@@ -161,12 +161,8 @@ export class RigorousPipeline {
       if (turn.harnessTask?.executionPolicy === 'adaptive') {
         const marker = turn.adaptiveTrialMarker
         if (!marker) {
-          await this.deps.turns.finishTurn({
-            threadId,
-            turnId,
-            status: 'failed',
-            error: 'adaptive trial marker is unavailable before rigorous dispatch'
-          })
+          // Do not mutate a persisted turn when its ownership cannot be
+          // established. Another runtime may be recovering it.
           return 'failed'
         }
         if (adaptiveTrial) {
@@ -182,22 +178,14 @@ export class RigorousPipeline {
           adaptiveBudget = { task: turn.harnessTask, trial: adaptiveTrial, startedRoles: 0 }
         } else {
           if (marker.phase !== 'ready') {
-            await this.deps.turns.finishTurn({
-              threadId,
-              turnId,
-              status: 'failed',
-              error: 'adaptive trial state is unavailable for rigorous re-entry'
-            })
+            // A persistent runtime can own this `running` marker. Reject the
+            // duplicate invocation without terminally changing its turn.
             return 'failed'
           }
           const activation = await this.deps.turns.activateAdaptiveTrial({ threadId, turnId })
           if (activation !== 'activated') {
-            await this.deps.turns.finishTurn({
-              threadId,
-              turnId,
-              status: 'failed',
-              error: 'adaptive trial state is unavailable before rigorous dispatch'
-            })
+            // The data-directory lease is held elsewhere, or state has
+            // become ineligible. No role request may be dispatched.
             return 'failed'
           }
           adaptiveBudget = {

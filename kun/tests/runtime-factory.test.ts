@@ -1,4 +1,9 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { FileSessionStore, FileThreadStore } from '../src/adapters/file/index.js'
+import { InMemoryEventBus } from '../src/adapters/in-memory-event-bus.js'
 import { InMemorySessionStore } from '../src/adapters/in-memory-session-store.js'
 import { InMemoryThreadStore } from '../src/adapters/in-memory-thread-store.js'
 import { createThreadRecord } from '../src/domain/thread.js'
@@ -10,6 +15,13 @@ import {
   makeToolResultItem
 } from '../src/domain/item.js'
 import { UsageService } from '../src/services/usage-service.js'
+import { FileAdaptiveTrialLeaseStore } from '../src/services/adaptive-trial-lease.js'
+import { RuntimeEventRecorder } from '../src/services/runtime-event-recorder.js'
+import { TurnService } from '../src/services/turn-service.js'
+import { ContextCompactor } from '../src/loop/context-compactor.js'
+import { InflightTracker } from '../src/loop/inflight-tracker.js'
+import { SteeringQueue } from '../src/loop/steering-queue.js'
+import { SequentialIdGenerator } from '../src/ports/id-generator.js'
 import {
   AdaptiveTrialCoordinator,
   adaptiveObservationsForTurn,
@@ -102,6 +114,34 @@ function adaptiveTurn(
     }),
     items
   }
+}
+
+function sharedFileTurnRuntime(dataDir: string, owner: string): {
+  threadStore: FileThreadStore
+  turns: TurnService
+} {
+  const threadStore = new FileThreadStore({ dataDir })
+  const sessionStore = new FileSessionStore({ dataDir })
+  const eventBus = new InMemoryEventBus()
+  const nowIso = () => new Date().toISOString()
+  const turns = new TurnService({
+    threadStore,
+    sessionStore,
+    events: new RuntimeEventRecorder({
+      eventBus,
+      sessionStore,
+      allocateSeq: (threadId) => eventBus.allocateSeq(threadId),
+      nowIso
+    }),
+    inflight: new InflightTracker(),
+    steering: new SteeringQueue(),
+    compactor: new ContextCompactor({}),
+    ids: new SequentialIdGenerator(),
+    nowIso,
+    usage: new UsageService(),
+    adaptiveTrialLeases: new FileAdaptiveTrialLeaseStore({ dataDir, owner })
+  })
+  return { threadStore, turns }
 }
 
 describe('runtime factory usage carryover', () => {
@@ -333,6 +373,44 @@ describe('runtime factory usage carryover', () => {
     })
   })
 
+  it('serializes adaptive activation across persistent runtimes sharing one data directory', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-adaptive-lease-'))
+    try {
+      const first = sharedFileTurnRuntime(dataDir, 'runtime-first')
+      const second = sharedFileTurnRuntime(dataDir, 'runtime-second')
+      const threadId = 'thr_shared_adaptive'
+      await first.threadStore.upsert(createThreadRecord({
+        id: threadId,
+        title: 'Shared adaptive runtime',
+        workspace: '/tmp',
+        model: 'test-model'
+      }))
+      const started = await first.turns.startTurn({
+        threadId,
+        request: { prompt: 'one persistent adaptive trial', harnessTask: ADAPTIVE_TASK }
+      })
+
+      const outcomes = await Promise.all([
+        first.turns.activateAdaptiveTrial({ threadId, turnId: started.turnId }),
+        second.turns.activateAdaptiveTrial({ threadId, turnId: started.turnId })
+      ])
+
+      expect([...outcomes].sort()).toEqual(['activated', 'lease_unavailable'])
+      expect((await second.turns.getTurn(threadId, started.turnId))?.adaptiveTrialMarker?.phase).toBe('running')
+
+      const owner = outcomes[0] === 'activated' ? first : second
+      await owner.turns.finishTurn({ threadId, turnId: started.turnId, status: 'completed' })
+      const postFinishLeaseStore = new FileAdaptiveTrialLeaseStore({ dataDir, owner: 'post-finish-check' })
+      const released = await postFinishLeaseStore.acquire({ threadId, turnId: started.turnId })
+      expect(released).not.toBeNull()
+      if (released) {
+        await postFinishLeaseStore.release(released)
+      }
+    } finally {
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
   it('uses a full file-change digest so same-path same-byte edits are progress', () => {
     const sharedPrefix = 'x'.repeat(1_024)
     const items = [
@@ -366,5 +444,49 @@ describe('runtime factory usage carryover', () => {
       noProgressWindow: 2,
       readRediscoveryThreshold: 3
     })).toBeNull()
+  })
+
+  it('bounds deeply nested and oversized file-change fingerprints without retaining raw content', () => {
+    let nested: Record<string, unknown> = { leaf: 'secret' }
+    for (let index = 0; index < 20_000; index += 1) nested = { next: nested }
+    const oversizedPrefix = 'x'.repeat(1_000_000)
+    const items = [
+      makeToolCallItem({
+        id: 'item_nested_write', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'nested_write',
+        toolName: 'write', toolKind: 'file_change', arguments: { path: 'src/nested.ts', content: nested }
+      }),
+      makeToolResultItem({
+        id: 'item_nested_result', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'nested_write',
+        toolName: 'write', toolKind: 'file_change', output: { bytes_written: 1 }
+      }),
+      makeToolCallItem({
+        id: 'item_large_write', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'large_write',
+        toolName: 'write', toolKind: 'file_change', arguments: { path: 'src/large.ts', content: `${oversizedPrefix}A` }
+      }),
+      makeToolResultItem({
+        id: 'item_large_result', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'large_write',
+        toolName: 'write', toolKind: 'file_change', output: { bytes_written: oversizedPrefix.length + 1 }
+      }),
+      makeToolCallItem({
+        id: 'item_large_write_changed', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'large_write_changed',
+        toolName: 'write', toolKind: 'file_change', arguments: { path: 'src/large.ts', content: `${oversizedPrefix}B` }
+      }),
+      makeToolResultItem({
+        id: 'item_large_result_changed', threadId: 'thr_adaptive', turnId: 'turn_bounded_digest', callId: 'large_write_changed',
+        toolName: 'write', toolKind: 'file_change', output: { bytes_written: oversizedPrefix.length + 1 }
+      })
+    ]
+
+    const observations = adaptiveObservationsForTurn(items, 'turn_bounded_digest', 3)
+
+    expect(observations).toHaveLength(3)
+    expect(observations.map((observation) => observation.diffFingerprint)).toEqual([
+      expect.stringMatching(/^sha256:/),
+      expect.stringMatching(/^sha256:/),
+      expect.stringMatching(/^sha256:/)
+    ])
+    expect(observations[1]?.diffFingerprint).not.toBe(observations[2]?.diffFingerprint)
+    expect(JSON.stringify(observations)).not.toContain(oversizedPrefix)
+    expect(JSON.stringify(observations)).not.toContain('secret')
   })
 })

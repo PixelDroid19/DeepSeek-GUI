@@ -26,6 +26,11 @@ import { PlannerArtifactSchema } from '../contracts/roles.js'
 import type { HarnessTaskSpec } from '../contracts/harness.js'
 import { HarnessTaskSpecSchema } from '../contracts/harness.js'
 import type { UsageService } from './usage-service.js'
+import {
+  InMemoryAdaptiveTrialLeaseStore,
+  type AdaptiveTrialLease,
+  type AdaptiveTrialLeaseStore
+} from './adaptive-trial-lease.js'
 
 export type TurnServiceDeps = {
   threadStore: ThreadStore
@@ -37,6 +42,11 @@ export type TurnServiceDeps = {
   ids: IdGenerator
   nowIso: () => string
   usage: Pick<UsageService, 'forThread'>
+  /**
+   * Serve mode supplies a data-directory lease store so an adaptive request
+   * cannot be dispatched by two runtimes that share persisted state.
+   */
+  adaptiveTrialLeases?: AdaptiveTrialLeaseStore
   roles?: RolesConfig
 }
 
@@ -50,9 +60,12 @@ export class TurnService {
   private readonly deps: TurnServiceDeps
   private readonly inflightTurns = new Map<string, AbortController>()
   private readonly threadMutationQueues = new Map<string, Promise<void>>()
+  private readonly adaptiveTrialLeases: AdaptiveTrialLeaseStore
+  private readonly activeAdaptiveTrialLeases = new Map<string, AdaptiveTrialLease>()
 
   constructor(deps: TurnServiceDeps) {
     this.deps = deps
+    this.adaptiveTrialLeases = deps.adaptiveTrialLeases ?? new InMemoryAdaptiveTrialLeaseStore()
   }
 
   async startTurn(input: {
@@ -146,32 +159,45 @@ export class TurnService {
   async activateAdaptiveTrial(input: {
     threadId: string
     turnId: string
-  }): Promise<'activated' | 'already_running' | 'unavailable'> {
-    let outcome: 'activated' | 'already_running' | 'unavailable' = 'unavailable'
-    await this.upsertThread(input.threadId, (current) => {
-      const turn = current.turns.find((candidate) => candidate.id === input.turnId)
-      if (
-        !turn ||
-        turn.status !== 'running' ||
-        turn.harnessTask?.executionPolicy !== 'adaptive' ||
-        !turn.adaptiveTrialMarker
-      ) {
-        return current
+  }): Promise<'activated' | 'already_running' | 'lease_unavailable' | 'unavailable'> {
+    if (this.activeAdaptiveTrialLeases.has(input.turnId)) return 'already_running'
+    const lease = await this.adaptiveTrialLeases.acquire(input)
+    if (!lease) return 'lease_unavailable'
+    const activation = { outcome: 'unavailable' as 'activated' | 'already_running' | 'unavailable' }
+    try {
+      await this.upsertThread(input.threadId, (current) => {
+        const turn = current.turns.find((candidate) => candidate.id === input.turnId)
+        if (
+          !turn ||
+          turn.status !== 'running' ||
+          turn.harnessTask?.executionPolicy !== 'adaptive' ||
+          !turn.adaptiveTrialMarker
+        ) {
+          return current
+        }
+        if (turn.adaptiveTrialMarker.phase === 'running') {
+          activation.outcome = 'already_running'
+          return current
+        }
+        activation.outcome = 'activated'
+        const marker = { ...turn.adaptiveTrialMarker, phase: 'running' as const }
+        return {
+          ...current,
+          turns: current.turns.map((candidate) =>
+            candidate.id === input.turnId ? { ...candidate, adaptiveTrialMarker: marker } : candidate
+          )
+        }
+      })
+      if (activation.outcome === 'activated') {
+        this.activeAdaptiveTrialLeases.set(input.turnId, lease)
+        return activation.outcome
       }
-      if (turn.adaptiveTrialMarker.phase === 'running') {
-        outcome = 'already_running'
-        return current
-      }
-      outcome = 'activated'
-      const marker = { ...turn.adaptiveTrialMarker, phase: 'running' as const }
-      return {
-        ...current,
-        turns: current.turns.map((candidate) =>
-          candidate.id === input.turnId ? { ...candidate, adaptiveTrialMarker: marker } : candidate
-        )
-      }
-    })
-    return outcome
+      await this.adaptiveTrialLeases.release(lease)
+      return activation.outcome
+    } catch (error) {
+      await this.adaptiveTrialLeases.release(lease).catch(() => undefined)
+      throw error
+    }
   }
 
   async steerTurn(input: { threadId: string; turnId: string; text: string }): Promise<void> {
@@ -211,6 +237,7 @@ export class TurnService {
       )
       return { ...touchThread(current, this.deps.nowIso()), turns: next, status: 'idle' }
     })
+    await this.releaseAdaptiveTrialLease(input.turnId)
     return { status: 'aborted' }
   }
 
@@ -295,6 +322,7 @@ export class TurnService {
       })
       return { ...touchThread(current, this.deps.nowIso()), turns: next, status: 'idle' }
     })
+    await this.releaseAdaptiveTrialLease(input.turnId)
     await this.deps.events.record({
       kind: input.status === 'completed' ? 'turn_completed' : input.status === 'aborted' ? 'turn_aborted' : 'turn_failed',
       threadId: input.threadId,
@@ -425,6 +453,13 @@ export class TurnService {
         this.threadMutationQueues.delete(threadId)
       }
     }
+  }
+
+  private async releaseAdaptiveTrialLease(turnId: string): Promise<void> {
+    const lease = this.activeAdaptiveTrialLeases.get(turnId)
+    if (!lease) return
+    this.activeAdaptiveTrialLeases.delete(turnId)
+    await this.adaptiveTrialLeases.release(lease).catch(() => undefined)
   }
 
   /**
