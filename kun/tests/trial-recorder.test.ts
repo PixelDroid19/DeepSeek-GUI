@@ -8,7 +8,11 @@ import {
 } from '../src/harness/benchmark-manifest.js'
 import {
   TrialRecorder,
-  trialResultToJsonl
+  replayTrialResult,
+  trialResultFromJsonl,
+  type TrialCausalTraceRecord,
+  trialResultToJsonl,
+  validateTrialCausalTrace
 } from '../src/harness/trial-recorder.js'
 
 const manifest: HarnessTrialManifest = {
@@ -208,10 +212,18 @@ describe('benchmark manifests and trial traces', () => {
     expect(first.records).toEqual(second.records)
     expect(first.stableDigest).toBe(second.stableDigest)
     expect(first.volatile).not.toEqual(second.volatile)
-    expect(first.officialOutcome).toBe('pass')
+    expect(first.internalOutcome).toBe('pass')
+    const causal = first.records.filter((record) => record.kind === 'causal') as TrialCausalTraceRecord[]
+    const toolCall = causal.find((record) => record.eventKind === 'item:tool_call')
+    const toolResult = causal.find((record) => record.eventKind === 'item:tool_result')
+    expect(toolCall).toBeDefined()
+    expect(toolResult?.parentId).toBe(toolCall?.causeId)
+    expect(validateTrialCausalTrace(first)).toEqual({ valid: true, reasons: [] })
     expect(trialResultToJsonl(first)).not.toContain('sk-first-secret')
     expect(trialResultToJsonl(first)).not.toContain('private chain of thought')
     expect(trialResultToJsonl(first)).not.toContain('hidden verifier output')
+    const replayed = replayTrialResult(trialResultFromJsonl(trialResultToJsonl(first)))
+    expect(replayed).toEqual({ valid: true, internalOutcome: 'pass', reasons: [] })
   })
 
   it('keeps failed and inconclusive outcomes visible without treating completed as an official pass', () => {
@@ -233,10 +245,32 @@ describe('benchmark manifests and trial traces', () => {
       events: []
     })
 
-    expect(failed.officialOutcome).toBe('fail')
+    expect(failed.internalOutcome).toBe('fail')
     expect(failed.falseCompletion).toBe(true)
-    expect(inconclusive.officialOutcome).toBe('inconclusive')
+    expect(inconclusive.internalOutcome).toBe('inconclusive')
     expect(inconclusive.records.at(-1)).toMatchObject({ kind: 'outcome', gateVerdict: 'inconclusive' })
+  })
+
+  it('rejects forged causal parents and a changed stable digest', () => {
+    const recorder = new TrialRecorder(parseBenchmarkManifest(manifest))
+    const result = recorder.record({
+      runtimeStatus: 'completed',
+      gate: { verdict: 'ship' },
+      usage,
+      wallTimeMs: 10,
+      items: trialItems({ callId: 'call_integrity', createdAt: '2026-08-03T10:00:00.000Z', secret: 'sk-integrity' }),
+      events: trialEvents('2026-08-03T10:00:00.000Z')
+    })
+    const root = result.records.find((record) => record.kind === 'causal' && record.causeId === 'trial:root') as
+      TrialCausalTraceRecord | undefined
+    if (!root) throw new Error('missing causal root')
+    const tampered = structuredClone(result)
+    const tamperedRoot = tampered.records.find((record) => record.kind === 'causal' && record.causeId === 'trial:root') as
+      TrialCausalTraceRecord | undefined
+    if (!tamperedRoot) throw new Error('missing cloned causal root')
+    tamperedRoot.parentId = root.causeId
+    expect(validateTrialCausalTrace(tampered).valid).toBe(false)
+    expect(replayTrialResult(tampered).valid).toBe(false)
   })
 
   it('normalizes evidence references without persisting secret-shaped identifiers or summaries', () => {

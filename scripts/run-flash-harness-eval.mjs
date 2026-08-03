@@ -3,7 +3,9 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   mkdir,
+  lstat,
   readFile,
+  realpath,
   rm,
   stat,
   writeFile
@@ -18,12 +20,14 @@ const DEFAULT_MODEL = 'deepseek-v4-flash'
 const DEFAULT_ENDPOINT_FORMAT = 'chat_completions'
 const DEFAULT_CEILING_USD = 5
 const DEFAULT_SUBSET = 'small'
+const DEFAULT_REPLICATES = 1
+const DEFAULT_ORDER_SEED = 17
 const MAX_OUTPUT_BYTES = 64_000
 const PREFLIGHT_TIMEOUT_MS = 15 * 60_000
 const CLI_GRACE_MS = 30_000
 const REPORT_VERSION = 1
-const HOST_VERIFIER_ISOLATION = 'separate-process'
 const MINIMAL_VERIFIER_ENV_KEYS = ['PATH', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'TZ']
+const HARNESS_SECRET_FD = 3
 
 const FIXTURES = {
   smoke: [
@@ -114,17 +118,39 @@ async function main() {
     return
   }
 
+  let promotionManifest
+  if (config.changeManifestPath) {
+    try {
+      promotionManifest = await loadPromotionManifest(config.changeManifestPath, harness)
+    } catch (error) {
+      report.outcome = 'inconclusive'
+      report.infrastructureExclusions.push(safeErrorMessage(error))
+      await writeReports(config.outputDir, report)
+      announceReport(config.outputDir, report.outcome)
+      process.exitCode = 1
+      return
+    }
+  }
+
   report.harnessCommit = prepared[0]?.loaded.manifest.harnessCommit ?? 'unrecorded'
-  for (const preparedTrial of orderTrials(prepared)) {
+  for (const preparedTrial of orderTrials(prepared, config.orderSeed)) {
     try {
       if (preparedTrial.resetWorkspace) await preparedTrial.resetWorkspace()
-      report.trials.push(await runTrial(preparedTrial, harness, config, apiKey))
+      const trial = await runTrial(preparedTrial, harness, config, apiKey)
+      trial.orderIndex = report.trials.length
+      report.trials.push(trial)
     } catch {
-      report.trials.push(infrastructureTrialRecord(preparedTrial))
+      const trial = infrastructureTrialRecord(preparedTrial)
+      trial.orderIndex = report.trials.length
+      report.trials.push(trial)
     }
   }
   report.comparison = summarizeComparison(report.trials)
   report.outcome = overallOutcome(report.trials, report.comparison)
+  if (promotionManifest) {
+    report.promotion = assessPromotionAgainstReport(promotionManifest, report, harness)
+    if (!report.promotion.promotable) report.outcome = 'inconclusive'
+  }
   if (report.comparison.unpairedTaskIds.length > 0) {
     report.infrastructureExclusions.push('unpaired baseline/harness manifests are inconclusive and are not used for a regression claim')
   }
@@ -139,8 +165,11 @@ function parseArgs(argv) {
     manifestPaths: [],
     subset: DEFAULT_SUBSET,
     maxCostUsd: DEFAULT_CEILING_USD,
+    replicates: DEFAULT_REPLICATES,
+    orderSeed: DEFAULT_ORDER_SEED,
     outputDir: resolve(ROOT, '.harness-evaluation'),
     dataDir: undefined,
+    changeManifestPath: undefined,
     help: false,
     subsetProvided: false
   }
@@ -170,11 +199,20 @@ function parseArgs(argv) {
       case '--max-cost-usd':
         config.maxCostUsd = parsePositiveUsd(value)
         break
+      case '--replicates':
+        config.replicates = parseReplicates(value)
+        break
+      case '--order-seed':
+        config.orderSeed = parseOrderSeed(value)
+        break
       case '--output-dir':
         config.outputDir = resolve(ROOT, value)
         break
       case '--data-dir':
         config.dataDir = resolve(ROOT, value)
+        break
+      case '--change-manifest':
+        config.changeManifestPath = resolve(ROOT, value)
         break
       default:
         throw new Error(`unknown option: ${flag}`)
@@ -185,6 +223,22 @@ function parseArgs(argv) {
   }
   if (config.manifestPaths.length > 16) throw new Error('at most 16 manifest paths may be evaluated per run')
   return config
+}
+
+function parseReplicates(value) {
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 32) {
+    throw new Error('--replicates must be an integer from 1 through 32')
+  }
+  return parsed
+}
+
+function parseOrderSeed(value) {
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 4_294_967_295) {
+    throw new Error('--order-seed must be an unsigned integer')
+  }
+  return parsed >>> 0
 }
 
 function splitFlag(token) {
@@ -208,8 +262,11 @@ function usage() {
     `  --manifest <path>       Strict harness manifest; repeatable\n` +
     `  --subset <smoke|small>  Deterministic local fixture set when no manifest is supplied\n` +
     `  --max-cost-usd <amount> Aggregate declared ceiling (default: ${DEFAULT_CEILING_USD})\n` +
+    `  --replicates <count>    Repeated paired attempts for generated fixtures (default: ${DEFAULT_REPLICATES})\n` +
+    `  --order-seed <integer>  Deterministic interleaving seed (default: ${DEFAULT_ORDER_SEED})\n` +
     `  --output-dir <path>     Report and generated-fixture directory\n` +
-    `  --data-dir <path>       Root for per-trial Kun data directories\n`
+    `  --data-dir <path>       Root for per-trial Kun data directories\n` +
+    `  --change-manifest <path> Offline ChangeManifest promotion gate\n`
 }
 
 function createReport(config) {
@@ -221,6 +278,7 @@ function createReport(config) {
     endpointFormat: DEFAULT_ENDPOINT_FORMAT,
     requestedSubset: config.manifestPaths.length ? 'provided-manifests' : config.subset,
     maxCostUsd: config.maxCostUsd,
+    orderSeed: config.orderSeed,
     harnessCommit: 'unrecorded',
     preflight: [],
     trials: [],
@@ -229,8 +287,22 @@ function createReport(config) {
       regressions: [],
       recoveredFailures: [],
       inconclusiveTaskIds: [],
-      unpairedTaskIds: []
+      unpairedTaskIds: [],
+      pairedOutcome: {
+        comparablePairs: 0,
+        inconclusivePairs: 0,
+        independentTasks: 0,
+        independentFamilies: 0,
+        bothPass: 0,
+        bothFail: 0,
+        baselineOnlyPass: 0,
+        harnessOnlyPass: 0,
+        passDelta: 0,
+        confidence95: { lower: 0, upper: 0 }
+      },
+      p95TokenDelta: 0
     },
+    promotion: null,
     infrastructureExclusions: [],
     outcome: 'inconclusive'
   }
@@ -258,21 +330,107 @@ async function runPreflight(apiKey) {
 
 async function loadHarnessInterfaces() {
   const harnessDir = resolve(ROOT, 'kun', 'dist', 'harness')
-  const [{ parseBenchmarkManifest }, { TrialResultSchema }, { adaptTerminalBenchTask }, { DEFAULT_BENCHMARK_TRIAL_BUDGETS }] = await Promise.all([
+  const [{ parseBenchmarkManifest, workspaceSnapshotAttestation }, { TrialResultSchema, replayTrialResult }, { adaptTerminalBenchTask }, { DEFAULT_BENCHMARK_TRIAL_BUDGETS }, changeManifest] = await Promise.all([
     import(pathToFileURL(join(harnessDir, 'benchmark-manifest.js')).href),
     import(pathToFileURL(join(harnessDir, 'trial-recorder.js')).href),
     import(pathToFileURL(join(harnessDir, 'adapters', 'terminal-bench-adapter.js')).href),
-    import(pathToFileURL(join(harnessDir, 'adapters', 'benchmark-adapter.js')).href)
+    import(pathToFileURL(join(harnessDir, 'adapters', 'benchmark-adapter.js')).href),
+    import(pathToFileURL(join(harnessDir, 'change-manifest.js')).href)
   ])
   if (
     typeof parseBenchmarkManifest !== 'function' ||
+    typeof workspaceSnapshotAttestation !== 'function' ||
     !TrialResultSchema ||
+    typeof replayTrialResult !== 'function' ||
     typeof adaptTerminalBenchTask !== 'function' ||
-    !DEFAULT_BENCHMARK_TRIAL_BUDGETS
+    !DEFAULT_BENCHMARK_TRIAL_BUDGETS ||
+    typeof changeManifest.parseChangeManifest !== 'function' ||
+    typeof changeManifest.assessChangePromotion !== 'function' ||
+    typeof changeManifest.changeManifestDigest !== 'function'
   ) {
     throw new Error('compiled harness exports are incomplete')
   }
-  return { parseBenchmarkManifest, TrialResultSchema, adaptTerminalBenchTask, DEFAULT_BENCHMARK_TRIAL_BUDGETS }
+  return {
+    parseBenchmarkManifest,
+    workspaceSnapshotAttestation,
+    TrialResultSchema,
+    replayTrialResult,
+    adaptTerminalBenchTask,
+    DEFAULT_BENCHMARK_TRIAL_BUDGETS,
+    ...changeManifest
+  }
+}
+
+async function loadPromotionManifest(path, harness) {
+  let source
+  try {
+    source = await readFile(path, 'utf8')
+  } catch {
+    throw new Error('could not read the requested ChangeManifest')
+  }
+  let parsed
+  try {
+    parsed = harness.parseChangeManifest(JSON.parse(source))
+  } catch {
+    throw new Error('requested ChangeManifest failed strict validation')
+  }
+  return {
+    manifestPath: path,
+    digest: harness.changeManifestDigest(parsed),
+    manifest: parsed
+  }
+}
+
+function assessPromotionAgainstReport(input, report, harness) {
+  const manifest = input.manifest
+  const decision = harness.assessChangePromotion(manifest)
+  const reasons = decision.promotable ? [] : [...decision.reasons]
+  const taskIds = new Set(report.trials.map((trial) => trial.taskId))
+  const attemptIds = new Set(report.trials.map((trial) => trial.attemptId ?? 'default'))
+  const paired = report.comparison.pairedOutcome
+  const passDeltaPp = paired.comparablePairs ? paired.passDelta * 100 : 0
+  const falseCompletionRates = ['baseline', 'harness'].map((condition) => {
+    const trials = report.trials.filter((trial) => trial.condition === condition)
+    const falseCompletions = trials.filter((trial) =>
+      trial.kunOutcome?.runtimeStatus === 'completed' && trial.outcome !== 'pass'
+    ).length
+    return trials.length ? falseCompletions / trials.length : 0
+  })
+  const falseCompletionDelta = falseCompletionRates[1] - falseCompletionRates[0]
+  const externalAttestations = report.trials
+    .map((trial) => trial.externalVerifier?.attestationDigest)
+    .filter((digest) => typeof digest === 'string')
+  const trialDigests = new Set(externalAttestations)
+  if (report.outcome !== 'pass') reasons.push('the complete report is not a passing external evaluation')
+  if (report.comparison.unpairedTaskIds.length || report.comparison.inconclusiveTaskIds.length) {
+    reasons.push('unpaired or inconclusive pairs cannot be excluded from promotion')
+  }
+  if (manifest.corpus.taskCount !== taskIds.size) reasons.push('ChangeManifest taskCount does not match the executed report')
+  if (manifest.corpus.replicateCount !== attemptIds.size) reasons.push('ChangeManifest replicateCount does not match the executed report')
+  if (manifest.corpus.comparablePairs !== paired.comparablePairs) reasons.push('ChangeManifest comparablePairs does not match the executed report')
+  if (manifest.corpus.independentTaskCount !== paired.independentTasks) reasons.push('ChangeManifest independentTaskCount does not match the executed report')
+  if (manifest.corpus.familyCount !== paired.independentFamilies) reasons.push('ChangeManifest familyCount does not match the executed report')
+  if (paired.comparablePairs !== taskIds.size * attemptIds.size) reasons.push('the final report does not cover every task/replicate pair')
+  if (Math.abs(manifest.outcome.passDeltaPp - passDeltaPp) > 1e-9) reasons.push('ChangeManifest pass delta does not match the executed report')
+  if (Math.abs(manifest.outcome.confidenceLowerPp - paired.confidence95.lower * 100) > 1e-9 ||
+      Math.abs(manifest.outcome.confidenceUpperPp - paired.confidence95.upper * 100) > 1e-9) {
+    reasons.push('ChangeManifest confidence interval does not match the executed report')
+  }
+  if (Math.abs(manifest.outcome.falseCompletionDelta - falseCompletionDelta) > 1e-9) reasons.push('ChangeManifest false-completion delta does not match the executed report')
+  if (manifest.outcome.p95TokenDelta !== undefined && Math.abs(manifest.outcome.p95TokenDelta - report.comparison.p95TokenDelta) > 1e-9) {
+    reasons.push('ChangeManifest p95 token delta does not match the executed report')
+  }
+  if (manifest.outcome.regressions !== report.comparison.regressions.length) reasons.push('ChangeManifest regressions do not match the executed report')
+  if (externalAttestations.length !== report.trials.length || report.trials.some((trial) => trial.externalVerifier?.status !== 'pass')) {
+    reasons.push('trusted external verifier attestations are missing for one or more trials')
+  }
+  if (manifest.outcome.evidenceDigests.some((digest) => !trialDigests.has(digest))) reasons.push('ChangeManifest evidence digest is not present in the executed report')
+  return {
+    manifestPath: input.manifestPath,
+    digest: input.digest,
+    promotable: reasons.length === 0,
+    reasons
+  }
 }
 
 async function loadProvidedTrials(paths, harness, config) {
@@ -290,8 +448,10 @@ async function loadProvidedTrials(paths, harness, config) {
       manifestPath,
       loaded,
       verifier,
-      dataDir: trialDataDir(config, loaded.identity.taskId, loaded.manifest.task.executionPolicy),
+      dataDir: trialDataDir(config, loaded.identity.taskId, loaded.manifest.task.executionPolicy, loaded.identity.attemptId),
       resetWorkspace: undefined,
+      // A supplied manifest has no trusted reset/snapshot controller. Keep it
+      // descriptive until an external controller supplies both.
       comparable: false
     })
   }
@@ -320,7 +480,7 @@ async function loadStrictManifest(path, parseBenchmarkManifest) {
 
 async function createDeterministicFixtureTrials(harness, config) {
   const fixtureSpecs = FIXTURES[config.subset]
-  const perTrialCost = config.maxCostUsd / (fixtureSpecs.length * 2)
+  const perTrialCost = config.maxCostUsd / (fixtureSpecs.length * 2 * config.replicates)
   const harnessCommit = await resolveHarnessCommit()
   const manifestsDir = join(config.outputDir, 'generated-manifests')
   const fixtureRoot = join(config.outputDir, 'fixtures')
@@ -332,8 +492,11 @@ async function createDeterministicFixtureTrials(harness, config) {
     const verifierRoot = join(config.outputDir, 'generated-verifiers', fixture.id)
     const writeWorkspace = async () => writeFixtureWorkspace(workspaceRoot, verifierRoot, fixture)
     await writeWorkspace()
-    const environmentDigest = `sha256:${sha256(JSON.stringify({ fixture, node: process.version }))}`
-    for (const executionPolicy of ['normal', 'adaptive']) {
+    const environmentDigest = sha256(JSON.stringify({ fixture, node: process.version }))
+    for (let replicate = 1; replicate <= config.replicates; replicate += 1) {
+      const attemptId = `replicate-${replicate}`
+      const trialSeed = deterministicTrialSeed(config.orderSeed, fixture.id, replicate)
+      for (const executionPolicy of ['normal', 'adaptive']) {
       const adapted = harness.adaptTerminalBenchTask({
         id: fixture.id,
         instruction: fixture.instruction,
@@ -348,13 +511,15 @@ async function createDeterministicFixtureTrials(harness, config) {
         endpointFormat: DEFAULT_ENDPOINT_FORMAT,
         harnessCommit,
         executionPolicy,
+        attemptId,
+        seed: trialSeed,
         budgets: {
           ...harness.DEFAULT_BENCHMARK_TRIAL_BUDGETS,
           maxCostUsd: perTrialCost
         }
       })
       const condition = conditionFor(executionPolicy)
-      const manifestPath = join(manifestsDir, `${fixture.id}.${condition}.json`)
+      const manifestPath = join(manifestsDir, `${fixture.id}.${condition}.${attemptId}.json`)
       await writeJson(manifestPath, adapted.manifest)
       await writeJson(`${manifestPath}.verifier.json`, {
         version: 1,
@@ -371,21 +536,26 @@ async function createDeterministicFixtureTrials(harness, config) {
           identity: adapted.identity
         },
         verifier,
-        dataDir: trialDataDir(config, fixture.id, condition),
+        dataDir: trialDataDir(config, fixture.id, condition, attemptId),
         resetWorkspace: writeWorkspace,
         comparable: true
       })
+      }
     }
   }
   return trials
+}
+
+function deterministicTrialSeed(orderSeed, taskId, replicate) {
+  return Number.parseInt(sha256(`${orderSeed}\u0000${taskId}\u0000${replicate}`).slice(7, 15), 16)
 }
 
 async function writeFixtureWorkspace(workspaceRoot, verifierRoot, fixture) {
   // Both directories are generated beneath the configured report directory.
   // Recreate them for every condition so baseline changes never reach harness.
   await Promise.all([
-    rm(workspaceRoot, { recursive: true, force: true }),
-    rm(verifierRoot, { recursive: true, force: true })
+    resetOwnedDirectory(workspaceRoot, dirname(workspaceRoot)),
+    resetOwnedDirectory(verifierRoot, dirname(verifierRoot))
   ])
   await mkdir(workspaceRoot, { recursive: true })
   await mkdir(verifierRoot, { recursive: true })
@@ -403,20 +573,60 @@ async function writeFixtureWorkspace(workspaceRoot, verifierRoot, fixture) {
   await initializeFixtureRepository(workspaceRoot)
 }
 
+/** Reset only generated fixture directories, rejecting symlinked parents first. */
+async function resetOwnedDirectory(target, ownerRoot) {
+  try {
+    const ownerStat = await lstat(ownerRoot)
+    if (ownerStat.isSymbolicLink() || !ownerStat.isDirectory()) {
+      throw new Error('generated fixture owner directory is not a real directory')
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+    await mkdir(ownerRoot, { recursive: true })
+  }
+  const canonicalOwner = await realpath(ownerRoot)
+  const absoluteTarget = resolve(target)
+  const relativeTarget = relative(canonicalOwner, absoluteTarget)
+  if (!relativeTarget || relativeTarget === '..' || relativeTarget.startsWith('../') || relativeTarget.startsWith('..\\')) {
+    throw new Error('generated fixture path escapes its output directory')
+  }
+  let probe = absoluteTarget
+  while (probe !== canonicalOwner) {
+    try {
+      const entry = await lstat(probe)
+      if (entry.isSymbolicLink()) throw new Error('generated fixture path contains a symlink')
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+    const parent = dirname(probe)
+    if (parent === probe) throw new Error('generated fixture path has no safe parent')
+    probe = parent
+  }
+  await rm(absoluteTarget, { recursive: true, force: true })
+}
+
 async function initializeFixtureRepository(workspaceRoot) {
+  const fixtureEnvironment = {
+    ...withoutDeepseekKey(process.env),
+    GIT_AUTHOR_DATE: '2000-01-01T00:00:00Z',
+    GIT_COMMITTER_DATE: '2000-01-01T00:00:00Z'
+  }
   const commands = [
     ['init', '--quiet'],
     ['add', '--all'],
     ['-c', 'user.name=Kun Fixture', '-c', 'user.email=kun-fixture@example.invalid', 'commit', '--quiet', '-m', 'fixture baseline']
   ]
   for (const args of commands) {
-    const result = await runSubprocess('git', args, { cwd: workspaceRoot, env: withoutDeepseekKey(process.env) })
+    const result = await runSubprocess('git', args, { cwd: workspaceRoot, env: fixtureEnvironment })
     if (result.exitCode !== 0 || result.spawnError) throw new Error('could not initialize a deterministic fixture workspace')
   }
 }
 
 async function resolveHarnessCommit() {
-  const result = await runSubprocess('git', ['rev-parse', 'HEAD'], { cwd: ROOT, env: process.env })
+  const result = await runSubprocess('git', ['rev-parse', 'HEAD'], {
+    cwd: ROOT,
+    env: withoutDeepseekKey(process.env)
+  })
   return result.exitCode === 0 && /^[0-9a-f]{40}$/i.test(result.stdout.trim()) ? result.stdout.trim() : 'unrecorded'
 }
 
@@ -434,17 +644,49 @@ function conditionFor(executionPolicy) {
   return 'unclassified'
 }
 
-function orderTrials(trials) {
-  return [...trials].sort((left, right) => {
-    const task = left.loaded.identity.taskId.localeCompare(right.loaded.identity.taskId)
-    if (task !== 0) return task
-    return left.condition.localeCompare(right.condition)
+function orderTrials(trials, seed) {
+  const groups = new Map()
+  for (const trial of trials) {
+    const key = JSON.stringify([
+      trial.loaded.identity.taskId,
+      trial.loaded.identity.attemptId ?? null,
+      trial.loaded.identity.taskDefinitionDigest ?? null
+    ])
+    const group = groups.get(key) ?? []
+    group.push(trial)
+    groups.set(key, group)
+  }
+  const orderedGroups = [...groups.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, group]) => [...group].sort((left, right) => left.condition.localeCompare(right.condition)))
+  let state = seed >>> 0
+  for (let index = orderedGroups.length - 1; index > 0; index -= 1) {
+    state = xorshift32(state)
+    const swapIndex = state % (index + 1)
+    const current = orderedGroups[index]
+    orderedGroups[index] = orderedGroups[swapIndex]
+    orderedGroups[swapIndex] = current
+  }
+  const startHarness = (state & 1) !== 0
+  return orderedGroups.flatMap((group, index) => {
+    // Alternate the first condition across pair groups; the seed chooses only
+    // which side starts, so an odd number of pairs leaves at most one extra.
+    const harnessFirst = startHarness ? index % 2 === 0 : index % 2 !== 0
+    return harnessFirst ? [...group].reverse() : group
   })
 }
 
-function trialDataDir(config, taskId, condition) {
+function xorshift32(value) {
+  let state = value >>> 0
+  state ^= state << 13
+  state ^= state >>> 17
+  state ^= state << 5
+  return state >>> 0
+}
+
+function trialDataDir(config, taskId, condition, attemptId = 'default') {
   const root = config.dataDir ?? join(config.outputDir, 'kun-data')
-  return join(root, safePathSegment(taskId), condition)
+  return join(root, safePathSegment(taskId), safePathSegment(attemptId), condition)
 }
 
 function safePathSegment(value) {
@@ -456,8 +698,12 @@ function shellQuote(value) {
 }
 
 async function runTrial(prepared, harness, config, apiKey) {
+  const snapshot = harness.workspaceSnapshotAttestation(prepared.loaded.manifest.workspaceRoot)
+  if (!snapshot.trusted || snapshot.digest !== prepared.loaded.identity.workspaceDigest) {
+    return infrastructureTrialRecord(prepared, 'workspace snapshot did not match the manifest identity')
+  }
   await mkdir(prepared.dataDir, { recursive: true })
-  const cli = await runSubprocess('node', [
+  const cli = await runSubprocess(process.execPath, [
     'kun/dist/cli/serve-entry.js',
     'harness',
     'run',
@@ -467,15 +713,31 @@ async function runTrial(prepared, harness, config, apiKey) {
     prepared.dataDir
   ], {
     cwd: ROOT,
-    env: { ...withoutDeepseekKey(process.env), DEEPSEEK_API_KEY: apiKey },
+    // Keep the provider credential out of the agent runtime environment. On
+    // Linux, model-controlled children can inspect /proc/$PPID/environ.
+    // runSubprocess writes this one-shot secret to an inherited pipe and the
+    // CLI closes the descriptor before any tools are available.
+    env: { ...minimalVerifierEnvironment(process.env), KUN_HARNESS_API_KEY_FD: String(HARNESS_SECRET_FD) },
+    secret: apiKey,
+    isolate: 'linux-pid-user',
     timeoutMs: prepared.loaded.manifest.task.budgets.wallTimeMs + CLI_GRACE_MS
   })
   const result = parseTrialResult(cli.stdout, harness.TrialResultSchema)
+  if (result) {
+    const replay = harness.replayTrialResult(result)
+    if (!replay.valid) {
+      return infrastructureTrialRecord(prepared, 'sealed trial trace failed independent replay')
+    }
+  }
   const record = {
     taskId: prepared.loaded.identity.taskId,
+    ...(prepared.loaded.identity.attemptId === undefined ? {} : { attemptId: prepared.loaded.identity.attemptId }),
     condition: prepared.condition,
+    family: prepared.loaded.identity.family,
     dataset: prepared.loaded.identity.dataset,
     datasetVersion: prepared.loaded.identity.datasetVersion,
+    workspaceDigest: prepared.loaded.identity.workspaceDigest,
+    taskDefinitionDigest: prepared.loaded.identity.taskDefinitionDigest,
     manifestHash: prepared.loaded.manifestHash,
     harnessCommit: prepared.loaded.manifest.harnessCommit,
     environmentDigest: prepared.loaded.identity.environmentDigest,
@@ -492,7 +754,10 @@ async function runTrial(prepared, harness, config, apiKey) {
       ? {
           runtimeStatus: result.runtimeStatus,
           gateVerdict: result.gateVerdict,
-          officialOutcome: result.officialOutcome,
+          internalOutcome: result.internalOutcome,
+          promptTokens: result.usage.promptTokens,
+          completionTokens: result.usage.completionTokens,
+          totalTokens: result.usage.totalTokens,
           costUsd: result.usage.costUsd,
           wallTimeMs: result.wallTimeMs,
           cacheHitRate: result.usage.cacheHitRate,
@@ -503,75 +768,52 @@ async function runTrial(prepared, harness, config, apiKey) {
       status: 'not-run',
       outputRedacted: true
     },
-    outcome: 'inconclusive'
+    outcome: 'inconclusive',
+    orderIndex: undefined
   }
 
   if (cli.spawnError || cli.timedOut || !result || cli.exitCode === null) return record
-  const completedBaseline = prepared.condition === 'baseline' && result.runtimeStatus === 'completed'
-  if (!completedBaseline && cli.exitCode !== 0 && result.officialOutcome === 'pass') return record
-  if (!completedBaseline && result.officialOutcome === 'inconclusive') return record
-  if (!completedBaseline && result.officialOutcome === 'fail') {
-    record.externalVerifier = { status: 'skipped-after-kun-failure', outputRedacted: true }
-    record.outcome = 'fail'
+  // The detached verifier is the authority for the benchmark outcome. A Kun
+  // completion-gate verdict is retained in `kunOutcome` as a diagnostic and
+  // never suppresses an external classification of a completed workspace.
+  if (result.runtimeStatus !== 'completed') {
+    record.externalVerifier = { status: 'skipped-after-runtime-failure', outputRedacted: true }
+    record.outcome = result.internalOutcome === 'fail' ? 'fail' : 'inconclusive'
     return record
   }
   if (!prepared.verifier) {
     record.externalVerifier = { status: 'not-provided', outputRedacted: true }
     return record
   }
-  if (prepared.verifier.isolation !== HOST_VERIFIER_ISOLATION) {
-    // `container` and `remote` describe real benchmark boundaries, but this
-    // runner has no Docker or remote dispatcher. Never reinterpret either as
-    // permission to run an arbitrary verifier command on the host.
-    record.externalVerifier = {
-      status: 'unsupported-isolation',
-      isolation: prepared.verifier.isolation,
-      outputRedacted: true
-    }
-    return record
-  }
-
-  const verifierResult = await runSubprocess('bash', ['-lc', prepared.verifier.command], {
-    cwd: prepared.loaded.manifest.workspaceRoot,
-    // A host verifier receives only process-liveness locale/path values, never
-    // the model key or the caller's broader environment.
-    env: minimalVerifierEnvironment(process.env),
-    timeoutMs: prepared.verifier.timeoutMs
-  })
+  // This runner has no container or remote controller. Metadata alone must
+  // never turn a host shell into a trusted verifier, so every sidecar remains
+  // descriptive/inconclusive until an external controller publishes its result.
   record.externalVerifier = {
-    status: verifierResult.spawnError
-      ? 'infrastructure-failure'
-      : verifierResult.timedOut
-        ? 'infrastructure-timeout'
-        : verifierResult.exitCode === 0
-        ? 'pass'
-        : 'fail',
+    status: 'unsupported-isolation',
     isolation: prepared.verifier.isolation,
-    exitCode: verifierResult.exitCode,
-    signal: verifierResult.signal,
-    timedOut: verifierResult.timedOut,
     outputRedacted: true,
-    stdoutBytes: Buffer.byteLength(redactText(verifierResult.stdout, apiKey)),
-    stderrBytes: Buffer.byteLength(redactText(verifierResult.stderr, apiKey))
+    reason: 'no trusted container or remote controller is configured'
   }
-  record.outcome = verifierResult.spawnError || verifierResult.timedOut
-    ? 'inconclusive'
-    : verifierResult.exitCode === 0 ? 'pass' : 'fail'
   return record
 }
 
-function infrastructureTrialRecord(prepared) {
+function infrastructureTrialRecord(prepared, reason = 'trial setup failed before the Kun CLI started') {
   return {
     taskId: prepared.loaded.identity.taskId,
+    ...(prepared.loaded.identity.attemptId === undefined ? {} : { attemptId: prepared.loaded.identity.attemptId }),
     condition: prepared.condition,
+    family: prepared.loaded.identity.family,
     dataset: prepared.loaded.identity.dataset,
     datasetVersion: prepared.loaded.identity.datasetVersion,
+    workspaceDigest: prepared.loaded.identity.workspaceDigest,
+    taskDefinitionDigest: prepared.loaded.identity.taskDefinitionDigest,
     manifestHash: prepared.loaded.manifestHash,
     harnessCommit: prepared.loaded.manifest.harnessCommit,
     environmentDigest: prepared.loaded.identity.environmentDigest,
-    runtime: { spawnError: 'trial setup failed before the Kun CLI started', outputRedacted: true },
+    runtime: { spawnError: reason, outputRedacted: true },
     externalVerifier: { status: 'not-run', outputRedacted: true },
-    outcome: 'inconclusive'
+    outcome: 'inconclusive',
+    orderIndex: undefined
   }
 }
 
@@ -661,7 +903,15 @@ function minimalVerifierEnvironment(environment) {
 function summarizeComparison(trials) {
   const byTask = new Map()
   for (const trial of trials) {
-    const key = `${trial.taskId}|${trial.dataset}|${trial.datasetVersion}|${trial.environmentDigest}`
+    const key = JSON.stringify([
+      trial.taskId,
+      trial.attemptId ?? null,
+      trial.dataset,
+      trial.datasetVersion,
+      trial.environmentDigest,
+      trial.workspaceDigest ?? null,
+      trial.taskDefinitionDigest ?? null
+    ])
     const group = byTask.get(key) ?? []
     group.push(trial)
     byTask.set(key, group)
@@ -671,12 +921,23 @@ function summarizeComparison(trials) {
     regressions: [],
     recoveredFailures: [],
     inconclusiveTaskIds: [],
-    unpairedTaskIds: []
+    unpairedTaskIds: [],
+    pairedOutcome: undefined
   }
+  const deltas = []
+  const deltasByTask = new Map()
+  const families = new Set()
+  let inconclusivePairs = 0
+  let bothPass = 0
+  let bothFail = 0
+  let baselineOnlyPass = 0
+  let harnessOnlyPass = 0
   for (const group of byTask.values()) {
     const baseline = group.find((trial) => trial.condition === 'baseline')
     const harness = group.find((trial) => trial.condition === 'harness')
-    const taskId = group[0].taskId
+    const taskId = group[0].attemptId
+      ? `${group[0].taskId}@${group[0].attemptId}`
+      : group[0].taskId
     if (
       !baseline ||
       !harness ||
@@ -687,15 +948,86 @@ function summarizeComparison(trials) {
       summary.unpairedTaskIds.push(taskId)
       continue
     }
-    summary.pairs.push({ taskId, baseline: baseline.outcome, harness: harness.outcome })
+    summary.pairs.push({
+      taskId,
+      baseline: baseline.outcome,
+      harness: harness.outcome,
+      order: [baseline.orderIndex ?? null, harness.orderIndex ?? null]
+    })
     if (baseline.outcome === 'pass' && harness.outcome !== 'pass') summary.regressions.push(taskId)
     if (baseline.outcome === 'fail' && harness.outcome === 'pass') summary.recoveredFailures.push(taskId)
-    if (baseline.outcome === 'inconclusive' || harness.outcome === 'inconclusive') summary.inconclusiveTaskIds.push(taskId)
+    if (baseline.outcome === 'inconclusive' || harness.outcome === 'inconclusive') {
+      summary.inconclusiveTaskIds.push(taskId)
+      inconclusivePairs += 1
+      continue
+    }
+    const baselinePass = baseline.outcome === 'pass'
+    const harnessPass = harness.outcome === 'pass'
+    if (baselinePass && harnessPass) bothPass += 1
+    else if (!baselinePass && !harnessPass) bothFail += 1
+    else if (baselinePass) baselineOnlyPass += 1
+    else harnessOnlyPass += 1
+    const delta = Number(harnessPass) - Number(baselinePass)
+    deltas.push(delta)
+    const taskDeltas = deltasByTask.get(baseline.taskId) ?? []
+    taskDeltas.push(delta)
+    deltasByTask.set(baseline.taskId, taskDeltas)
+    families.add(baseline.family ?? baseline.dataset)
   }
   for (const key of ['pairs', 'regressions', 'recoveredFailures', 'inconclusiveTaskIds', 'unpairedTaskIds']) {
     summary[key].sort((left, right) => typeof left === 'string' ? left.localeCompare(right) : left.taskId.localeCompare(right.taskId))
   }
+  summary.pairedOutcome = {
+    comparablePairs: deltas.length,
+    inconclusivePairs,
+    independentTasks: deltasByTask.size,
+    independentFamilies: families.size,
+    bothPass,
+    bothFail,
+    baselineOnlyPass,
+    harnessOnlyPass,
+    passDelta: deltas.length ? deltas.reduce((sum, value) => sum + value, 0) / deltas.length : 0,
+    confidence95: pairedClusterBootstrapConfidenceInterval(deltasByTask)
+  }
+  const baselineTokens = trials
+    .filter((trial) => trial.condition === 'baseline' && Number.isFinite(trial.kunOutcome?.totalTokens))
+    .map((trial) => trial.kunOutcome.totalTokens)
+  const harnessTokens = trials
+    .filter((trial) => trial.condition === 'harness' && Number.isFinite(trial.kunOutcome?.totalTokens))
+    .map((trial) => trial.kunOutcome.totalTokens)
+  const baselineP95 = percentile95(baselineTokens)
+  const harnessP95 = percentile95(harnessTokens)
+  summary.p95TokenDelta = baselineP95 > 0 ? (harnessP95 - baselineP95) / baselineP95 : 0
   return summary
+}
+
+function percentile95(values) {
+  if (!values.length) return 0
+  const sorted = [...values].sort((left, right) => left - right)
+  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)] ?? 0
+}
+
+function pairedClusterBootstrapConfidenceInterval(samplesByTask) {
+  const clusters = [...samplesByTask.values()].filter((samples) => samples.length > 0)
+  if (!clusters.length) return { lower: 0, upper: 0 }
+  const means = []
+  let state = 0x6d2b79f5
+  for (let iteration = 0; iteration < 2_000; iteration += 1) {
+    let sum = 0
+    for (let index = 0; index < clusters.length; index += 1) {
+      state = Math.imul(state ^ (state >>> 15), 1 | state)
+      state += Math.imul(state ^ (state >>> 7), 61 | state) ^ state
+      const random = ((state ^ (state >>> 14)) >>> 0) / 4_294_967_296
+      const cluster = clusters[Math.floor(random * clusters.length)] ?? []
+      sum += cluster.reduce((total, value) => total + value, 0) / cluster.length
+    }
+    means.push(sum / clusters.length)
+  }
+  means.sort((left, right) => left - right)
+  return {
+    lower: means[Math.floor((means.length - 1) * 0.025)] ?? 0,
+    upper: means[Math.floor((means.length - 1) * 0.975)] ?? 0
+  }
 }
 
 function overallOutcome(trials, comparison) {
@@ -734,12 +1066,40 @@ function runSubprocess(command, args, options) {
     let spawnError
     let settled = false
     let timedOut = false
-    const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe'] })
+    const secretPipe = typeof options.secret === 'string' && process.platform !== 'win32'
+    const launch = isolatedLaunch(command, args, options.isolate)
+    if (launch.unsupported) {
+      resolveResult({
+        exitCode: null,
+        signal: null,
+        stdout: '',
+        stderr: '',
+        spawnError: new Error(launch.unsupported),
+        timedOut: false
+      })
+      return
+    }
+    const child = spawn(launch.command, launch.args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: secretPipe ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32'
+    })
+    if (secretPipe) {
+      const descriptor = child.stdio[HARNESS_SECRET_FD]
+      if (descriptor && typeof descriptor.end === 'function') {
+        // A Linux pipe may surface ECONNRESET when the CLI closes its copy
+        // after consuming the credential. It is an expected close, not a
+        // runner failure; never let it become an uncaught process error.
+        descriptor.on('error', () => {})
+        descriptor.end(options.secret)
+      }
+    }
     const timeout = options.timeoutMs && Number.isFinite(options.timeoutMs)
       ? setTimeout(() => {
           timedOut = true
-          child.kill('SIGTERM')
-          setTimeout(() => child.kill('SIGKILL'), 5_000).unref()
+          terminateProcessGroup(child, 'SIGTERM')
+          setTimeout(() => terminateProcessGroup(child, 'SIGKILL'), 5_000).unref()
         }, options.timeoutMs)
       : undefined
     const append = (current, chunk) => {
@@ -753,9 +1113,64 @@ function runSubprocess(command, args, options) {
       if (settled) return
       settled = true
       if (timeout) clearTimeout(timeout)
-      resolveResult({ exitCode, signal, stdout, stderr, spawnError, timedOut })
+      void finalizeSubprocess(child, () => resolveResult({ exitCode, signal, stdout, stderr, spawnError, timedOut }))
     })
   })
+}
+
+function isolatedLaunch(command, args, isolation) {
+  if (!isolation) return { command, args }
+  if (isolation !== 'linux-pid-user') return { unsupported: `unsupported process isolation: ${isolation}` }
+  if (process.platform !== 'linux') {
+    return { unsupported: 'live harness trials require Linux PID and user namespaces' }
+  }
+  // The private PID namespace hides the runner (which owns the provider
+  // credential) from model-controlled tools. The user namespace prevents
+  // same-UID /proc inspection of the runner as a second line of defense.
+  return {
+    command: 'unshare',
+    args: [
+      '--user',
+      '--map-root-user',
+      '--pid',
+      '--mount',
+      '--fork',
+      '--mount-proc=/proc',
+      command,
+      ...args
+    ]
+  }
+}
+
+function terminateProcessGroup(child, signal) {
+  if (!child.pid) return
+  if (process.platform === 'win32') {
+    const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+    killer.once('error', () => child.kill(signal))
+    return
+  }
+  try {
+    process.kill(-child.pid, signal)
+  } catch {
+    // The child or its group may already have exited.
+  }
+}
+
+async function finalizeSubprocess(child, done) {
+  terminateProcessGroup(child, 'SIGTERM')
+  if (process.platform !== 'win32' && child.pid) {
+    const deadline = Date.now() + 2_000
+    while (Date.now() < deadline) {
+      try {
+        process.kill(-child.pid, 0)
+      } catch {
+        break
+      }
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
+    }
+    terminateProcessGroup(child, 'SIGKILL')
+  }
+  done()
 }
 
 async function writeReports(outputDir, report) {
@@ -786,14 +1201,15 @@ function renderMarkdown(report) {
     '',
     '## Trials',
     '',
-    '| Task | Condition | Dataset/version | Commit | Kun outcome | External verifier | Final | Cost | Latency | Cache hit rate |',
-    '| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |',
+    '| Task | Attempt | Condition | Dataset/version | Commit | Kun outcome | External verifier | Final | Cost | Latency | Cache hit rate |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |',
     ...report.trials.map((trial) => [
       trial.taskId,
+      trial.attemptId ?? 'default',
       trial.condition,
       `${trial.dataset}@${trial.datasetVersion}`,
       trial.harnessCommit,
-      trial.kunOutcome?.officialOutcome ?? 'unavailable',
+      trial.kunOutcome?.internalOutcome ?? 'unavailable',
       trial.externalVerifier.status,
       trial.outcome,
       formatUsd(trial.kunOutcome?.costUsd),
@@ -804,6 +1220,14 @@ function renderMarkdown(report) {
     '## A/B comparison',
     '',
     `- Paired tasks: ${report.comparison.pairs.length}`,
+    `- Comparable pairs: ${report.comparison.pairedOutcome?.comparablePairs ?? 0}`,
+    `- Paired pass delta: ${formatRate(report.comparison.pairedOutcome?.passDelta)}`,
+    `- p95 token delta (harness vs baseline): ${formatRate(report.comparison.p95TokenDelta)}`,
+    `- Paired bootstrap 95% CI: ${formatRate(report.comparison.pairedOutcome?.confidence95?.lower)} to ${formatRate(report.comparison.pairedOutcome?.confidence95?.upper)}`,
+    ...(report.promotion
+      ? [`- ChangeManifest promotion: ${report.promotion.promotable ? 'promotable' : 'rejected'} (${report.promotion.digest})`,
+        ...report.promotion.reasons.map((reason) => `- Promotion exclusion: ${reason}`)]
+      : ['- ChangeManifest promotion: not requested']),
     `- Regressions: ${renderList(report.comparison.regressions)}`,
     `- Recovered failures: ${renderList(report.comparison.recoveredFailures)}`,
     `- Inconclusive pairs: ${renderList(report.comparison.inconclusiveTaskIds)}`,
