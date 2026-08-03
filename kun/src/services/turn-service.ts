@@ -27,9 +27,9 @@ import type { HarnessTaskSpec } from '../contracts/harness.js'
 import { HarnessTaskSpecSchema } from '../contracts/harness.js'
 import type { UsageService } from './usage-service.js'
 import {
-  InMemoryAdaptiveTrialLeaseStore,
-  type AdaptiveTrialLease,
-  type AdaptiveTrialLeaseStore
+  InMemoryTurnLeaseStore,
+  type TurnLease,
+  type TurnLeaseStore
 } from './adaptive-trial-lease.js'
 
 export type TurnServiceDeps = {
@@ -43,10 +43,10 @@ export type TurnServiceDeps = {
   nowIso: () => string
   usage: Pick<UsageService, 'forThread'>
   /**
-   * Serve mode supplies a data-directory lease store so an adaptive request
-   * cannot be dispatched by two runtimes that share persisted state.
+   * Serve mode supplies a data-directory lease store so every start write is
+   * serialized across runtimes and adaptive model dispatch stays exclusive.
    */
-  adaptiveTrialLeases?: AdaptiveTrialLeaseStore
+  turnLeases?: TurnLeaseStore
   roles?: RolesConfig
 }
 
@@ -60,61 +60,53 @@ export class TurnService {
   private readonly deps: TurnServiceDeps
   private readonly inflightTurns = new Map<string, AbortController>()
   private readonly threadMutationQueues = new Map<string, Promise<void>>()
-  private readonly adaptiveTrialLeases: AdaptiveTrialLeaseStore
-  private readonly activeAdaptiveTrialLeases = new Map<string, AdaptiveTrialLease>()
-  private readonly activeAdaptiveThreadLeases = new Map<
+  private readonly turnLeases: TurnLeaseStore
+  private readonly activeAdaptiveTrialLeases = new Map<string, TurnLease>()
+  private readonly retainedAdaptiveStartLeases = new Map<
     string,
-    { turnId: string; lease: AdaptiveTrialLease }
+    { turnId: string; lease: TurnLease }
   >()
 
   constructor(deps: TurnServiceDeps) {
     this.deps = deps
-    this.adaptiveTrialLeases = deps.adaptiveTrialLeases ?? new InMemoryAdaptiveTrialLeaseStore()
+    this.turnLeases = deps.turnLeases ?? new InMemoryTurnLeaseStore()
   }
 
   async startTurn(input: {
     threadId: string
     request: StartTurnRequest
   }): Promise<StartTurnResponse> {
-    const thread = await this.deps.threadStore.get(input.threadId)
-    if (!thread) throw new Error(`thread not found: ${input.threadId}`)
-    if (input.request.mode === 'rigorous') {
-      if (thread.mode === 'plan') {
-        throw new Error('rigorous mode is only available on agent-mode threads')
-      }
-      if (this.deps.roles?.enabled === false) {
-        throw new Error('rigorous mode is disabled by roles.enabled=false')
-      }
+    const turnId = this.deps.ids.next('turn')
+    const startLease = await this.turnLeases.acquireThread({ threadId: input.threadId, turnId })
+    if (!startLease) {
+      throw new Error('thread turn start is already active; adaptive harness trial requires exclusive thread execution')
     }
-    const harnessTask = input.request.harnessTask
-      ? HarnessTaskSpecSchema.parse(input.request.harnessTask)
-      : undefined
-    if (harnessTask?.executionPolicy === 'adaptive' && (input.request.mode === 'plan' || thread.mode === 'plan')) {
-      throw new Error('adaptive harness trials are unavailable in plan mode')
-    }
-    const adaptiveTrialMarker = harnessTask?.executionPolicy === 'adaptive'
-      ? this.createReadyAdaptiveTrialMarker(
-          this.deps.nowIso(),
-          this.deps.usage.forThread(input.threadId)
-        )
-      : undefined
-    const isAdaptiveTrial = harnessTask?.executionPolicy === 'adaptive'
-    if (isAdaptiveTrial && this.activeAdaptiveThreadLeases.has(input.threadId)) {
-      throw new Error('adaptive harness trial requires exclusive thread execution')
-    }
-    // Per-turn leases from the prior implementation intentionally have their
-    // own canonical path. They are only acquired after the adaptive turn has
-    // been durably written as running, so this serialized mutation still sees
-    // and rejects that persisted turn without scanning arbitrary lock files.
-    const adaptiveThreadLease = isAdaptiveTrial
-      ? await this.adaptiveTrialLeases.acquireThread({ threadId: input.threadId })
-      : undefined
-    if (isAdaptiveTrial && !adaptiveThreadLease) {
-      throw new Error('adaptive harness trial requires exclusive thread execution')
-    }
-    let ownsAdaptiveThreadLease = false
+    let retainsStartLease = false
+    let releasedStartLease = false
     try {
-      const turnId = this.deps.ids.next('turn')
+      const thread = await this.deps.threadStore.get(input.threadId)
+      if (!thread) throw new Error(`thread not found: ${input.threadId}`)
+      if (input.request.mode === 'rigorous') {
+        if (thread.mode === 'plan') {
+          throw new Error('rigorous mode is only available on agent-mode threads')
+        }
+        if (this.deps.roles?.enabled === false) {
+          throw new Error('rigorous mode is disabled by roles.enabled=false')
+        }
+      }
+      const harnessTask = input.request.harnessTask
+        ? HarnessTaskSpecSchema.parse(input.request.harnessTask)
+        : undefined
+      if (harnessTask?.executionPolicy === 'adaptive' && (input.request.mode === 'plan' || thread.mode === 'plan')) {
+        throw new Error('adaptive harness trials are unavailable in plan mode')
+      }
+      const isAdaptiveTrial = harnessTask?.executionPolicy === 'adaptive'
+      const adaptiveTrialMarker = isAdaptiveTrial
+        ? this.createReadyAdaptiveTrialMarker(
+            this.deps.nowIso(),
+            this.deps.usage.forThread(input.threadId)
+          )
+        : undefined
       const turn = createTurnRecord({
         id: turnId,
         threadId: input.threadId,
@@ -147,9 +139,15 @@ export class TurnService {
           turns: [...current.turns, startTurnRecord(appendTurnItem(turn, userItem))]
         }
       })
-      if (adaptiveThreadLease) {
-        this.activeAdaptiveThreadLeases.set(input.threadId, { turnId, lease: adaptiveThreadLease })
-        ownsAdaptiveThreadLease = true
+      if (isAdaptiveTrial) {
+        this.retainedAdaptiveStartLeases.set(input.threadId, { turnId, lease: startLease })
+        retainsStartLease = true
+      } else {
+        // A normal turn needs the lease only through its durable start write.
+        // A later adaptive start reacquires the CAS lock, observes this running
+        // turn, and fails closed, preserving adaptive↔normal symmetry.
+        await this.turnLeases.release(startLease)
+        releasedStartLease = true
       }
       await this.deps.sessionStore.appendItem(input.threadId, userItem)
       await this.deps.events.record({
@@ -174,8 +172,8 @@ export class TurnService {
       this.deps.steering.setTurn(turnId)
       return { threadId: input.threadId, turnId, userMessageItemId: userItem.id }
     } catch (error) {
-      if (adaptiveThreadLease && !ownsAdaptiveThreadLease) {
-        await this.adaptiveTrialLeases.release(adaptiveThreadLease).catch(() => undefined)
+      if (!retainsStartLease && !releasedStartLease) {
+        await this.turnLeases.release(startLease).catch(() => undefined)
       }
       throw error
     }
@@ -191,7 +189,7 @@ export class TurnService {
     turnId: string
   }): Promise<'activated' | 'already_running' | 'lease_unavailable' | 'unavailable'> {
     if (this.activeAdaptiveTrialLeases.has(input.turnId)) return 'already_running'
-    const lease = await this.adaptiveTrialLeases.acquire(input)
+    const lease = await this.turnLeases.acquire(input)
     if (!lease) return 'lease_unavailable'
     const activation = { outcome: 'unavailable' as 'activated' | 'already_running' | 'unavailable' }
     try {
@@ -222,10 +220,10 @@ export class TurnService {
         this.activeAdaptiveTrialLeases.set(input.turnId, lease)
         return activation.outcome
       }
-      await this.adaptiveTrialLeases.release(lease)
+      await this.turnLeases.release(lease)
       return activation.outcome
     } catch (error) {
-      await this.adaptiveTrialLeases.release(lease).catch(() => undefined)
+      await this.turnLeases.release(lease).catch(() => undefined)
       throw error
     }
   }
@@ -246,17 +244,11 @@ export class TurnService {
     this.deps.steering.clear()
     this.inflightTurns.delete(input.turnId)
     this.deps.inflight.end(input.turnId)
-    await this.deps.events.record({
-      kind: 'turn_aborted',
-      threadId: input.threadId,
-      turnId: input.turnId
-    })
-    if (input.discard) {
-      await this.discardTurnItems(input.threadId, input.turnId)
-    }
+    const interrupted = { applied: false }
     await this.upsertThread(input.threadId, (current) => {
       const turn = current.turns.find((t) => t.id === input.turnId)
-      if (!turn) return current
+      if (!turn || turn.status !== 'running') return current
+      interrupted.applied = true
       const next = current.turns.map((t) =>
         t.id === input.turnId
           ? this.finalizeOpenItems(
@@ -265,10 +257,32 @@ export class TurnService {
             )
           : t
       )
-      return { ...touchThread(current, this.deps.nowIso()), turns: next, status: 'idle' }
+      return {
+        ...touchThread(current, this.deps.nowIso()),
+        turns: next,
+        status: this.threadStatusAfterTurnMutation(next)
+      }
     })
+    if (!interrupted.applied) {
+      await this.releaseAdaptiveTrialLease(input.turnId)
+      // A previous interrupter can have persisted `aborted` and then died
+      // before revoking its remote owner's lease. Repeating the exact-turn
+      // revocation is safe: releaseThread refuses a successor's different ID.
+      await this.turnLeases.releaseThread({ threadId: input.threadId, turnId: input.turnId })
+      await this.releaseRetainedAdaptiveStartLease(input.threadId, input.turnId)
+      return { status: (await this.getTurn(input.threadId, input.turnId))?.status ?? 'aborted' }
+    }
+    if (input.discard) {
+      await this.discardTurnItems(input.threadId, input.turnId)
+    }
     await this.releaseAdaptiveTrialLease(input.turnId)
-    await this.releaseAdaptiveThreadLease(input.threadId, input.turnId)
+    await this.turnLeases.releaseThread({ threadId: input.threadId, turnId: input.turnId })
+    await this.releaseRetainedAdaptiveStartLease(input.threadId, input.turnId)
+    await this.deps.events.record({
+      kind: 'turn_aborted',
+      threadId: input.threadId,
+      turnId: input.turnId
+    })
     return { status: 'aborted' }
   }
 
@@ -295,7 +309,7 @@ export class TurnService {
       reason: input.request.reason
     })
     if (result.replacedTokens > 0) {
-      await this.appendItem(input.threadId, result.summaryItem)
+      await this.appendItem(input.threadId, result.summaryItem, { requiresRunning: false })
     }
     await this.deps.events.record({
       kind: 'compaction_completed',
@@ -345,29 +359,51 @@ export class TurnService {
     this.inflightTurns.delete(input.turnId)
     this.deps.inflight.end(input.turnId)
     this.deps.steering.clear()
+    const errorItem = input.error
+      ? makeErrorItem({
+          id: `item_${input.turnId}_error`,
+          turnId: input.turnId,
+          threadId: input.threadId,
+          message: input.error
+        })
+      : undefined
+    const finished = { applied: false }
     await this.upsertThread(input.threadId, (current) => {
+      const target = current.turns.find((turn) => turn.id === input.turnId)
+      if (!target || target.status !== 'running') return current
+      finished.applied = true
       const next = current.turns.map((t) => {
         if (t.id !== input.turnId) return t
-        const finished = this.finalizeOpenItems(finishTurn(t, input.status), input.status)
-        return input.error ? { ...finished, error: input.error } : finished
+        const terminal = this.finalizeOpenItems(finishTurn(t, input.status), input.status)
+        const withError = errorItem ? appendTurnItem(terminal, errorItem) : terminal
+        return input.error ? { ...withError, error: input.error } : withError
       })
-      return { ...touchThread(current, this.deps.nowIso()), turns: next, status: 'idle' }
+      return {
+        ...touchThread(current, this.deps.nowIso()),
+        turns: next,
+        status: this.threadStatusAfterTurnMutation(next)
+      }
     })
+    if (!finished.applied) {
+      await this.releaseAdaptiveTrialLease(input.turnId)
+      // Keep terminal cleanup idempotent across runtimes. In particular, a
+      // stale owner cannot delete a newer lease because the store matches the
+      // persisted lease's turn ID before unlinking it.
+      await this.turnLeases.releaseThread({ threadId: input.threadId, turnId: input.turnId })
+      await this.releaseRetainedAdaptiveStartLease(input.threadId, input.turnId)
+      return
+    }
     await this.releaseAdaptiveTrialLease(input.turnId)
-    await this.releaseAdaptiveThreadLease(input.threadId, input.turnId)
+    await this.turnLeases.releaseThread({ threadId: input.threadId, turnId: input.turnId })
+    await this.releaseRetainedAdaptiveStartLease(input.threadId, input.turnId)
     await this.deps.events.record({
       kind: input.status === 'completed' ? 'turn_completed' : input.status === 'aborted' ? 'turn_aborted' : 'turn_failed',
       threadId: input.threadId,
       turnId: input.turnId,
       ...(input.error ? { message: input.error } : {})
     })
-    if (input.error) {
-      await this.appendItem(input.threadId, makeErrorItem({
-        id: `item_${input.turnId}_error`,
-        turnId: input.turnId,
-        threadId: input.threadId,
-        message: input.error
-      }))
+    if (errorItem) {
+      await this.deps.sessionStore.appendItem(input.threadId, errorItem)
     }
   }
 
@@ -396,7 +432,7 @@ export class TurnService {
     await this.upsertThread(threadId, (current) => ({
       ...current,
       turns: current.turns.map((turn) =>
-        turn.id === turnId
+        turn.id === turnId && turn.status === 'running'
           ? {
               ...turn,
               ...(patch.activeSkillIds ? { activeSkillIds: [...patch.activeSkillIds] } : {}),
@@ -416,7 +452,8 @@ export class TurnService {
    * calls this after each chunk so SSE consumers see live updates.
    */
   async applyItem(threadId: string, item: TurnItem): Promise<void> {
-    await this.appendItem(threadId, item)
+    const applied = await this.appendItem(threadId, item)
+    if (!applied) return
     await this.deps.events.record({
       kind: 'item_created',
       threadId,
@@ -431,19 +468,19 @@ export class TurnService {
     itemId: string,
     patch: Partial<TurnItem>
   ): Promise<TurnItem | null> {
-    const updatedInSession = await this.deps.sessionStore.updateItem(threadId, itemId, patch)
     const updatedItems: TurnItem[] = []
     await this.upsertThread(threadId, (current) => {
       const turns = current.turns.map((turn) => {
         const existing = turn.items.find((item) => item.id === itemId)
-        if (!existing) return turn
+        if (!existing || turn.status !== 'running') return turn
         updatedItems[0] = { ...existing, ...patch } as TurnItem
         return replaceTurnItem(turn, itemId, patch)
       })
       return { ...current, turns }
     })
-    const updated = updatedItems[0] ?? updatedInSession
+    const updated = updatedItems[0]
     if (!updated) return null
+    await this.deps.sessionStore.updateItem(threadId, itemId, patch)
     await this.deps.events.record({
       kind: 'item_updated',
       threadId,
@@ -454,15 +491,35 @@ export class TurnService {
     return updated
   }
 
-  private async appendItem(threadId: string, item: TurnItem): Promise<void> {
-    await this.deps.sessionStore.appendItem(threadId, item)
+  private async appendItem(
+    threadId: string,
+    item: TurnItem,
+    options: { requiresRunning?: boolean } = {}
+  ): Promise<boolean> {
+    const requiresRunning = options.requiresRunning ?? true
+    if (!requiresRunning) {
+      await this.deps.sessionStore.appendItem(threadId, item)
+      await this.upsertThread(threadId, (current) => {
+        const turn = current.turns.find((t) => t.id === item.turnId)
+        if (!turn) return current
+        const nextTurn = appendTurnItem(turn, item)
+        const turns = current.turns.map((t) => (t.id === item.turnId ? nextTurn : t))
+        return { ...current, turns }
+      })
+      return true
+    }
+    const appended = { value: false }
     await this.upsertThread(threadId, (current) => {
       const turn = current.turns.find((t) => t.id === item.turnId)
-      if (!turn) return current
+      if (!turn || turn.status !== 'running') return current
+      appended.value = true
       const nextTurn = appendTurnItem(turn, item)
       const turns = current.turns.map((t) => (t.id === item.turnId ? nextTurn : t))
       return { ...current, turns }
     })
+    if (!appended.value) return false
+    await this.deps.sessionStore.appendItem(threadId, item)
+    return true
   }
 
   private async upsertThread(
@@ -491,14 +548,18 @@ export class TurnService {
     const lease = this.activeAdaptiveTrialLeases.get(turnId)
     if (!lease) return
     this.activeAdaptiveTrialLeases.delete(turnId)
-    await this.adaptiveTrialLeases.release(lease).catch(() => undefined)
+    await this.turnLeases.release(lease).catch(() => undefined)
   }
 
-  private async releaseAdaptiveThreadLease(threadId: string, turnId: string): Promise<void> {
-    const active = this.activeAdaptiveThreadLeases.get(threadId)
+  private async releaseRetainedAdaptiveStartLease(threadId: string, turnId: string): Promise<void> {
+    const active = this.retainedAdaptiveStartLeases.get(threadId)
     if (!active || active.turnId !== turnId) return
-    this.activeAdaptiveThreadLeases.delete(threadId)
-    await this.adaptiveTrialLeases.release(active.lease).catch(() => undefined)
+    this.retainedAdaptiveStartLeases.delete(threadId)
+    await this.turnLeases.release(active.lease).catch(() => undefined)
+  }
+
+  private threadStatusAfterTurnMutation(turns: Turn[]): ThreadStatus {
+    return turns.some((turn) => turn.status === 'running') ? 'running' : 'idle'
   }
 
   /**

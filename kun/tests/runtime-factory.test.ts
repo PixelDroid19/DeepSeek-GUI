@@ -15,7 +15,7 @@ import {
   makeToolResultItem
 } from '../src/domain/item.js'
 import { UsageService } from '../src/services/usage-service.js'
-import { FileAdaptiveTrialLeaseStore } from '../src/services/adaptive-trial-lease.js'
+import { FileTurnLeaseStore } from '../src/services/adaptive-trial-lease.js'
 import { RuntimeEventRecorder } from '../src/services/runtime-event-recorder.js'
 import { TurnService } from '../src/services/turn-service.js'
 import { ContextCompactor } from '../src/loop/context-compactor.js'
@@ -124,6 +124,7 @@ function sharedFileTurnRuntime(dataDir: string, owner: string, turnSuffix?: stri
   const sessionStore = new FileSessionStore({ dataDir })
   const eventBus = new InMemoryEventBus()
   const nowIso = () => new Date().toISOString()
+  let generatedTurnCount = 0
   const turns = new TurnService({
     threadStore,
     sessionStore,
@@ -137,11 +138,18 @@ function sharedFileTurnRuntime(dataDir: string, owner: string, turnSuffix?: stri
     steering: new SteeringQueue(),
     compactor: new ContextCompactor({}),
     ids: turnSuffix
-      ? { next: (prefix) => `${prefix}_${turnSuffix}` }
+      ? {
+          next: (prefix) => {
+            generatedTurnCount += 1
+            return generatedTurnCount === 1
+              ? `${prefix}_${turnSuffix}`
+              : `${prefix}_${turnSuffix}_${generatedTurnCount}`
+          }
+        }
       : new SequentialIdGenerator(),
     nowIso,
     usage: new UsageService(),
-    adaptiveTrialLeases: new FileAdaptiveTrialLeaseStore({ dataDir, owner })
+    turnLeases: new FileTurnLeaseStore({ dataDir, owner })
   })
   return { threadStore, turns }
 }
@@ -402,7 +410,7 @@ describe('runtime factory usage carryover', () => {
 
       const owner = outcomes[0] === 'activated' ? first : second
       await owner.turns.finishTurn({ threadId, turnId: started.turnId, status: 'completed' })
-      const postFinishLeaseStore = new FileAdaptiveTrialLeaseStore({ dataDir, owner: 'post-finish-check' })
+      const postFinishLeaseStore = new FileTurnLeaseStore({ dataDir, owner: 'post-finish-check' })
       const released = await postFinishLeaseStore.acquire({ threadId, turnId: started.turnId })
       expect(released).not.toBeNull()
       if (released) {
@@ -455,7 +463,7 @@ describe('runtime factory usage carryover', () => {
         threadId,
         request: { prompt: 'adaptive start after owner release', harnessTask: ADAPTIVE_TASK }
       })
-      expect(retried.turnId).toBe(owner === first ? 'turn_second' : 'turn_first')
+      expect(retried.turnId).toBe(owner === first ? 'turn_second_2' : 'turn_first_2')
       await other.turns.interruptTurn({ threadId, turnId: retried.turnId })
     } finally {
       await rm(dataDir, { recursive: true, force: true })
@@ -503,7 +511,7 @@ describe('runtime factory usage carryover', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'kun-adaptive-legacy-turn-lease-'))
     const threadId = 'thr_legacy_adaptive_start'
     const legacyTurnId = 'turn_legacy'
-    const legacyLeaseStore = new FileAdaptiveTrialLeaseStore({ dataDir, owner: 'legacy-runtime' })
+    const legacyLeaseStore = new FileTurnLeaseStore({ dataDir, owner: 'legacy-runtime' })
     let legacyLease: Awaited<ReturnType<typeof legacyLeaseStore.acquire>> = null
     try {
       const runtime = sharedFileTurnRuntime(dataDir, 'new-runtime')
@@ -532,12 +540,123 @@ describe('runtime factory usage carryover', () => {
         request: { prompt: 'new adaptive work', harnessTask: ADAPTIVE_TASK }
       })).rejects.toThrow('adaptive harness trial requires exclusive thread execution')
 
-      const probe = new FileAdaptiveTrialLeaseStore({ dataDir, owner: 'thread-lease-probe' })
-      const releasedThreadLease = await probe.acquireThread({ threadId })
+      const probe = new FileTurnLeaseStore({ dataDir, owner: 'thread-lease-probe' })
+      const releasedThreadLease = await probe.acquireThread({ threadId, turnId: 'turn_probe' })
       expect(releasedThreadLease).not.toBeNull()
       if (releasedThreadLease) await probe.release(releasedThreadLease)
     } finally {
       if (legacyLease) await legacyLeaseStore.release(legacyLease)
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  it('serializes normal and adaptive starts in both directions and releases the next start', async () => {
+    const runRace = async (label: string, firstKind: 'adaptive' | 'normal') => {
+      const dataDir = await mkdtemp(join(tmpdir(), `kun-thread-start-${label}-`))
+      try {
+        const adaptive = sharedFileTurnRuntime(dataDir, `adaptive-${label}`, `adaptive_${label}`)
+        const normal = sharedFileTurnRuntime(dataDir, `normal-${label}`, `normal_${label}`)
+        const threadId = `thr_mixed_start_${label}`
+        await adaptive.threadStore.upsert(createThreadRecord({
+          id: threadId,
+          title: `Mixed start ${label}`,
+          workspace: '/tmp',
+          model: 'test-model'
+        }))
+        const start = (runtime: typeof adaptive, kind: 'adaptive' | 'normal') => runtime.turns.startTurn({
+          threadId,
+          request: kind === 'adaptive'
+            ? { prompt: `${kind} start`, harnessTask: ADAPTIVE_TASK }
+            : { prompt: `${kind} start` }
+        })
+        const firstRuntime = firstKind === 'adaptive' ? adaptive : normal
+        const secondRuntime = firstKind === 'adaptive' ? normal : adaptive
+        const secondKind = firstKind === 'adaptive' ? 'normal' : 'adaptive'
+        const starts = await Promise.allSettled([
+          start(firstRuntime, firstKind),
+          start(secondRuntime, secondKind)
+        ])
+        const acceptedIndex = starts.findIndex((startResult) => startResult.status === 'fulfilled')
+        const rejected = starts.find((startResult) => startResult.status === 'rejected')
+
+        expect(acceptedIndex).not.toBe(-1)
+        expect(rejected?.status).toBe('rejected')
+        if (acceptedIndex === -1 || starts[acceptedIndex]?.status !== 'fulfilled') {
+          throw new Error('expected one persisted start')
+        }
+        const owner = acceptedIndex === 0 ? firstRuntime : secondRuntime
+        const successor = owner === adaptive ? normal : adaptive
+        const persisted = await adaptive.threadStore.get(threadId)
+        expect(persisted?.turns).toHaveLength(1)
+        expect(persisted?.turns[0]?.id).toBe(starts[acceptedIndex].value.turnId)
+
+        await owner.turns.finishTurn({
+          threadId,
+          turnId: starts[acceptedIndex].value.turnId,
+          status: 'completed'
+        })
+        const next = await start(successor, successor === adaptive ? 'adaptive' : 'normal')
+        expect(next.turnId).toBeTruthy()
+        await successor.turns.finishTurn({ threadId, turnId: next.turnId, status: 'completed' })
+      } finally {
+        await rm(dataDir, { recursive: true, force: true })
+      }
+    }
+
+    await runRace('adaptive-first', 'adaptive')
+    await runRace('normal-first', 'normal')
+  })
+
+  it('lets a foreign interrupt revoke only its owner lease and preserve the aborted turn', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-foreign-interrupt-'))
+    try {
+      const owner = sharedFileTurnRuntime(dataDir, 'owner-runtime', 'owner')
+      const interrupter = sharedFileTurnRuntime(dataDir, 'interrupter-runtime', 'interrupter')
+      const threadId = 'thr_foreign_interrupt'
+      await owner.threadStore.upsert(createThreadRecord({
+        id: threadId,
+        title: 'Foreign interrupt',
+        workspace: '/tmp',
+        model: 'test-model'
+      }))
+      const started = await owner.turns.startTurn({
+        threadId,
+        request: { prompt: 'adaptive owner turn', harnessTask: ADAPTIVE_TASK }
+      })
+
+      await interrupter.turns.interruptTurn({ threadId, turnId: started.turnId })
+      expect((await owner.turns.getTurn(threadId, started.turnId))?.status).toBe('aborted')
+
+      await owner.turns.applyItem(threadId, makeAssistantTextItem({
+        id: 'item_stale_owner',
+        threadId,
+        turnId: started.turnId,
+        text: 'stale owner output'
+      }))
+      expect(await owner.turns.updateItem(threadId, `item_${started.turnId}_user`, {
+        text: 'stale owner rewrite'
+      })).toBeNull()
+      await owner.turns.finishTurn({ threadId, turnId: started.turnId, status: 'completed' })
+      const aborted = await owner.turns.getTurn(threadId, started.turnId)
+      expect(aborted?.status).toBe('aborted')
+      expect(aborted?.items.some((item) => item.id === 'item_stale_owner')).toBe(false)
+      expect(aborted?.items.find((item) => item.id === `item_${started.turnId}_user`)).toMatchObject({
+        text: 'adaptive owner turn'
+      })
+
+      const successor = await interrupter.turns.startTurn({
+        threadId,
+        request: { prompt: 'successor adaptive turn', harnessTask: ADAPTIVE_TASK }
+      })
+      await new FileTurnLeaseStore({ dataDir, owner: 'stale-revoker' })
+        .releaseThread({ threadId, turnId: started.turnId })
+      await interrupter.turns.interruptTurn({ threadId, turnId: started.turnId })
+      await expect(owner.turns.startTurn({
+        threadId,
+        request: { prompt: 'must not erase successor lease' }
+      })).rejects.toThrow('thread turn start is already active')
+      await interrupter.turns.finishTurn({ threadId, turnId: successor.turnId, status: 'completed' })
+    } finally {
       await rm(dataDir, { recursive: true, force: true })
     }
   })
@@ -575,6 +694,45 @@ describe('runtime factory usage carryover', () => {
       noProgressWindow: 2,
       readRediscoveryThreshold: 3
     })).toBeNull()
+  })
+
+  it('includes a mutation in the 129th file-change edit in the progress fingerprint', () => {
+    const firstEdits = Array.from({ length: 129 }, (_, index) => ({
+      oldText: `old-${index}`,
+      newText: `new-${index}`
+    }))
+    const secondEdits = firstEdits.map((edit) => ({ ...edit }))
+    secondEdits[128] = { ...secondEdits[128]!, newText: 'changed-at-129' }
+    const items = [
+      makeToolCallItem({
+        id: 'item_many_edits_first', threadId: 'thr_adaptive', turnId: 'turn_many_edits', callId: 'many_edits_first',
+        toolName: 'apply_patch', toolKind: 'file_change', arguments: { path: 'src/example.ts', edits: firstEdits }
+      }),
+      makeToolResultItem({
+        id: 'item_many_edits_first_result', threadId: 'thr_adaptive', turnId: 'turn_many_edits', callId: 'many_edits_first',
+        toolName: 'apply_patch', toolKind: 'file_change', output: { applied: true }
+      }),
+      makeToolCallItem({
+        id: 'item_many_edits_second', threadId: 'thr_adaptive', turnId: 'turn_many_edits', callId: 'many_edits_second',
+        toolName: 'apply_patch', toolKind: 'file_change', arguments: { path: 'src/example.ts', edits: secondEdits }
+      }),
+      makeToolResultItem({
+        id: 'item_many_edits_second_result', threadId: 'thr_adaptive', turnId: 'turn_many_edits', callId: 'many_edits_second',
+        toolName: 'apply_patch', toolKind: 'file_change', output: { applied: true }
+      })
+    ]
+
+    const observations = adaptiveObservationsForTurn(items, 'turn_many_edits', 2)
+
+    expect(observations[0]?.diffFingerprint).not.toBe(observations[1]?.diffFingerprint)
+    expect(detectStall(observations, {
+      maxObservations: 2,
+      repeatedActionThreshold: 2,
+      repeatedErrorThreshold: 3,
+      noProgressWindow: 2,
+      readRediscoveryThreshold: 3
+    })).toBeNull()
+    expect(JSON.stringify(observations)).not.toContain('changed-at-129')
   })
 
   it('bounds deeply nested and oversized file-change fingerprints without retaining raw content', () => {

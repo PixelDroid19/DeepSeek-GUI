@@ -68,7 +68,7 @@ import { KUN_SYSTEM_PROMPT } from '../prompt/kun-system-prompt.js'
 import { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
 import { ThreadService } from '../services/thread-service.js'
 import { TurnService } from '../services/turn-service.js'
-import { FileAdaptiveTrialLeaseStore } from '../services/adaptive-trial-lease.js'
+import { FileTurnLeaseStore } from '../services/adaptive-trial-lease.js'
 import { ReviewService } from '../services/review-service.js'
 import { UsageService } from '../services/usage-service.js'
 import type { UsageEvent } from '../contracts/events.js'
@@ -258,7 +258,7 @@ export async function createKunServeRuntime(
     ids,
     nowIso,
     usage: usageService,
-    adaptiveTrialLeases: new FileAdaptiveTrialLeaseStore({ dataDir: options.dataDir }),
+    turnLeases: new FileTurnLeaseStore({ dataDir: options.dataDir }),
     roles: rolesConfig
   })
   const threadService = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
@@ -766,11 +766,9 @@ function adaptiveObservation(input: {
 }
 
 /**
- * Hashes the complete string values of a bounded file-change structure and
- * returned diff/hash artifact without retaining raw file content in
- * observations. String bytes are fed to SHA-256 in bounded chunks, while
- * traversal itself remains iterative with deterministic depth/item/byte
- * overflow markers.
+ * Combines the full canonical file-change argument digest with a bounded
+ * returned diff/hash artifact. Raw file content is never retained in the
+ * observation; only the local digest traversal sees every supplied edit.
  */
 function fileChangeDiffFingerprint(
   contentDigest: string,
@@ -785,11 +783,10 @@ function fileChangeDiffFingerprint(
 }
 
 function fileChangeContentDigest(toolName: string, argumentsValue: Record<string, unknown>): string {
-  const writer = new BoundedDigestWriter(createHash('sha256'))
-  appendStableDigestValue(writer, 'tool', toolName)
-  appendStableDigestValue(writer, 'arguments', argumentsValue)
-  writer.finish()
-  return `sha256:${writer.digest('hex')}`
+  const hash = createHash('sha256')
+  appendCanonicalDigestText(hash, 'tool', toolName)
+  appendCanonicalDigestValue(hash, 'arguments', argumentsValue)
+  return `sha256:${hash.digest('hex')}`
 }
 
 function boundedFileChangeArguments(
@@ -826,6 +823,105 @@ function fileChangeArtifact(output: unknown): Record<string, unknown> | undefine
 type DigestFrame =
   | { kind: 'value'; label: string; value: unknown; depth: number }
   | { kind: 'text'; tag: string; value: string; sampled?: boolean }
+
+type CanonicalDigestFrame =
+  | { kind: 'value'; label: string; value: unknown }
+  | { kind: 'array'; value: unknown[]; index: number }
+  | { kind: 'object'; value: Record<string, unknown>; keys: string[]; index: number }
+
+/**
+ * File-change identity must include every supplied edit, even past the
+ * bounded observation limits. This traversal hashes only into a local SHA-256
+ * state; it never retains raw arguments in the adaptive observation.
+ */
+function appendCanonicalDigestValue(
+  hash: ReturnType<typeof createHash>,
+  label: string,
+  value: unknown
+): void {
+  const seen = new WeakSet<object>()
+  const frames: CanonicalDigestFrame[] = [{ kind: 'value', label, value }]
+  while (frames.length > 0) {
+    const frame = frames.pop()
+    if (!frame) continue
+    if (frame.kind === 'array') {
+      if (frame.index >= frame.value.length) continue
+      const index = frame.index
+      appendCanonicalDigestText(hash, 'index', String(index))
+      frames.push({ ...frame, index: index + 1 })
+      if (index in frame.value) {
+        frames.push({ kind: 'value', label: 'value', value: frame.value[index] })
+      } else {
+        appendCanonicalDigestText(hash, 'hole', '')
+      }
+      continue
+    }
+    if (frame.kind === 'object') {
+      if (frame.index >= frame.keys.length) continue
+      const key = frame.keys[frame.index]!
+      appendCanonicalDigestText(hash, 'key', key)
+      frames.push({ ...frame, index: frame.index + 1 })
+      frames.push({ kind: 'value', label: 'value', value: frame.value[key] })
+      continue
+    }
+    appendCanonicalDigestText(hash, 'label', frame.label)
+    if (frame.value === null) {
+      appendCanonicalDigestText(hash, 'null', '')
+      continue
+    }
+    if (frame.value === undefined) {
+      appendCanonicalDigestText(hash, 'undefined', '')
+      continue
+    }
+    if (typeof frame.value === 'string') {
+      appendCanonicalDigestText(hash, 'string', frame.value)
+      continue
+    }
+    if (typeof frame.value === 'boolean') {
+      appendCanonicalDigestText(hash, 'boolean', frame.value ? 'true' : 'false')
+      continue
+    }
+    if (typeof frame.value === 'number') {
+      appendCanonicalDigestText(hash, 'number', Number.isFinite(frame.value) ? String(frame.value) : '<non-finite>')
+      continue
+    }
+    if (typeof frame.value === 'bigint') {
+      appendCanonicalDigestText(hash, 'bigint', frame.value.toString())
+      continue
+    }
+    if (typeof frame.value !== 'object') {
+      appendCanonicalDigestText(hash, 'other', typeof frame.value)
+      continue
+    }
+    if (seen.has(frame.value)) {
+      appendCanonicalDigestText(hash, 'cycle', '')
+      continue
+    }
+    seen.add(frame.value)
+    if (Array.isArray(frame.value)) {
+      appendCanonicalDigestText(hash, 'array', String(frame.value.length))
+      frames.push({ kind: 'array', value: frame.value, index: 0 })
+      continue
+    }
+    const record = frame.value as Record<string, unknown>
+    const keys = Object.keys(record).sort()
+    appendCanonicalDigestText(hash, 'object', String(keys.length))
+    frames.push({ kind: 'object', value: record, keys, index: 0 })
+  }
+}
+
+function appendCanonicalDigestText(
+  hash: ReturnType<typeof createHash>,
+  kind: string,
+  value: string
+): void {
+  hash.update(`${kind}\u0000utf16_length:${value.length}\u0000`)
+  forEachUtf8Chunk(value, (chunk) => {
+    hash.update(`${Buffer.byteLength(chunk, 'utf8')}\u0000`)
+    hash.update(chunk, 'utf8')
+  })
+  hash.update('\u0000')
+}
 
 function appendStableDigestValue(
   writer: BoundedDigestWriter,
@@ -937,6 +1033,13 @@ function appendExactDigestText(writer: BoundedDigestWriter, tag: string, value: 
 
 function sha256Utf8Chunks(value: string): string {
   const hash = createHash('sha256')
+  forEachUtf8Chunk(value, (chunk) => {
+    hash.update(chunk, 'utf8')
+  })
+  return hash.digest('hex')
+}
+
+function forEachUtf8Chunk(value: string, consume: (chunk: string) => void): void {
   for (let start = 0; start < value.length;) {
     let end = Math.min(value.length, start + MAX_ADAPTIVE_DIGEST_STRING_CHUNK_CODE_UNITS)
     if (
@@ -947,10 +1050,9 @@ function sha256Utf8Chunks(value: string): string {
       end -= 1
     }
     if (end === start) end = Math.min(value.length, start + 2)
-    hash.update(value.slice(start, end), 'utf8')
+    consume(value.slice(start, end))
     start = end
   }
-  return hash.digest('hex')
 }
 
 function isHighSurrogate(code: number): boolean {
