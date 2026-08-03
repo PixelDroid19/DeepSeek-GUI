@@ -66,6 +66,7 @@ function makeRuntime(
     allocateSeq: (threadId) => eventBus.allocateSeq(threadId),
     nowIso
   })
+  const usage = new UsageService()
   const turns = new TurnService({
     threadStore,
     sessionStore,
@@ -75,6 +76,7 @@ function makeRuntime(
     compactor: new ContextCompactor({}),
     ids,
     nowIso,
+    usage,
     roles: { enabled: true }
   })
   const threads = new ThreadService({
@@ -90,7 +92,6 @@ function makeRuntime(
     pending: () => [],
     get: (_approvalId: string): ApprovalRequest | undefined => undefined
   }
-  const usage = new UsageService()
   const pipeline = new RigorousPipeline({
     threadStore,
     turns,
@@ -122,6 +123,7 @@ function makeTurnRuntimeWithRoles(enabled: boolean) {
     allocateSeq: (threadId) => eventBus.allocateSeq(threadId),
     nowIso
   })
+  const usage = new UsageService()
   const turns = new TurnService({
     threadStore,
     sessionStore,
@@ -131,6 +133,7 @@ function makeTurnRuntimeWithRoles(enabled: boolean) {
     compactor: new ContextCompactor({}),
     ids,
     nowIso,
+    usage,
     roles: { enabled }
   })
   const threads = new ThreadService({
@@ -1675,6 +1678,35 @@ describe('rigorous pipeline', () => {
     expect(status).toBe('failed')
     expect((await runtime.turns.getTurn(thread.id, turn.turnId))?.error).toContain('adaptive rigorous pipeline')
     await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('fails adaptive rigorous re-entry before a role can resend work', async () => {
+    let childCalls = 0
+    const runtime = makeRuntime(async () => {
+      childCalls += 1
+      return { summary: 'unexpected role invocation' }
+    })
+    const thread = await runtime.threads.create({
+      title: 'Adaptive re-entry', workspace: '/tmp', model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'resume adaptive work',
+        mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: [] },
+        harnessTask: { ...REQUIRED_HARNESS_TASK, executionPolicy: 'adaptive' }
+      }
+    })
+    expect(await runtime.turns.activateAdaptiveTrial({ threadId: thread.id, turnId: turn.turnId })).toBe('activated')
+
+    // A restarted runtime has no in-memory AdaptiveTrialState, only the
+    // durable `running` marker written before the original model request.
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect(childCalls).toBe(0)
+    expect((await runtime.turns.getTurn(thread.id, turn.turnId))?.error).toContain('adaptive trial state is unavailable')
   })
 
   it('atomically refuses concurrent starts when one turn is adaptive', async () => {

@@ -53,6 +53,25 @@ export const TurnStatus = z.enum([
 ])
 export type TurnStatus = z.infer<typeof TurnStatus>
 
+/**
+ * Durable protocol state for an adaptive harness turn. `ready` is written
+ * with the turn before any model request; `running` is atomically claimed by
+ * the runtime immediately before dispatch. A runtime without the live state
+ * must never resume a `running` marker.
+ */
+export const AdaptiveTrialMarkerSchema = z.object({
+  version: z.literal(1),
+  phase: z.enum(['ready', 'running']),
+  startedAtMs: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  usageBaseline: z.object({
+    promptTokens: z.number().int().nonnegative(),
+    completionTokens: z.number().int().nonnegative(),
+    turns: z.number().int().nonnegative(),
+    costUsd: z.number().nonnegative()
+  }).strict()
+}).strict()
+export type AdaptiveTrialMarker = z.infer<typeof AdaptiveTrialMarkerSchema>
+
 export const TurnSchema = z.object({
   id: z.string().min(1),
   threadId: z.string().min(1),
@@ -77,6 +96,8 @@ export const TurnSchema = z.object({
   planArtifact: PlannerArtifactSchema.optional(),
   /** Optional opt-in harness task; absent on normal interactive turns. */
   harnessTask: HarnessTaskSpecSchema.optional(),
+  /** Durable adaptive trial baseline and activation phase; never client-supplied. */
+  adaptiveTrialMarker: AdaptiveTrialMarkerSchema.optional(),
   /**
    * Optional per-turn mode override. When set, it takes precedence over
    * the thread mode for this turn (e.g. a Plan-mode turn inside an

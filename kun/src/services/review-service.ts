@@ -143,7 +143,8 @@ export class ReviewService {
       steering,
       compactor,
       ids,
-      nowIso
+      nowIso,
+      usage
     })
     const threads = new ThreadService({
       threadStore,

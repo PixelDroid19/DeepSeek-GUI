@@ -105,7 +105,8 @@ export function buildHarness(): Harness {
     steering,
     compactor,
     ids,
-    nowIso
+    nowIso,
+    usage
   })
   const threadService = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
   const model = makeModel([{ kind: 'completed', stopReason: 'stop' }])

@@ -9,6 +9,7 @@ import { appendTurnItem, createTurnRecord, startTurn } from '../src/domain/turn.
 import { createThreadRecord } from '../src/domain/thread.js'
 import { RuntimeEventRecorder } from '../src/services/runtime-event-recorder.js'
 import { TurnService } from '../src/services/turn-service.js'
+import { UsageService } from '../src/services/usage-service.js'
 import { InflightTracker } from '../src/loop/inflight-tracker.js'
 import { SteeringQueue } from '../src/loop/steering-queue.js'
 import { ContextCompactor } from '../src/loop/context-compactor.js'
@@ -301,7 +302,8 @@ describe('HybridThreadStore', () => {
       steering: new SteeringQueue(),
       compactor: new ContextCompactor(),
       ids: new SequentialIdGenerator(),
-      nowIso: () => '2026-06-04T00:00:02.000Z'
+      nowIso: () => '2026-06-04T00:00:02.000Z',
+      usage: new UsageService()
     })
   }
 

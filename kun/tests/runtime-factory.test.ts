@@ -17,8 +17,10 @@ import {
 } from '../src/server/runtime-factory.js'
 import type { UsageSnapshot } from '../src/contracts/usage.js'
 import type { HarnessTaskSpec } from '../src/contracts/harness.js'
-import type { Turn } from '../src/contracts/turns.js'
+import type { AdaptiveTrialMarker, Turn } from '../src/contracts/turns.js'
 import type { TurnItem } from '../src/contracts/items.js'
+import { detectStall } from '../src/orchestration/stall-detector.js'
+import { bootstrapThread, makeHarness, makeSilentModel } from './loop-test-harness.js'
 
 const ADAPTIVE_TASK: HarnessTaskSpec = {
   version: 1,
@@ -70,13 +72,32 @@ function usage(overrides: Partial<UsageSnapshot>): UsageSnapshot {
   }
 }
 
-function adaptiveTurn(id: string, items: TurnItem[] = []): Turn {
+function adaptiveMarker(phase: AdaptiveTrialMarker['phase'] = 'ready'): AdaptiveTrialMarker {
+  return {
+    version: 1,
+    phase,
+    startedAtMs: Date.parse('2026-08-03T00:00:00.000Z'),
+    usageBaseline: {
+      promptTokens: 100,
+      completionTokens: 20,
+      turns: 4,
+      costUsd: 0.2
+    }
+  }
+}
+
+function adaptiveTurn(
+  id: string,
+  items: TurnItem[] = [],
+  marker: AdaptiveTrialMarker = adaptiveMarker()
+): Turn {
   return {
     ...createTurnRecord({
       id,
       threadId: 'thr_adaptive',
       prompt: 'test adaptive trial',
       harnessTask: ADAPTIVE_TASK,
+      adaptiveTrialMarker: marker,
       status: 'running'
     }),
     items
@@ -198,17 +219,20 @@ describe('runtime factory usage carryover', () => {
     const coordinator = new AdaptiveTrialCoordinator()
     const first = coordinator.claim({
       threadId: 'thr_adaptive',
-      turn: adaptiveTurn('turn_first'),
-      usage: usage({ promptTokens: 100, completionTokens: 20, turns: 4, costUsd: 0.2 }),
-      nowIso: '2026-08-03T00:00:00.000Z'
+      turn: adaptiveTurn('turn_first')
     })
 
     expect(first.kind).toBe('acquired')
+    if (first.kind !== 'acquired') throw new Error('expected adaptive trial claim')
+    expect(first.state.trial.usageBaseline).toEqual({
+      promptTokens: 100,
+      completionTokens: 20,
+      turns: 4,
+      costUsd: 0.2
+    })
     const concurrent = coordinator.claim({
       threadId: 'thr_adaptive',
-      turn: adaptiveTurn('turn_second'),
-      usage: usage({}),
-      nowIso: '2026-08-03T00:00:00.000Z'
+      turn: adaptiveTurn('turn_second')
     })
     expect(concurrent).toEqual({ kind: 'concurrent', activeTurnId: 'turn_first' })
     coordinator.release('thr_adaptive', 'turn_first')
@@ -224,12 +248,17 @@ describe('runtime factory usage carryover', () => {
     })
     const reentry = coordinator.claim({
       threadId: 'thr_adaptive',
-      turn: adaptiveTurn('turn_reentry', [recoveryItem]),
-      usage: usage({}),
-      nowIso: '2026-08-03T00:00:00.000Z'
+      turn: adaptiveTurn('turn_reentry', [recoveryItem])
     })
 
     expect(reentry).toEqual({ kind: 'reentry_state_unavailable' })
+
+    const legacyReentry = coordinator.claim({
+      threadId: 'thr_adaptive',
+      turn: { ...adaptiveTurn('turn_legacy_reentry'), adaptiveTrialMarker: undefined }
+    })
+
+    expect(legacyReentry).toEqual({ kind: 'reentry_state_unavailable' })
 
     const resumedWithoutState = coordinator.claim({
       threadId: 'thr_adaptive',
@@ -238,9 +267,7 @@ describe('runtime factory usage carryover', () => {
         threadId: 'thr_adaptive',
         turnId: 'turn_untracked_reentry',
         text: 'response persisted before restart'
-      })]),
-      usage: usage({}),
-      nowIso: '2026-08-03T00:00:00.000Z'
+      })])
     })
 
     expect(resumedWithoutState).toEqual({ kind: 'reentry_state_unavailable' })
@@ -251,9 +278,7 @@ describe('runtime factory usage carryover', () => {
     const oversizedKey = 'oversized_key_'.repeat(10_000)
     const claim = coordinator.claim({
       threadId: 'thr_adaptive',
-      turn: adaptiveTurn('turn_incremental'),
-      usage: usage({}),
-      nowIso: '2026-08-03T00:00:00.000Z'
+      turn: adaptiveTurn('turn_incremental')
     })
     if (claim.kind !== 'acquired') throw new Error('expected adaptive trial claim')
 
@@ -278,5 +303,68 @@ describe('runtime factory usage carryover', () => {
     expect(claim.state.observations).toHaveLength(2)
     expect(claim.state.observations.map((entry) => entry.action?.name)).toEqual(['read', 'read'])
     expect(JSON.stringify(claim.state.observations).length).toBeLessThan(20_000)
+  })
+
+  it('fails closed after a restart window once the durable marker is activated before model dispatch', async () => {
+    const h = makeHarness(makeSilentModel())
+    await bootstrapThread(h)
+    await h.turns.finishTurn({ threadId: h.threadId, turnId: h.turnId, status: 'completed' })
+    h.usage.record(h.threadId, usage({ promptTokens: 100, completionTokens: 20, turns: 4, costUsd: 0.2 }))
+    const started = await h.turns.startTurn({
+      threadId: h.threadId,
+      request: { prompt: 'start adaptive trial', harnessTask: ADAPTIVE_TASK }
+    })
+
+    const ready = await h.turns.getTurn(h.threadId, started.turnId)
+    expect(ready?.adaptiveTrialMarker).toMatchObject({
+      phase: 'ready',
+      usageBaseline: { promptTokens: 100, completionTokens: 20, turns: 4, costUsd: 0.2 }
+    })
+    expect(await h.turns.activateAdaptiveTrial({ threadId: h.threadId, turnId: started.turnId })).toBe('activated')
+    expect(await h.turns.activateAdaptiveTrial({ threadId: h.threadId, turnId: started.turnId })).toBe('already_running')
+
+    // Simulate a process crash immediately after the marker write and before
+    // the first model chunk, item, or usage event can be persisted.
+    const restarted = new AdaptiveTrialCoordinator()
+    const persisted = await h.turns.getTurn(h.threadId, started.turnId)
+    if (!persisted) throw new Error('expected persisted adaptive turn')
+    expect(restarted.claim({ threadId: h.threadId, turn: persisted })).toEqual({
+      kind: 'reentry_state_unavailable'
+    })
+  })
+
+  it('uses a full file-change digest so same-path same-byte edits are progress', () => {
+    const sharedPrefix = 'x'.repeat(1_024)
+    const items = [
+      makeToolCallItem({
+        id: 'item_first_write', threadId: 'thr_adaptive', turnId: 'turn_diff', callId: 'write_first',
+        toolName: 'write', toolKind: 'file_change', arguments: { path: 'src/example.ts', content: `${sharedPrefix}A` }
+      }),
+      makeToolResultItem({
+        id: 'item_first_result', threadId: 'thr_adaptive', turnId: 'turn_diff', callId: 'write_first',
+        toolName: 'write', toolKind: 'file_change', output: { path: 'src/example.ts', bytes_written: 1_025 }
+      }),
+      makeToolCallItem({
+        id: 'item_second_write', threadId: 'thr_adaptive', turnId: 'turn_diff', callId: 'write_second',
+        toolName: 'write', toolKind: 'file_change', arguments: { path: 'src/example.ts', content: `${sharedPrefix}B` }
+      }),
+      makeToolResultItem({
+        id: 'item_second_result', threadId: 'thr_adaptive', turnId: 'turn_diff', callId: 'write_second',
+        toolName: 'write', toolKind: 'file_change', output: { path: 'src/example.ts', bytes_written: 1_025 }
+      })
+    ]
+
+    const observations = adaptiveObservationsForTurn(items, 'turn_diff', 2)
+
+    expect(observations.map((observation) => observation.diffFingerprint)).toHaveLength(2)
+    expect(observations[0]?.diffFingerprint).not.toBe(observations[1]?.diffFingerprint)
+    expect(JSON.stringify(observations)).not.toContain(sharedPrefix)
+    expect(detectStall(observations, {
+      maxObservations: 2,
+      repeatedActionThreshold: 2,
+      repeatedErrorThreshold: 3,
+      noProgressWindow: 2,
+      readRediscoveryThreshold: 3
+    })).toBeNull()
   })
 })

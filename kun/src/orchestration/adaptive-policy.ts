@@ -1,4 +1,5 @@
 import type { HarnessAdaptivePolicy, HarnessTaskSpec, HarnessTrialBudgets } from '../contracts/harness.js'
+import type { AdaptiveTrialMarker } from '../contracts/turns.js'
 import {
   DEFAULT_HARNESS_ADAPTIVE_POLICY
 } from '../contracts/harness.js'
@@ -63,6 +64,24 @@ export type AdaptiveTrialState = {
   startedAtMs: number
   usageBaseline: AdaptiveTrialUsageBaseline
   recovery: AdaptiveRecoveryState
+}
+
+/** Rehydrates the in-memory controller state from the durable turn marker. */
+export function adaptiveTrialStateFromMarker(marker: AdaptiveTrialMarker): AdaptiveTrialState {
+  return {
+    startedAtMs: marker.startedAtMs,
+    usageBaseline: {
+      promptTokens: marker.usageBaseline.promptTokens,
+      completionTokens: marker.usageBaseline.completionTokens,
+      turns: marker.usageBaseline.turns,
+      costUsd: marker.usageBaseline.costUsd
+    },
+    recovery: {
+      recoveryRounds: 0,
+      stage: 'initial',
+      attemptedActionSignatures: []
+    }
+  }
 }
 
 export type RecoveryAction = {

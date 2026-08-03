@@ -74,7 +74,8 @@ export function createChildAgentExecutor(options: ChildAgentExecutorOptions): Ch
       steering,
       compactor,
       ids,
-      nowIso
+      nowIso,
+      usage
     })
     const threads = new ThreadService({
       threadStore,

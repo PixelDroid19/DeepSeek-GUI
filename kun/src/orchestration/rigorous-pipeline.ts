@@ -36,6 +36,7 @@ import {
   type TrustedEvidenceRecord
 } from './completion-gate.js'
 import {
+  adaptiveTrialStateFromMarker,
   adaptiveTrialUsageSince,
   advanceAdaptiveRecoveryState,
   chooseRecovery,
@@ -156,15 +157,56 @@ export class RigorousPipeline {
         ? turn.model?.trim() || thread.model
         : undefined
       const roleModel = pinnedHarnessModel ?? thread.model
-      const runStartedAtMs = this.nowMs()
-      const runStartingUsage = this.deps.usage.forThread(threadId)
-      const adaptiveBudget = turn.harnessTask?.executionPolicy === 'adaptive'
-        ? {
+      let adaptiveBudget: AdaptiveTrialBudgetTracker | undefined
+      if (turn.harnessTask?.executionPolicy === 'adaptive') {
+        const marker = turn.adaptiveTrialMarker
+        if (!marker) {
+          await this.deps.turns.finishTurn({
+            threadId,
+            turnId,
+            status: 'failed',
+            error: 'adaptive trial marker is unavailable before rigorous dispatch'
+          })
+          return 'failed'
+        }
+        if (adaptiveTrial) {
+          if (marker.phase !== 'running') {
+            await this.deps.turns.finishTurn({
+              threadId,
+              turnId,
+              status: 'failed',
+              error: 'adaptive trial marker was not activated before rigorous dispatch'
+            })
+            return 'failed'
+          }
+          adaptiveBudget = { task: turn.harnessTask, trial: adaptiveTrial, startedRoles: 0 }
+        } else {
+          if (marker.phase !== 'ready') {
+            await this.deps.turns.finishTurn({
+              threadId,
+              turnId,
+              status: 'failed',
+              error: 'adaptive trial state is unavailable for rigorous re-entry'
+            })
+            return 'failed'
+          }
+          const activation = await this.deps.turns.activateAdaptiveTrial({ threadId, turnId })
+          if (activation !== 'activated') {
+            await this.deps.turns.finishTurn({
+              threadId,
+              turnId,
+              status: 'failed',
+              error: 'adaptive trial state is unavailable before rigorous dispatch'
+            })
+            return 'failed'
+          }
+          adaptiveBudget = {
             task: turn.harnessTask,
-            trial: adaptiveTrial ?? createAdaptiveTrialState(runStartedAtMs, runStartingUsage),
+            trial: adaptiveTrialStateFromMarker(marker),
             startedRoles: 0
           }
-        : undefined
+        }
+      }
       let plan = turn.planArtifact
       if (!plan) {
         const planned = await this.runRole({
@@ -1467,23 +1509,6 @@ function hasRecordableChildUsage(
     usage.totalTokens > 0 ||
     (usage.turns ?? 0) > 0 ||
     (usage.costUsd ?? 0) > 0
-}
-
-function createAdaptiveTrialState(startedAtMs: number, usage: UsageSnapshot): AdaptiveTrialState {
-  return {
-    startedAtMs,
-    usageBaseline: {
-      promptTokens: usage.promptTokens,
-      completionTokens: usage.completionTokens,
-      turns: usage.turns,
-      costUsd: usage.costUsd ?? 0
-    },
-    recovery: {
-      recoveryRounds: 0,
-      stage: 'initial',
-      attemptedActionSignatures: []
-    }
-  }
 }
 
 function requireAdaptiveBudget(

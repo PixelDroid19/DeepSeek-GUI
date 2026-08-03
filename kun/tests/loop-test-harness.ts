@@ -115,7 +115,8 @@ export function makeHarness(
     steering,
     compactor,
     ids,
-    nowIso
+    nowIso,
+    usage
   })
   const threads = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
   const loop = new AgentLoop({

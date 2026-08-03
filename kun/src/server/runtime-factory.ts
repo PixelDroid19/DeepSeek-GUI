@@ -1,4 +1,5 @@
 import { mkdir } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { buildRouter } from './routes/index.js'
 import type { ServerRuntime } from './routes/server-runtime.js'
@@ -81,6 +82,7 @@ import { createChildAgentExecutor } from '../delegation/child-agent-executor.js'
 import { RigorousPipeline } from '../orchestration/rigorous-pipeline.js'
 import {
   adaptivePolicyForTask,
+  adaptiveTrialStateFromMarker,
   adaptiveTrialUsageSince,
   decideAdaptiveEscalation,
   type AdaptiveTrialState,
@@ -149,8 +151,8 @@ export type AdaptiveTrialClaim =
 
 /**
  * Keeps opt-in adaptive state turn-local and refuses ambiguous recovery after
- * a process/runtime re-entry. Durable review items provide the re-entry marker;
- * live state is never silently recreated after recovery already started.
+ * a process/runtime re-entry. The durable turn marker is activated before
+ * model dispatch; live state is never silently recreated after that point.
  */
 export class AdaptiveTrialCoordinator {
   private readonly activeTurnByThread = new Map<string, string>()
@@ -158,8 +160,6 @@ export class AdaptiveTrialCoordinator {
   claim(input: {
     threadId: string
     turn: Turn
-    usage: UsageSnapshot
-    nowIso: string
   }): AdaptiveTrialClaim {
     const activeTurnId = this.activeTurnByThread.get(input.threadId)
     if (activeTurnId) return { kind: 'concurrent', activeTurnId }
@@ -167,12 +167,13 @@ export class AdaptiveTrialCoordinator {
     if (!task || task.executionPolicy !== 'adaptive') {
       throw new Error('adaptive trial coordinator requires an adaptive harness task')
     }
-    if (adaptiveReentryStateUnavailable(input.turn.items)) {
+    const marker = input.turn.adaptiveTrialMarker
+    if (!marker || marker.phase === 'running' || adaptiveReentryStateUnavailable(input.turn.items)) {
       return { kind: 'reentry_state_unavailable' }
     }
     const maxObservations = boundedObservationCapacity(adaptivePolicyForTask(task).maxObservations)
     const state: AdaptiveTrialRuntimeState = {
-      trial: newAdaptiveTrialState(input.nowIso, input.usage),
+      trial: adaptiveTrialStateFromMarker(marker),
       observations: adaptiveObservationsForTurn(input.turn.items, input.turn.id, maxObservations),
       maxObservations
     }
@@ -249,6 +250,7 @@ export async function createKunServeRuntime(
     compactor,
     ids,
     nowIso,
+    usage: usageService,
     roles: rolesConfig
   })
   const threadService = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
@@ -510,9 +512,7 @@ export async function createKunServeRuntime(
         }
         const claim = adaptiveTrials.claim({
           threadId,
-          turn,
-          usage: usageService.forThread(threadId),
-          nowIso: nowIso()
+          turn
         })
         if (claim.kind === 'concurrent') {
           if (claim.activeTurnId === turnId) return 'failed'
@@ -555,6 +555,16 @@ export async function createKunServeRuntime(
           return 'failed' as const
         }
         try {
+          const activation = await turnService.activateAdaptiveTrial({ threadId, turnId })
+          if (activation !== 'activated') {
+            await turnService.finishTurn({
+              threadId,
+              turnId,
+              status: 'failed',
+              error: 'adaptive trial state is unavailable before model dispatch'
+            })
+            return 'failed'
+          }
           const decision = decideForCurrentTurn()
           if (decision.kind === 'fail') {
             await turnService.finishTurn({
@@ -732,33 +742,149 @@ function adaptiveObservation(input: {
   arguments: Record<string, unknown>
   result?: Extract<TurnItem, { kind: 'tool_result' }>
 }): StallObservation {
+  const result = input.result
+  const completedFileChange = input.toolKind === 'file_change' && result && !result.isError
+  const contentDigest = input.toolKind === 'file_change'
+    ? fileChangeContentDigest(input.toolName, input.arguments)
+    : undefined
   return {
     action: {
       kind: adaptiveActionKind(input.toolName, input.toolKind),
       name: input.toolName.slice(0, 256),
-      arguments: boundedObservationArguments(input.arguments)
+      arguments: contentDigest
+        ? boundedFileChangeArguments(input.arguments, contentDigest)
+        : boundedObservationArguments(input.arguments)
     },
-    ...(input.result?.isError
-      ? { command: { exitCode: 1, error: boundedToolObservation(input.result.output) } }
-      : input.result ? { evidenceFingerprint: boundedToolObservation(input.result.output) } : {})
+    ...(completedFileChange
+      ? { diffFingerprint: fileChangeDiffFingerprint(contentDigest!, result.output) }
+      : {}),
+    ...(result?.isError
+      ? { command: { exitCode: 1, error: boundedToolObservation(result.output) } }
+      : result ? { evidenceFingerprint: boundedToolObservation(result.output) } : {})
   }
 }
 
-function newAdaptiveTrialState(now: string, usage: UsageSnapshot): AdaptiveTrialState {
-  return {
-    startedAtMs: toEpochMs(now),
-    usageBaseline: {
-      promptTokens: usage.promptTokens,
-      completionTokens: usage.completionTokens,
-      turns: usage.turns,
-      costUsd: usage.costUsd ?? 0
-    },
-    recovery: {
-      recoveryRounds: 0,
-      stage: 'initial',
-      attemptedActionSignatures: []
-    }
+/**
+ * Hashes the full file-change request and any returned diff/hash artifact
+ * without retaining raw file content in adaptive observations. Unlike the
+ * bounded action summary, this digest changes when edits differ after a long
+ * shared prefix or have the same path and byte count.
+ */
+function fileChangeDiffFingerprint(
+  contentDigest: string,
+  output: unknown
+): string {
+  const hash = createHash('sha256')
+  appendDigestText(hash, 'content_digest', contentDigest)
+  const artifact = fileChangeArtifact(output)
+  if (artifact !== undefined) appendStableDigestValue(hash, 'artifact', artifact)
+  return `sha256:${hash.digest('hex')}`
+}
+
+function fileChangeContentDigest(toolName: string, argumentsValue: Record<string, unknown>): string {
+  const hash = createHash('sha256')
+  appendStableDigestValue(hash, 'tool', toolName)
+  appendStableDigestValue(hash, 'arguments', argumentsValue)
+  return `sha256:${hash.digest('hex')}`
+}
+
+function boundedFileChangeArguments(
+  argumentsValue: Record<string, unknown>,
+  contentDigest: string
+): Record<string, unknown> {
+  const bounded = boundedObservationArguments(argumentsValue)
+  for (const key of [
+    'content',
+    'markdown',
+    'oldText',
+    'newText',
+    'old_text',
+    'new_text',
+    'edits',
+    'patch',
+    'diff'
+  ]) {
+    delete bounded[key]
   }
+  return { ...bounded, content_digest: contentDigest }
+}
+
+function fileChangeArtifact(output: unknown): Record<string, unknown> | undefined {
+  if (!output || typeof output !== 'object' || Array.isArray(output)) return undefined
+  const record = output as Record<string, unknown>
+  const artifact: Record<string, unknown> = {}
+  for (const key of ['diff', 'patch', 'content_hash', 'contentHash', 'hash', 'sha256']) {
+    if (Object.prototype.hasOwnProperty.call(record, key)) artifact[key] = record[key]
+  }
+  return Object.keys(artifact).length > 0 ? artifact : undefined
+}
+
+function appendStableDigestValue(
+  hash: ReturnType<typeof createHash>,
+  label: string,
+  value: unknown,
+  seen = new WeakSet<object>()
+): void {
+  appendDigestText(hash, 'label', label)
+  if (value === null) {
+    appendDigestText(hash, 'null', '')
+    return
+  }
+  if (value === undefined) {
+    appendDigestText(hash, 'undefined', '')
+    return
+  }
+  if (typeof value === 'string') {
+    appendDigestText(hash, 'string', value)
+    return
+  }
+  if (typeof value === 'boolean') {
+    appendDigestText(hash, 'boolean', value ? 'true' : 'false')
+    return
+  }
+  if (typeof value === 'number') {
+    appendDigestText(hash, 'number', Number.isFinite(value) ? String(value) : '<non-finite>')
+    return
+  }
+  if (typeof value === 'bigint') {
+    appendDigestText(hash, 'bigint', value.toString())
+    return
+  }
+  if (typeof value !== 'object') {
+    appendDigestText(hash, 'other', typeof value)
+    return
+  }
+  if (seen.has(value)) {
+    appendDigestText(hash, 'cycle', '')
+    return
+  }
+  seen.add(value)
+  if (Array.isArray(value)) {
+    appendDigestText(hash, 'array', String(value.length))
+    for (let index = 0; index < value.length; index += 1) {
+      appendDigestText(hash, 'index', String(index))
+      if (index in value) appendStableDigestValue(hash, 'value', value[index], seen)
+      else appendDigestText(hash, 'hole', '')
+    }
+    return
+  }
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record).sort()
+  appendDigestText(hash, 'object', String(keys.length))
+  for (const key of keys) {
+    appendDigestText(hash, 'key', key)
+    appendStableDigestValue(hash, 'value', record[key], seen)
+  }
+}
+
+function appendDigestText(
+  hash: ReturnType<typeof createHash>,
+  kind: string,
+  value: string
+): void {
+  hash.update(`${kind}:${Buffer.byteLength(value, 'utf8')}:`)
+  hash.update(value)
+  hash.update('\n')
 }
 
 function adaptiveRecoveryBudget(

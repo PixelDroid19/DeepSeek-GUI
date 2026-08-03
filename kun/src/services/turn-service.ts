@@ -1,6 +1,16 @@
 import type { ThreadRecord, ThreadStatus } from '../contracts/threads.js'
-import type { CompactRequest, CompactResponse, StartTurnRequest, StartTurnResponse, Turn, TurnStatus } from '../contracts/turns.js'
+import {
+  AdaptiveTrialMarkerSchema,
+  type AdaptiveTrialMarker,
+  type CompactRequest,
+  type CompactResponse,
+  type StartTurnRequest,
+  type StartTurnResponse,
+  type Turn,
+  type TurnStatus
+} from '../contracts/turns.js'
 import type { TurnItem } from '../contracts/items.js'
+import type { UsageSnapshot } from '../contracts/usage.js'
 import type { SessionStore } from '../ports/session-store.js'
 import type { ThreadStore } from '../ports/thread-store.js'
 import type { IdGenerator } from '../ports/id-generator.js'
@@ -15,6 +25,7 @@ import type { RolesConfig } from '../config/kun-config.js'
 import { PlannerArtifactSchema } from '../contracts/roles.js'
 import type { HarnessTaskSpec } from '../contracts/harness.js'
 import { HarnessTaskSpecSchema } from '../contracts/harness.js'
+import type { UsageService } from './usage-service.js'
 
 export type TurnServiceDeps = {
   threadStore: ThreadStore
@@ -25,6 +36,7 @@ export type TurnServiceDeps = {
   compactor: ContextCompactor
   ids: IdGenerator
   nowIso: () => string
+  usage: Pick<UsageService, 'forThread'>
   roles?: RolesConfig
 }
 
@@ -63,6 +75,12 @@ export class TurnService {
     if (harnessTask?.executionPolicy === 'adaptive' && (input.request.mode === 'plan' || thread.mode === 'plan')) {
       throw new Error('adaptive harness trials are unavailable in plan mode')
     }
+    const adaptiveTrialMarker = harnessTask?.executionPolicy === 'adaptive'
+      ? this.createReadyAdaptiveTrialMarker(
+          this.deps.nowIso(),
+          this.deps.usage.forThread(input.threadId)
+        )
+      : undefined
     const turnId = this.deps.ids.next('turn')
     const turn = createTurnRecord({
       id: turnId,
@@ -76,6 +94,7 @@ export class TurnService {
         ? PlannerArtifactSchema.parse(input.request.planArtifact)
         : undefined,
       harnessTask,
+      adaptiveTrialMarker,
       mode: input.request.mode
     })
     const userItem = makeUserItem({
@@ -117,6 +136,42 @@ export class TurnService {
     })
     this.deps.steering.setTurn(turnId)
     return { threadId: input.threadId, turnId, userMessageItemId: userItem.id }
+  }
+
+  /**
+   * Atomically changes a fresh adaptive marker to `running` before a caller
+   * can dispatch a model request. A second runtime observing the marker must
+   * fail closed instead of recreating a trial baseline.
+   */
+  async activateAdaptiveTrial(input: {
+    threadId: string
+    turnId: string
+  }): Promise<'activated' | 'already_running' | 'unavailable'> {
+    let outcome: 'activated' | 'already_running' | 'unavailable' = 'unavailable'
+    await this.upsertThread(input.threadId, (current) => {
+      const turn = current.turns.find((candidate) => candidate.id === input.turnId)
+      if (
+        !turn ||
+        turn.status !== 'running' ||
+        turn.harnessTask?.executionPolicy !== 'adaptive' ||
+        !turn.adaptiveTrialMarker
+      ) {
+        return current
+      }
+      if (turn.adaptiveTrialMarker.phase === 'running') {
+        outcome = 'already_running'
+        return current
+      }
+      outcome = 'activated'
+      const marker = { ...turn.adaptiveTrialMarker, phase: 'running' as const }
+      return {
+        ...current,
+        turns: current.turns.map((candidate) =>
+          candidate.id === input.turnId ? { ...candidate, adaptiveTrialMarker: marker } : candidate
+        )
+      }
+    })
+    return outcome
   }
 
   async steerTurn(input: { threadId: string; turnId: string; text: string }): Promise<void> {
@@ -385,6 +440,24 @@ export class TurnService {
     if (adaptiveTurnRunning || (harnessTask?.executionPolicy === 'adaptive' && runningTurns.length > 0)) {
       throw new Error('adaptive harness trial requires exclusive thread execution')
     }
+  }
+
+  private createReadyAdaptiveTrialMarker(
+    nowIso: string,
+    usage: UsageSnapshot
+  ): AdaptiveTrialMarker {
+    const parsed = Date.parse(nowIso)
+    return AdaptiveTrialMarkerSchema.parse({
+      version: 1,
+      phase: 'ready',
+      startedAtMs: Number.isFinite(parsed) ? Math.max(0, parsed) : 0,
+      usageBaseline: {
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+        turns: usage.turns,
+        costUsd: usage.costUsd ?? 0
+      }
+    })
   }
 
   private finalizeOpenItems(
