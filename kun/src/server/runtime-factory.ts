@@ -78,6 +78,9 @@ import { FileMemoryStore } from '../memory/memory-store.js'
 import { DelegationRuntime, FileDelegationStore } from '../delegation/delegation-runtime.js'
 import { createChildAgentExecutor } from '../delegation/child-agent-executor.js'
 import { RigorousPipeline } from '../orchestration/rigorous-pipeline.js'
+import { decideAdaptiveEscalation } from '../orchestration/adaptive-policy.js'
+import type { StallActionKind, StallObservation } from '../orchestration/stall-detector.js'
+import type { TurnItem } from '../contracts/items.js'
 import { EvalSuiteStore } from '../evals/eval-suite-store.js'
 import { buildEvalToolProviders } from '../evals/eval-tool-provider.js'
 
@@ -408,6 +411,39 @@ export async function createKunServeRuntime(
     ...(memoryStore ? { memoryStore } : {}),
     async runTurn(threadId, turnId) {
       const turn = await turnService.getTurn(threadId, turnId)
+      const thread = turn?.harnessTask?.executionPolicy === 'adaptive'
+        ? await threadStore.get(threadId)
+        : undefined
+      if (turn?.harnessTask?.executionPolicy === 'adaptive' && turn.mode !== 'plan' && thread?.mode !== 'plan') {
+        const items = await sessionStore.loadItems(threadId)
+        const usage = usageService.forThread(threadId)
+        const decision = decideAdaptiveEscalation({
+          task: turn.harnessTask,
+          history: adaptiveObservations(items),
+          budget: {
+            limits: turn.harnessTask.budgets,
+            elapsedWallTimeMs: elapsedTurnMs(turn.startedAt ?? turn.createdAt, nowIso()),
+            modelSteps: usage.turns,
+            costUsd: usage.costUsd ?? 0,
+            recoveryRounds: 0,
+            stage: 'initial',
+            attemptedActionSignatures: []
+          }
+        })
+        if (decision.kind === 'fail') {
+          await turnService.finishTurn({
+            threadId,
+            turnId,
+            status: 'failed',
+            error: `adaptive recovery stopped: ${decision.action.failure ?? 'invalid_stage'}`
+          })
+          return 'failed'
+        }
+        if (decision.kind === 'rigorous') {
+          const status = await rigorousPipeline.run(threadId, turnId, decision.signal)
+          return status === 'fallback' ? loop.runTurn(threadId, turnId) : status
+        }
+      }
       if (turn?.mode === 'rigorous') {
         const status = await rigorousPipeline.run(threadId, turnId)
         return status === 'fallback' ? loop.runTurn(threadId, turnId) : status
@@ -458,6 +494,48 @@ export async function createKunServeRuntime(
       }
     }
   }
+}
+
+function adaptiveObservations(items: readonly TurnItem[]): StallObservation[] {
+  const resultsByCallId = new Map<string, Extract<TurnItem, { kind: 'tool_result' }>>()
+  for (const item of items) {
+    if (item.kind === 'tool_result') resultsByCallId.set(item.callId, item)
+  }
+  return items.flatMap((item): StallObservation[] => {
+    if (item.kind !== 'tool_call') return []
+    const result = resultsByCallId.get(item.callId)
+    return [{
+      action: {
+        kind: adaptiveActionKind(item),
+        name: item.toolName,
+        arguments: item.arguments
+      },
+      ...(result?.isError
+        ? { command: { exitCode: 1, error: boundedToolObservation(result.output) } }
+        : result ? { evidenceFingerprint: boundedToolObservation(result.output) } : {})
+    }]
+  })
+}
+
+function adaptiveActionKind(item: Extract<TurnItem, { kind: 'tool_call' }>): StallActionKind {
+  if (item.toolKind === 'file_change') return 'write'
+  if (item.toolKind === 'command_execution') return 'command'
+  return ['read', 'grep', 'find', 'ls'].includes(item.toolName) ? 'read' : 'tool'
+}
+
+function boundedToolObservation(output: unknown): string {
+  if (typeof output === 'string') return output.slice(0, 4_000)
+  try {
+    return JSON.stringify(output).slice(0, 4_000)
+  } catch {
+    return 'unserializable tool error'
+  }
+}
+
+function elapsedTurnMs(startedAt: string, nowIso: string): number {
+  const start = Date.parse(startedAt)
+  const now = Date.parse(nowIso)
+  return Number.isFinite(start) && Number.isFinite(now) ? Math.max(0, now - start) : 0
 }
 
 function tokenEconomyConfigForOptions(

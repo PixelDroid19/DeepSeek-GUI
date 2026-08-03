@@ -23,6 +23,7 @@ import { EvalSuiteStore } from '../src/evals/eval-suite-store.js'
 import { LocalToolHost } from '../src/adapters/tool/local-tool-host.js'
 import { VerificationCriterionResultSchema } from '../src/contracts/roles.js'
 import type { HarnessTaskSpec } from '../src/contracts/harness.js'
+import type { StallSignal } from '../src/orchestration/stall-detector.js'
 
 const REQUIRED_HARNESS_TASK: HarnessTaskSpec = {
   version: 1,
@@ -474,6 +475,82 @@ describe('rigorous pipeline', () => {
     expect(reviewerRuns).toBe(2)
     expect(items).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'assistant_text', text: expect.stringContaining('ship') })
+    ]))
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('runs one bounded adaptive recovery sequence with a new critic hypothesis', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-adaptive-recovery-'))
+    await execFileAsync('git', ['init', '--quiet', workspace])
+    const roles: string[] = []
+    const models: Array<string | undefined> = []
+    let reviewerRuns = 0
+    const child: ChildRunExecutor = async (input) => {
+      roles.push(input.label ?? '')
+      models.push(input.model)
+      if (input.artifactKind === 'execution') {
+        return { summary: 'execution', artifact: { summary: 'changed', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return { summary: 'verification', artifact: { findings: [], criteriaResults: [], commandsRun: [] } }
+      }
+      reviewerRuns += 1
+      if (reviewerRuns === 1) {
+        return { summary: 'review', artifact: { verdict: 'fix', reasons: ['initial diagnosis'] } }
+      }
+      if (reviewerRuns === 2) {
+        return { summary: 'critic', artifact: { verdict: 'fix', reasons: ['new hypothesis: isolate the failed state'] } }
+      }
+      return { summary: 'review', artifact: { verdict: 'ship', reasons: ['fixed'] } }
+    }
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({
+      title: 'Adaptive recovery', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'recover the task',
+        model: 'harness-pinned-model',
+        mode: 'rigorous',
+        planArtifact: { intent: 'recover', risks: [], steps: ['fix'], verificationCriteria: [] },
+        harnessTask: {
+          ...REQUIRED_HARNESS_TASK,
+          executionPolicy: 'adaptive',
+          acceptanceCriteria: [{
+            id: 'optional',
+            description: 'optional',
+            required: false,
+            acceptedEvidenceKinds: ['command']
+          }]
+        }
+      }
+    })
+    const stall: StallSignal = {
+      reason: 'repeated_action',
+      signature: 'stall:repeat',
+      observationCount: 3,
+      retainedObservationCount: 3,
+      actionSignature: 'action:repeat'
+    }
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId, stall)
+
+    expect(status).toBe('completed')
+    expect(roles).toEqual([
+      'rigorous:executor',
+      'rigorous:verifier',
+      'rigorous:reviewer',
+      'rigorous:reviewer',
+      'rigorous:executor',
+      'rigorous:verifier',
+      'rigorous:reviewer'
+    ])
+    expect(models).toEqual(models.map(() => 'harness-pinned-model'))
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'review', title: 'Adaptive recovery checkpoint' }),
+      expect.objectContaining({ kind: 'review', title: 'Adaptive recovery hypothesis accepted' })
     ]))
     await rm(workspace, { recursive: true, force: true })
   })

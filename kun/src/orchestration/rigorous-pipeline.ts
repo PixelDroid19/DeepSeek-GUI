@@ -35,7 +35,14 @@ import {
   type CompletionGateResult,
   type TrustedEvidenceRecord
 } from './completion-gate.js'
+import {
+  chooseRecovery,
+  type RecoveryAction,
+  type RecoveryBudget,
+  type RecoveryFailure
+} from './adaptive-policy.js'
 import { ROLE_PROFILES, resolveRoleModel, roleEnabled } from './role-profiles.js'
+import type { StallSignal } from './stall-detector.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -73,6 +80,11 @@ type GitCaptureOutput =
   | { ok: true; stdout: string }
   | { ok: false }
 
+type AdaptiveRecoveryResult =
+  | { status: 'completed'; hypothesis: string }
+  | { status: 'aborted' }
+  | { status: 'failed'; failure: RecoveryFailure }
+
 export type RigorousPipelineDeps = {
   threadStore: ThreadStore
   turns: TurnService
@@ -95,7 +107,7 @@ export type RigorousPipelineDeps = {
 export class RigorousPipeline {
   constructor(private readonly deps: RigorousPipelineDeps) {}
 
-  async run(threadId: string, turnId: string): Promise<PipelineStatus> {
+  async run(threadId: string, turnId: string, adaptiveSignal?: StallSignal): Promise<PipelineStatus> {
     const signal = this.deps.turns.getAbortController(turnId)
     if (!signal) {
       await this.deps.turns.finishTurn({
@@ -116,13 +128,20 @@ export class RigorousPipeline {
       if (!thread || !turn) throw new Error('rigorous pipeline missing thread or turn')
       const workspace = thread.workspace ?? ''
       const request = turn.prompt
+      const pinnedHarnessModel = turn.harnessTask
+        ? turn.model?.trim() || thread.model
+        : undefined
+      const roleModel = pinnedHarnessModel ?? thread.model
+      const runStartedAtMs = toEpochMs(this.deps.nowIso())
+      const runStartingUsage = this.deps.usage.forThread(threadId)
       let plan = turn.planArtifact
       if (!plan) {
         const planned = await this.runRole({
           role: 'planner',
           kind: 'plan',
           prompt: plannerPrompt(request),
-          threadModel: thread.model,
+          threadModel: roleModel,
+          ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
           threadId,
           turnId,
           workspace,
@@ -146,7 +165,8 @@ export class RigorousPipeline {
         threadId,
         turnId,
         workspace,
-        threadModel: thread.model,
+        threadModel: roleModel,
+        ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
         request,
         plan,
         signal
@@ -161,7 +181,8 @@ export class RigorousPipeline {
         threadId,
         turnId,
         workspace,
-        threadModel: thread.model,
+        threadModel: roleModel,
+        ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
         request,
         plan,
         execution: firstExecution.artifact,
@@ -187,7 +208,8 @@ export class RigorousPipeline {
         threadId,
         turnId,
         workspace,
-        threadModel: thread.model,
+        threadModel: roleModel,
+        ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
         plan,
         verification: firstVerification.artifact,
         verificationRawText: firstVerification.rawText,
@@ -230,15 +252,57 @@ export class RigorousPipeline {
       })
       await this.persistCompletionGate(threadId, turnId, completionGate, firstTrustedEvidence, 'initial')
 
+      let recoveryHypothesis: string | undefined
+      if (
+        completionGate.verdict === 'fix' &&
+        turn.harnessTask?.executionPolicy === 'adaptive' &&
+        adaptiveSignal
+      ) {
+        const recovered = await this.runAdaptiveRecovery({
+          threadId,
+          turnId,
+          workspace,
+          task: turn.harnessTask,
+          signal: adaptiveSignal,
+          plan,
+          verification: firstVerification.artifact,
+          diff: firstDiff,
+          priorReviewerReasons: review.artifact.reasons,
+          threadModel: roleModel,
+          ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
+          initialModelSteps: (turn.planArtifact ? 0 : 1) + 3,
+          startedAtMs: runStartedAtMs,
+          usageAtStart: {
+            modelTurns: runStartingUsage.turns,
+            costUsd: runStartingUsage.costUsd ?? 0
+          },
+          abortSignal: signal
+        })
+        if (recovered.status === 'aborted') {
+          await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
+          return 'aborted'
+        }
+        if (recovered.status === 'failed') {
+          completionGate = {
+            verdict: 'fail',
+            reasons: [...completionGate.reasons, `adaptive recovery stopped: ${recovered.failure}`]
+          }
+        } else {
+          recoveryHypothesis = recovered.hypothesis
+        }
+      }
+
       if (completionGate.verdict === 'fix') {
         const fixedExecution = await this.runExecutor({
           threadId,
           turnId,
           workspace,
-          threadModel: thread.model,
+          threadModel: roleModel,
+          ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
           request,
           plan,
           priorFindings: firstVerification.artifact.findings,
+          ...(recoveryHypothesis ? { recoveryHypothesis } : {}),
           signal
         })
         if (fixedExecution.status === 'aborted') {
@@ -251,7 +315,8 @@ export class RigorousPipeline {
           threadId,
           turnId,
           workspace,
-          threadModel: thread.model,
+          threadModel: roleModel,
+          ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
           request,
           plan,
           execution: fixedExecution.artifact,
@@ -277,7 +342,8 @@ export class RigorousPipeline {
           threadId,
           turnId,
           workspace,
-          threadModel: thread.model,
+          threadModel: roleModel,
+          ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
           plan,
           verification: finalVerification.artifact,
           verificationRawText: finalVerification.rawText,
@@ -354,21 +420,128 @@ export class RigorousPipeline {
     }
   }
 
+  private async runAdaptiveRecovery(input: {
+    threadId: string
+    turnId: string
+    workspace: string
+    task: HarnessTaskSpec
+    signal: StallSignal
+    plan: PlannerArtifact
+    verification: VerificationArtifact
+    diff: string
+    priorReviewerReasons: readonly string[]
+    threadModel: string
+    pinnedModel?: string
+    initialModelSteps: number
+    startedAtMs: number
+    usageAtStart: { modelTurns: number; costUsd: number }
+    abortSignal: AbortSignal
+  }): Promise<AdaptiveRecoveryResult> {
+    const attemptedActionSignatures: string[] = []
+    const budgetFor = (stage: RecoveryBudget['stage'], minimumModelSteps: number): RecoveryBudget => {
+      const usage = this.deps.usage.forThread(input.threadId)
+      return {
+        limits: input.task.budgets,
+        elapsedWallTimeMs: elapsedSince(input.startedAtMs, this.deps.nowIso()),
+        modelSteps: Math.max(minimumModelSteps, usage.turns - input.usageAtStart.modelTurns),
+        costUsd: Math.max(0, (usage.costUsd ?? 0) - input.usageAtStart.costUsd),
+        recoveryRounds: 0,
+        stage,
+        attemptedActionSignatures
+      }
+    }
+    const takeAction = (stage: RecoveryBudget['stage'], minimumModelSteps: number): RecoveryAction =>
+      chooseRecovery(input.signal, budgetFor(stage, minimumModelSteps))
+
+    let action = takeAction('initial', input.initialModelSteps)
+    if (action.kind === 'fail') {
+      await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+      return { status: 'failed', failure: action.failure ?? 'invalid_stage' }
+    }
+    await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+    attemptedActionSignatures.push(action.actionSignature)
+
+    action = takeAction('checkpointed', input.initialModelSteps)
+    if (action.kind === 'fail') {
+      await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+      return { status: 'failed', failure: action.failure ?? 'invalid_stage' }
+    }
+    await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+    attemptedActionSignatures.push(action.actionSignature)
+
+    const critic = await this.runReviewer({
+      threadId: input.threadId,
+      turnId: input.turnId,
+      workspace: input.workspace,
+      threadModel: input.threadModel,
+      ...(input.pinnedModel ? { pinnedModel: input.pinnedModel } : {}),
+      plan: input.plan,
+      verification: input.verification,
+      verificationRawText: '',
+      diff: input.diff,
+      signal: input.abortSignal,
+      recoveryCritic: true
+    })
+    if (critic.status === 'aborted') return { status: 'aborted' }
+
+    action = takeAction('critic_complete', input.initialModelSteps + 1)
+    if (action.kind === 'fail') {
+      await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+      return { status: 'failed', failure: action.failure ?? 'invalid_stage' }
+    }
+    const hypothesis = firstNewHypothesis(critic.artifact.reasons, input.priorReviewerReasons)
+    if (!hypothesis) {
+      const failure = missingHypothesisAction(input.signal)
+      await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, failure)
+      return { status: 'failed', failure: 'hypothesis_missing' }
+    }
+    await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+    attemptedActionSignatures.push(action.actionSignature)
+
+    action = takeAction('hypothesis_confirmed', input.initialModelSteps + 1)
+    if (action.kind === 'fail') {
+      await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+      return { status: 'failed', failure: action.failure ?? 'invalid_stage' }
+    }
+    await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+    return { status: 'completed', hypothesis }
+  }
+
+  private async persistAdaptiveRecoveryAction(
+    threadId: string,
+    turnId: string,
+    action: RecoveryAction
+  ): Promise<void> {
+    await this.deps.turns.applyItem(threadId, makeReviewItem({
+      id: `item_${turnId}_adaptive_recovery_${action.kind}_${action.actionSignature.slice(-12)}`,
+      threadId,
+      turnId,
+      target: { kind: 'custom', instructions: 'bounded adaptive recovery checkpoint' },
+      title: recoveryActionTitle(action),
+      status: 'completed',
+      reviewText: renderAdaptiveRecoveryAction(action),
+      finishedAt: this.deps.nowIso()
+    }))
+  }
+
   private async runExecutor(input: {
     threadId: string
     turnId: string
     workspace: string
     threadModel: string
+    pinnedModel?: string
     request: string
     plan: PlannerArtifact
     priorFindings?: VerificationArtifact['findings']
+    recoveryHypothesis?: string
     signal: AbortSignal
   }): Promise<{ status: 'completed' | 'aborted'; artifact: ExecutionArtifact; rawText: string }> {
     const result = await this.runRole({
       role: 'executor',
       kind: 'execution',
-      prompt: executorPrompt(input.request, input.plan, input.priorFindings),
+      prompt: executorPrompt(input.request, input.plan, input.priorFindings, input.recoveryHypothesis),
       threadModel: input.threadModel,
+      ...(input.pinnedModel ? { pinnedModel: input.pinnedModel } : {}),
       threadId: input.threadId,
       turnId: input.turnId,
       workspace: input.workspace,
@@ -387,6 +560,7 @@ export class RigorousPipeline {
     turnId: string
     workspace: string
     threadModel: string
+    pinnedModel?: string
     request: string
     plan: PlannerArtifact
     execution: ExecutionArtifact
@@ -407,6 +581,7 @@ export class RigorousPipeline {
         input.harnessTask
       ),
       threadModel: input.threadModel,
+      ...(input.pinnedModel ? { pinnedModel: input.pinnedModel } : {}),
       threadId: input.threadId,
       turnId: input.turnId,
       workspace: input.workspace,
@@ -428,18 +603,23 @@ export class RigorousPipeline {
     turnId: string
     workspace: string
     threadModel: string
+    pinnedModel?: string
     plan: PlannerArtifact
     verification: VerificationArtifact
     verificationRawText: string
     diff: string
     signal: AbortSignal
     finalRound?: boolean
+    recoveryCritic?: boolean
   }): Promise<{ status: 'completed' | 'aborted'; artifact: VerdictArtifact; rawText: string }> {
     const result = await this.runRole({
       role: 'reviewer',
       kind: 'verdict',
-      prompt: reviewerPrompt(input.plan, input.verification, input.verificationRawText, input.diff, Boolean(input.finalRound)),
+      prompt: input.recoveryCritic
+        ? recoveryCriticPrompt(input.plan, input.verification, input.diff)
+        : reviewerPrompt(input.plan, input.verification, input.verificationRawText, input.diff, Boolean(input.finalRound)),
       threadModel: input.threadModel,
+      ...(input.pinnedModel ? { pinnedModel: input.pinnedModel } : {}),
       threadId: input.threadId,
       turnId: input.turnId,
       workspace: input.workspace,
@@ -467,6 +647,7 @@ export class RigorousPipeline {
     kind: StageArtifactKind
     prompt: string
     threadModel: string
+    pinnedModel?: string
     threadId: string
     turnId: string
     workspace: string
@@ -476,7 +657,10 @@ export class RigorousPipeline {
       throw new Error(`role ${input.role} is disabled`)
     }
     const profile = ROLE_PROFILES[input.role]
-    const route = resolveRoleModel(input.role, this.deps.roles, input.threadModel || this.deps.defaultModel)
+    const configuredRoute = resolveRoleModel(input.role, this.deps.roles, input.threadModel || this.deps.defaultModel)
+    const route = input.pinnedModel?.trim()
+      ? { ...configuredRoute, model: input.pinnedModel.trim() }
+      : configuredRoute
     await this.deps.events.record({
       kind: 'pipeline_stage_started',
       threadId: input.threadId,
@@ -1187,6 +1371,56 @@ function toUsageSnapshot(usage: NonNullable<Awaited<ReturnType<ChildRunExecutor>
   }
 }
 
+function elapsedSince(startedAtMs: number, nowIso: string): number {
+  const now = toEpochMs(nowIso)
+  return Number.isFinite(startedAtMs) && Number.isFinite(now)
+    ? Math.max(0, now - startedAtMs)
+    : 0
+}
+
+function toEpochMs(value: string): number {
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function firstNewHypothesis(reasons: readonly string[], priorReasons: readonly string[]): string | undefined {
+  const seen = new Set(priorReasons.map(normalizeHypothesis).filter(Boolean))
+  for (const reason of reasons) {
+    const normalized = normalizeHypothesis(reason)
+    if (normalized && !seen.has(normalized)) return reason.trim()
+  }
+  return undefined
+}
+
+function normalizeHypothesis(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ')
+}
+
+function missingHypothesisAction(signal: StallSignal): RecoveryAction {
+  return {
+    kind: 'fail',
+    actionSignature: `recovery:fail:hypothesis_missing:${signal.signature}`,
+    reason: signal.reason,
+    failure: 'hypothesis_missing'
+  }
+}
+
+function recoveryActionTitle(action: RecoveryAction): string {
+  switch (action.kind) {
+    case 'checkpoint': return 'Adaptive recovery checkpoint'
+    case 'critic': return 'Adaptive recovery isolated critic'
+    case 'require_hypothesis': return 'Adaptive recovery hypothesis accepted'
+    case 'rigorous_fix': return 'Adaptive recovery rigorous fix'
+    case 'fail': return 'Adaptive recovery stopped'
+  }
+}
+
+function renderAdaptiveRecoveryAction(action: RecoveryAction): string {
+  return action.kind === 'fail'
+    ? `Adaptive recovery stopped: ${action.failure ?? 'invalid_stage'}.`
+    : `Adaptive recovery action: ${action.kind}; signal: ${action.reason}.`
+}
+
 function plannerPrompt(request: string): string {
   return [
     'User request:',
@@ -1200,7 +1434,8 @@ function plannerPrompt(request: string): string {
 function executorPrompt(
   request: string,
   plan: PlannerArtifact,
-  priorFindings?: VerificationArtifact['findings']
+  priorFindings?: VerificationArtifact['findings'],
+  recoveryHypothesis?: string
 ): string {
   return [
     'User request:',
@@ -1212,6 +1447,12 @@ function executorPrompt(
       ? ['',
           'Verifier findings to fix:',
           JSON.stringify(priorFindings, null, 2)
+        ].join('\n')
+      : '',
+    recoveryHypothesis
+      ? ['',
+          'Adaptive recovery hypothesis (test this new hypothesis; do not repeat the stalled action):',
+          recoveryHypothesis
         ].join('\n')
       : '',
     '',
@@ -1289,6 +1530,29 @@ function reviewerPrompt(
     fenced(diff || '(no git diff captured)'),
     '',
     'Return ship, fix, or replan. End with the required fenced JSON artifact.'
+  ].join('\n')
+}
+
+function recoveryCriticPrompt(
+  plan: PlannerArtifact,
+  verification: VerificationArtifact,
+  diff: string
+): string {
+  return [
+    'Adaptive recovery critic: remain isolated and read-only.',
+    'Provide exactly one new, falsifiable hypothesis for the stalled execution. Do not propose a retry of the same action.',
+    'Return the hypothesis as one reason in the required verdict artifact.',
+    '',
+    'Planner artifact:',
+    JSON.stringify(plan, null, 2),
+    '',
+    'Verifier artifact:',
+    JSON.stringify(verification, null, 2),
+    '',
+    'Captured git diff:',
+    fenced(diff || '(no git diff captured)'),
+    '',
+    'End with the required fenced JSON artifact.'
   ].join('\n')
 }
 

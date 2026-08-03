@@ -10,6 +10,16 @@ export const HARNESS_MAX_CONSTRAINTS = 100
 export const HARNESS_MAX_EVIDENCE_IDS = 100
 export const HARNESS_MAX_COST_USD = 10_000
 
+/** Defaults are conservative so an adaptive task begins on the normal loop. */
+export const DEFAULT_HARNESS_ADAPTIVE_POLICY = {
+  maxObservations: 32,
+  repeatedActionThreshold: 3,
+  repeatedErrorThreshold: 2,
+  noProgressWindow: 3,
+  readRediscoveryThreshold: 3,
+  complexityThreshold: 6
+} as const
+
 const HarnessIdentifierSchema = z.string().trim().min(1).max(256)
 const HarnessTextSchema = z.string().trim().min(1).max(16_000)
 
@@ -65,6 +75,22 @@ export type HarnessTrialBudgets = z.infer<typeof HarnessTrialBudgetsSchema>
 export const HarnessExecutionPolicySchema = z.enum(['normal', 'rigorous', 'adaptive'])
 export type HarnessExecutionPolicy = z.infer<typeof HarnessExecutionPolicySchema>
 
+/**
+ * Bounded, model-agnostic knobs for opt-in adaptive harness tasks. These
+ * values do not carry action data and are safe to persist in a task manifest.
+ */
+export const HarnessAdaptivePolicySchema = z
+  .object({
+    maxObservations: z.number().int().min(2).max(1_024).default(DEFAULT_HARNESS_ADAPTIVE_POLICY.maxObservations),
+    repeatedActionThreshold: z.number().int().min(2).max(128).default(DEFAULT_HARNESS_ADAPTIVE_POLICY.repeatedActionThreshold),
+    repeatedErrorThreshold: z.number().int().min(2).max(128).default(DEFAULT_HARNESS_ADAPTIVE_POLICY.repeatedErrorThreshold),
+    noProgressWindow: z.number().int().min(2).max(128).default(DEFAULT_HARNESS_ADAPTIVE_POLICY.noProgressWindow),
+    readRediscoveryThreshold: z.number().int().min(2).max(128).default(DEFAULT_HARNESS_ADAPTIVE_POLICY.readRediscoveryThreshold),
+    complexityThreshold: z.number().int().min(1).max(1_000).default(DEFAULT_HARNESS_ADAPTIVE_POLICY.complexityThreshold)
+  })
+  .strict()
+export type HarnessAdaptivePolicy = z.infer<typeof HarnessAdaptivePolicySchema>
+
 export const HarnessBenchmarkMetadataSchema = z
   .object({
     family: HarnessIdentifierSchema,
@@ -89,6 +115,7 @@ export const HarnessTaskSpecSchema = z
     constraints: z.array(HarnessTaskConstraintSchema).max(HARNESS_MAX_CONSTRAINTS),
     budgets: HarnessTrialBudgetsSchema,
     executionPolicy: HarnessExecutionPolicySchema,
+    adaptivePolicy: HarnessAdaptivePolicySchema.optional(),
     benchmark: HarnessBenchmarkMetadataSchema.optional()
   })
   .strict()
