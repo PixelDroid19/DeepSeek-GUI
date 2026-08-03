@@ -799,6 +799,102 @@ describe('rigorous pipeline', () => {
     await rm(dataDir, { recursive: true, force: true })
   })
 
+  it('rejects a required criterion backed only by an optional failed mechanical check', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-optional-failed-evidence-'))
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-rigorous-optional-failed-evidence-data-'))
+    await execFileAsync('git', ['init', '--quiet', workspace])
+    await writeFile(join(workspace, '.keep'), 'base\n', 'utf8')
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.email', 'kun@example.test'])
+    await execFileAsync('git', ['-C', workspace, 'config', 'user.name', 'Kun Test'])
+    await execFileAsync('git', ['-C', workspace, 'add', '.keep'])
+    await execFileAsync('git', ['-C', workspace, 'commit', '--quiet', '-m', 'baseline'])
+    const store = new EvalSuiteStore({ dir: join(dataDir, 'evals') })
+    let executorRuns = 0
+    const child: ChildRunExecutor = async (input) => {
+      if (input.artifactKind === 'execution') {
+        executorRuns += 1
+        return { summary: 'execution', artifact: { summary: 's', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return {
+          summary: 'verification',
+          artifact: {
+            findings: [],
+            criteriaResults: [{
+              criterion: 'acceptance',
+              pass: true,
+              evidenceIds: ['command:harness:optional-fail']
+            }],
+            commandsRun: []
+          }
+        }
+      }
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ready'] } }
+    }
+    const runtime = makeRuntime(child, {
+      enabled: true,
+      store,
+      toolHost: new LocalToolHost({
+        tools: [LocalToolHost.defineTool({
+          name: 'bash',
+          toolKind: 'command_execution',
+          policy: 'auto',
+          inputSchema: { type: 'object', properties: {} },
+          description: 'failing optional check',
+          execute: async () => ({ output: 'optional check failed', isError: true })
+        })],
+        actionLevels: { enabled: false }
+      }),
+      approvalPolicy: 'auto'
+    })
+    const thread = await runtime.threads.create({
+      title: 'Optional failed evidence', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work',
+        mode: 'rigorous',
+        planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
+        harnessTask: {
+          ...REQUIRED_HARNESS_TASK,
+          verification: [{
+            id: 'optional-fail',
+            command: 'optional failure',
+            expectation: { kind: 'exit-zero' },
+            required: false,
+            timeoutMs: 1_000
+          }]
+        }
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect(executorRuns).toBe(1)
+    const items = await runtime.sessionStore.loadItems(thread.id)
+    const gate = items.find((item) => item.kind === 'review' && item.title === 'Rigorous completion gate')
+    const report = gate?.kind === 'review' ? gate.reviewText ?? '' : ''
+    const verifier = items.find(
+      (item) => item.kind === 'review' && 'roleName' in item && item.roleName === 'verifier'
+    )
+    const verifierReport = verifier?.kind === 'review' ? verifier.reviewText ?? '' : ''
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'review',
+        title: 'Rigorous completion gate',
+        reviewText: expect.stringContaining('unknown trusted evidence')
+      })
+    ]))
+    expect(report).not.toContain('command:harness:optional-fail')
+    expect(verifierReport).not.toContain(
+      'FAIL harness:optional-fail (exit-zero) Evidence ID: command:harness:optional-fail'
+    )
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dataDir, { recursive: true, force: true })
+  })
+
   it('re-captures suite and workspace evidence after the initial reviewer returns', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-delayed-initial-mutation-'))
     const dataDir = await mkdtemp(join(tmpdir(), 'kun-rigorous-delayed-initial-mutation-data-'))

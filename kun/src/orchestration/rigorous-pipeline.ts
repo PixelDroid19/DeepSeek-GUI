@@ -1094,6 +1094,7 @@ function buildTrustedEvidenceRegistry(input: {
 }): TrustedEvidenceRecord[] {
   const records: TrustedEvidenceRecord[] = []
   for (const result of input.evalRun?.outcome.results ?? []) {
+    if (!result.pass) continue
     records.push({
       id: commandEvidenceId(result),
       kind: 'command',
@@ -1339,7 +1340,10 @@ function renderEvalRun(evalRun: MechanicalEvalRun): string {
   ]
   for (const result of evalRun.outcome.results) {
     const name = result.origin === 'harness' ? `harness:${result.checkId}` : result.name
-    lines.push(`- ${result.pass ? 'PASS' : 'FAIL'} ${name} (${result.expectation}) Evidence ID: ${commandEvidenceId(result)}`)
+    const evidence = result.pass
+      ? `Evidence ID: ${commandEvidenceId(result)}`
+      : 'No trusted evidence recorded'
+    lines.push(`- ${result.pass ? 'PASS' : 'FAIL'} ${name} (${result.expectation}) ${evidence}`)
   }
   return lines.join('\n')
 }
