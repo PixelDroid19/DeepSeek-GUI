@@ -116,7 +116,7 @@ function adaptiveTurn(
   }
 }
 
-function sharedFileTurnRuntime(dataDir: string, owner: string): {
+function sharedFileTurnRuntime(dataDir: string, owner: string, turnSuffix?: string): {
   threadStore: FileThreadStore
   turns: TurnService
 } {
@@ -136,7 +136,9 @@ function sharedFileTurnRuntime(dataDir: string, owner: string): {
     inflight: new InflightTracker(),
     steering: new SteeringQueue(),
     compactor: new ContextCompactor({}),
-    ids: new SequentialIdGenerator(),
+    ids: turnSuffix
+      ? { next: (prefix) => `${prefix}_${turnSuffix}` }
+      : new SequentialIdGenerator(),
     nowIso,
     usage: new UsageService(),
     adaptiveTrialLeases: new FileAdaptiveTrialLeaseStore({ dataDir, owner })
@@ -406,6 +408,55 @@ describe('runtime factory usage carryover', () => {
       if (released) {
         await postFinishLeaseStore.release(released)
       }
+    } finally {
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  it('serializes distinct adaptive starts across persistent runtimes sharing one thread', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-adaptive-thread-lease-'))
+    try {
+      const first = sharedFileTurnRuntime(dataDir, 'runtime-first', 'first')
+      const second = sharedFileTurnRuntime(dataDir, 'runtime-second', 'second')
+      const threadId = 'thr_shared_adaptive_start'
+      await first.threadStore.upsert(createThreadRecord({
+        id: threadId,
+        title: 'Shared adaptive start',
+        workspace: '/tmp',
+        model: 'test-model'
+      }))
+
+      const starts = await Promise.allSettled([
+        first.turns.startTurn({
+          threadId,
+          request: { prompt: 'first adaptive start', harnessTask: ADAPTIVE_TASK }
+        }),
+        second.turns.startTurn({
+          threadId,
+          request: { prompt: 'second adaptive start', harnessTask: ADAPTIVE_TASK }
+        })
+      ])
+      const accepted = starts.find((start) => start.status === 'fulfilled')
+      const rejected = starts.find((start) => start.status === 'rejected')
+
+      expect(accepted?.status).toBe('fulfilled')
+      expect(rejected?.status).toBe('rejected')
+      if (!accepted || accepted.status !== 'fulfilled') throw new Error('expected one adaptive start')
+      if (!rejected || rejected.status !== 'rejected') throw new Error('expected one rejected adaptive start')
+      expect(String(rejected.reason)).toContain('adaptive harness trial requires exclusive thread execution')
+      const persisted = await first.threadStore.get(threadId)
+      expect(persisted?.turns).toHaveLength(1)
+      expect(persisted?.turns[0]?.id).toBe(accepted.value.turnId)
+
+      const owner = accepted.value.turnId === 'turn_first' ? first : second
+      const other = owner === first ? second : first
+      await owner.turns.finishTurn({ threadId, turnId: accepted.value.turnId, status: 'completed' })
+      const retried = await other.turns.startTurn({
+        threadId,
+        request: { prompt: 'adaptive start after owner release', harnessTask: ADAPTIVE_TASK }
+      })
+      expect(retried.turnId).toBe(owner === first ? 'turn_second' : 'turn_first')
+      await other.turns.interruptTurn({ threadId, turnId: retried.turnId })
     } finally {
       await rm(dataDir, { recursive: true, force: true })
     }

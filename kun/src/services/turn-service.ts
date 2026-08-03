@@ -62,6 +62,10 @@ export class TurnService {
   private readonly threadMutationQueues = new Map<string, Promise<void>>()
   private readonly adaptiveTrialLeases: AdaptiveTrialLeaseStore
   private readonly activeAdaptiveTrialLeases = new Map<string, AdaptiveTrialLease>()
+  private readonly activeAdaptiveThreadLeases = new Map<
+    string,
+    { turnId: string; lease: AdaptiveTrialLease }
+  >()
 
   constructor(deps: TurnServiceDeps) {
     this.deps = deps
@@ -94,61 +98,83 @@ export class TurnService {
           this.deps.usage.forThread(input.threadId)
         )
       : undefined
-    const turnId = this.deps.ids.next('turn')
-    const turn = createTurnRecord({
-      id: turnId,
-      threadId: input.threadId,
-      prompt: input.request.prompt,
-      model: input.request.model,
-      reasoningEffort: input.request.reasoningEffort,
-      attachmentIds: input.request.attachmentIds ?? [],
-      guiPlan: input.request.guiPlan,
-      planArtifact: input.request.planArtifact
-        ? PlannerArtifactSchema.parse(input.request.planArtifact)
-        : undefined,
-      harnessTask,
-      adaptiveTrialMarker,
-      mode: input.request.mode
-    })
-    const userItem = makeUserItem({
-      id: `item_${turnId}_user`,
-      turnId,
-      threadId: input.threadId,
-      text: input.request.prompt,
-      displayText: input.request.displayText,
-      attachmentIds: input.request.attachmentIds ?? []
-    })
-    const controller = new AbortController()
-    await this.upsertThread(input.threadId, (current) => {
-      this.assertAdaptiveTurnCanStart(current, harnessTask)
-      return {
-        ...touchThread(current, this.deps.nowIso()),
-        status: 'running',
-        turns: [...current.turns, startTurnRecord(appendTurnItem(turn, userItem))]
+    const isAdaptiveTrial = harnessTask?.executionPolicy === 'adaptive'
+    if (isAdaptiveTrial && this.activeAdaptiveThreadLeases.has(input.threadId)) {
+      throw new Error('adaptive harness trial requires exclusive thread execution')
+    }
+    const adaptiveThreadLease = isAdaptiveTrial
+      ? await this.adaptiveTrialLeases.acquireThread({ threadId: input.threadId })
+      : undefined
+    if (isAdaptiveTrial && !adaptiveThreadLease) {
+      throw new Error('adaptive harness trial requires exclusive thread execution')
+    }
+    let ownsAdaptiveThreadLease = false
+    try {
+      const turnId = this.deps.ids.next('turn')
+      const turn = createTurnRecord({
+        id: turnId,
+        threadId: input.threadId,
+        prompt: input.request.prompt,
+        model: input.request.model,
+        reasoningEffort: input.request.reasoningEffort,
+        attachmentIds: input.request.attachmentIds ?? [],
+        guiPlan: input.request.guiPlan,
+        planArtifact: input.request.planArtifact
+          ? PlannerArtifactSchema.parse(input.request.planArtifact)
+          : undefined,
+        harnessTask,
+        adaptiveTrialMarker,
+        mode: input.request.mode
+      })
+      const userItem = makeUserItem({
+        id: `item_${turnId}_user`,
+        turnId,
+        threadId: input.threadId,
+        text: input.request.prompt,
+        displayText: input.request.displayText,
+        attachmentIds: input.request.attachmentIds ?? []
+      })
+      const controller = new AbortController()
+      await this.upsertThread(input.threadId, (current) => {
+        this.assertAdaptiveTurnCanStart(current, harnessTask)
+        return {
+          ...touchThread(current, this.deps.nowIso()),
+          status: 'running',
+          turns: [...current.turns, startTurnRecord(appendTurnItem(turn, userItem))]
+        }
+      })
+      if (adaptiveThreadLease) {
+        this.activeAdaptiveThreadLeases.set(input.threadId, { turnId, lease: adaptiveThreadLease })
+        ownsAdaptiveThreadLease = true
       }
-    })
-    await this.deps.sessionStore.appendItem(input.threadId, userItem)
-    await this.deps.events.record({
-      kind: 'turn_started',
-      threadId: input.threadId,
-      turnId
-    })
-    await this.deps.events.record({
-      kind: 'item_created',
-      threadId: input.threadId,
-      turnId,
-      itemId: userItem.id,
-      item: userItem
-    })
-    this.inflightTurns.set(turnId, controller)
-    this.deps.inflight.begin({
-      id: turnId,
-      kind: 'model',
-      threadId: input.threadId,
-      turnId
-    })
-    this.deps.steering.setTurn(turnId)
-    return { threadId: input.threadId, turnId, userMessageItemId: userItem.id }
+      await this.deps.sessionStore.appendItem(input.threadId, userItem)
+      await this.deps.events.record({
+        kind: 'turn_started',
+        threadId: input.threadId,
+        turnId
+      })
+      await this.deps.events.record({
+        kind: 'item_created',
+        threadId: input.threadId,
+        turnId,
+        itemId: userItem.id,
+        item: userItem
+      })
+      this.inflightTurns.set(turnId, controller)
+      this.deps.inflight.begin({
+        id: turnId,
+        kind: 'model',
+        threadId: input.threadId,
+        turnId
+      })
+      this.deps.steering.setTurn(turnId)
+      return { threadId: input.threadId, turnId, userMessageItemId: userItem.id }
+    } catch (error) {
+      if (adaptiveThreadLease && !ownsAdaptiveThreadLease) {
+        await this.adaptiveTrialLeases.release(adaptiveThreadLease).catch(() => undefined)
+      }
+      throw error
+    }
   }
 
   /**
@@ -238,6 +264,7 @@ export class TurnService {
       return { ...touchThread(current, this.deps.nowIso()), turns: next, status: 'idle' }
     })
     await this.releaseAdaptiveTrialLease(input.turnId)
+    await this.releaseAdaptiveThreadLease(input.threadId, input.turnId)
     return { status: 'aborted' }
   }
 
@@ -323,6 +350,7 @@ export class TurnService {
       return { ...touchThread(current, this.deps.nowIso()), turns: next, status: 'idle' }
     })
     await this.releaseAdaptiveTrialLease(input.turnId)
+    await this.releaseAdaptiveThreadLease(input.threadId, input.turnId)
     await this.deps.events.record({
       kind: input.status === 'completed' ? 'turn_completed' : input.status === 'aborted' ? 'turn_aborted' : 'turn_failed',
       threadId: input.threadId,
@@ -460,6 +488,13 @@ export class TurnService {
     if (!lease) return
     this.activeAdaptiveTrialLeases.delete(turnId)
     await this.adaptiveTrialLeases.release(lease).catch(() => undefined)
+  }
+
+  private async releaseAdaptiveThreadLease(threadId: string, turnId: string): Promise<void> {
+    const active = this.activeAdaptiveThreadLeases.get(threadId)
+    if (!active || active.turnId !== turnId) return
+    this.activeAdaptiveThreadLeases.delete(threadId)
+    await this.adaptiveTrialLeases.release(active.lease).catch(() => undefined)
   }
 
   /**

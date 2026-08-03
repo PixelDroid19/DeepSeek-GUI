@@ -5,8 +5,11 @@ import { resolve } from 'node:path'
 export const DEFAULT_ADAPTIVE_TRIAL_LEASE_TTL_MS = 5 * 60_000
 const RECLAIM_GUARD_TTL_MS = 30_000
 
+export type AdaptiveTrialLeaseScope = 'thread' | 'turn'
+
 export type AdaptiveTrialLease = {
   version: 1
+  scope: AdaptiveTrialLeaseScope
   owner: string
   token: string
   threadId: string
@@ -16,6 +19,7 @@ export type AdaptiveTrialLease = {
 
 export interface AdaptiveTrialLeaseStore {
   acquire(input: { threadId: string; turnId: string }): Promise<AdaptiveTrialLease | null>
+  acquireThread(input: { threadId: string }): Promise<AdaptiveTrialLease | null>
   release(lease: AdaptiveTrialLease): Promise<void>
 }
 
@@ -23,6 +27,12 @@ type LeaseStoreOptions = {
   owner?: string
   nowMs?: () => number
   ttlMs?: number
+}
+
+type LeaseInput = {
+  scope: AdaptiveTrialLeaseScope
+  threadId: string
+  turnId: string
 }
 
 /**
@@ -42,19 +52,27 @@ export class InMemoryAdaptiveTrialLeaseStore implements AdaptiveTrialLeaseStore 
   }
 
   async acquire(input: { threadId: string; turnId: string }): Promise<AdaptiveTrialLease | null> {
-    const key = leaseKey(input.threadId, input.turnId)
+    return this.acquireLease({ ...input, scope: 'turn' })
+  }
+
+  async acquireThread(input: { threadId: string }): Promise<AdaptiveTrialLease | null> {
+    return this.acquireLease({ ...input, scope: 'thread', turnId: '' })
+  }
+
+  async release(lease: AdaptiveTrialLease): Promise<void> {
+    const key = leaseKey(lease.scope, lease.threadId, lease.turnId)
+    const current = this.leases.get(key)
+    if (matchesLease(current, lease)) this.leases.delete(key)
+  }
+
+  private async acquireLease(input: LeaseInput): Promise<AdaptiveTrialLease | null> {
+    const key = leaseKey(input.scope, input.threadId, input.turnId)
     const now = this.nowMs()
     const existing = this.leases.get(key)
     if (existing && existing.expiresAtMs > now) return null
     const lease = createLease({ ...input, owner: this.owner, nowMs: now, ttlMs: this.ttlMs })
     this.leases.set(key, lease)
     return lease
-  }
-
-  async release(lease: AdaptiveTrialLease): Promise<void> {
-    const key = leaseKey(lease.threadId, lease.turnId)
-    const current = this.leases.get(key)
-    if (matchesLease(current, lease)) this.leases.delete(key)
   }
 }
 
@@ -77,8 +95,16 @@ export class FileAdaptiveTrialLeaseStore implements AdaptiveTrialLeaseStore {
   }
 
   async acquire(input: { threadId: string; turnId: string }): Promise<AdaptiveTrialLease | null> {
+    return this.acquireLease({ ...input, scope: 'turn' })
+  }
+
+  async acquireThread(input: { threadId: string }): Promise<AdaptiveTrialLease | null> {
+    return this.acquireLease({ ...input, scope: 'thread', turnId: '' })
+  }
+
+  private async acquireLease(input: LeaseInput): Promise<AdaptiveTrialLease | null> {
     await mkdir(this.rootDir, { recursive: true })
-    const path = this.leasePath(input.threadId, input.turnId)
+    const path = this.leasePath(input)
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const now = this.nowMs()
       const lease = createLease({ ...input, owner: this.owner, nowMs: now, ttlMs: this.ttlMs })
@@ -102,7 +128,7 @@ export class FileAdaptiveTrialLeaseStore implements AdaptiveTrialLeaseStore {
   }
 
   async release(lease: AdaptiveTrialLease): Promise<void> {
-    const path = this.leasePath(lease.threadId, lease.turnId)
+    const path = this.leasePath(lease)
     const guard = await this.acquireReclaimGuard(path)
     if (!guard) return
     try {
@@ -116,8 +142,8 @@ export class FileAdaptiveTrialLeaseStore implements AdaptiveTrialLeaseStore {
     }
   }
 
-  private leasePath(threadId: string, turnId: string): string {
-    return resolve(this.rootDir, `${leaseKey(threadId, turnId)}.json`)
+  private leasePath(input: Pick<AdaptiveTrialLease, 'scope' | 'threadId' | 'turnId'>): string {
+    return resolve(this.rootDir, `${leaseKey(input.scope, input.threadId, input.turnId)}.json`)
   }
 
   private async reclaimExpired(path: string, now: number): Promise<boolean> {
@@ -161,6 +187,7 @@ export class FileAdaptiveTrialLeaseStore implements AdaptiveTrialLeaseStore {
 }
 
 function createLease(input: {
+  scope: AdaptiveTrialLeaseScope
   owner: string
   threadId: string
   turnId: string
@@ -169,6 +196,7 @@ function createLease(input: {
 }): AdaptiveTrialLease {
   return {
     version: 1,
+    scope: input.scope,
     owner: input.owner,
     token: randomUUID(),
     threadId: input.threadId,
@@ -183,29 +211,44 @@ function normalizeTtl(value: number | undefined): number {
     : DEFAULT_ADAPTIVE_TRIAL_LEASE_TTL_MS
 }
 
-function leaseKey(threadId: string, turnId: string): string {
-  return createHash('sha256').update(`${threadId}\u0000${turnId}`).digest('hex')
+function leaseKey(scope: AdaptiveTrialLeaseScope, threadId: string, turnId: string): string {
+  const identity = scope === 'turn'
+    // Preserve the pre-thread-lease path so an in-flight turn lease from a
+    // rolling upgrade remains visible and cannot be bypassed.
+    ? `${threadId}\u0000${turnId}`
+    : `\u0000thread\u0000${threadId}`
+  return createHash('sha256').update(identity).digest('hex')
 }
 
 function matchesLease(
   current: AdaptiveTrialLease | null | undefined,
   candidate: AdaptiveTrialLease
 ): boolean {
-  return current?.owner === candidate.owner && current.token === candidate.token
+  return current?.scope === candidate.scope &&
+    current.threadId === candidate.threadId &&
+    current.turnId === candidate.turnId &&
+    current.owner === candidate.owner &&
+    current.token === candidate.token
 }
 
 async function readLease(path: string): Promise<AdaptiveTrialLease | null> {
   try {
     const parsed = JSON.parse(await readFile(path, 'utf8')) as Partial<AdaptiveTrialLease>
+    const scope: AdaptiveTrialLeaseScope | null = parsed.scope === 'thread'
+      ? 'thread'
+      : parsed.scope === undefined || parsed.scope === 'turn'
+        ? 'turn'
+        : null
     if (
       parsed.version === 1 &&
+      scope &&
       typeof parsed.owner === 'string' && parsed.owner.length > 0 &&
       typeof parsed.token === 'string' && parsed.token.length > 0 &&
       typeof parsed.threadId === 'string' && parsed.threadId.length > 0 &&
-      typeof parsed.turnId === 'string' && parsed.turnId.length > 0 &&
+      typeof parsed.turnId === 'string' && (scope === 'thread' || parsed.turnId.length > 0) &&
       typeof parsed.expiresAtMs === 'number' && Number.isFinite(parsed.expiresAtMs)
     ) {
-      return parsed as AdaptiveTrialLease
+      return { ...parsed, scope } as AdaptiveTrialLease
     }
   } catch {
     // A process can die after exclusive create and before the lease payload is
