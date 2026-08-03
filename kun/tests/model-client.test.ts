@@ -1778,6 +1778,35 @@ describe('DeepseekCompatModelClient', () => {
     expect(error.message.length).toBeLessThanOrEqual(600)
   })
 
+  it('redacts multi-segment OAuth JSON token diagnostics', async () => {
+    const oauthPrefix = 'oauth-prefix'
+    const oauthSuffix = 'oauth-secret-tail'
+    const accessPrefix = 'access-prefix'
+    const accessSuffix = 'access-secret-tail'
+    const body = [
+      '{"oauth2_access_token":"' + oauthPrefix + '\\"' + oauthSuffix + '",',
+      '"access_token":"' + accessPrefix + '\\"' + accessSuffix + '"}'
+    ].join('')
+    const fetchImpl: typeof fetch = async () => new Response(body, { status: 401 })
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash',
+      fetchImpl
+    })
+    const chunks: ModelStreamChunk[] = []
+
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) chunks.push(chunk)
+
+    const error = chunks.find((chunk) => chunk.kind === 'error')
+    if (!error || error.kind !== 'error') throw new Error('expected error chunk')
+    expect(error.message).toContain('<redacted>')
+    expect(error.message).not.toContain(oauthPrefix)
+    expect(error.message).not.toContain(oauthSuffix)
+    expect(error.message).not.toContain(accessPrefix)
+    expect(error.message).not.toContain(accessSuffix)
+  })
+
   it('redacts an unclosed JSON refresh token diagnostic', async () => {
     const refreshPrefix = 'unclosed-refresh-prefix'
     const refreshSuffix = 'unclosed-refresh-secret-tail'
