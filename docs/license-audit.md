@@ -13,6 +13,9 @@ captured on 2026-08-03. It is not legal advice.
   XingYu-Zhong/DeepSeek-GUI".
 - The checked-in [`LICENSE`](../LICENSE) begins with `MIT License` and its
   copyright line is `Copyright (c) 2026 xingyu`.
+- Its SHA-256 fingerprint is
+  `1ab9c994b7859e0b5733814875a4798bdaa2f5a47a6a186c5049337f242cfcbc`; the
+  boundary checker rejects a changed license file until the policy is reviewed.
 - The canonical Kun upstream license is published at
   <https://raw.githubusercontent.com/KunAgent/Kun/master/LICENSE>. At the time
   of this audit it is PolyForm Noncommercial 1.0.0.
@@ -35,6 +38,10 @@ copy code, files, or features from the post-change Kun upstream. Do not import
 an upstream commit or file from
 `5472bed3b878854d296851820834145f5fe1a353` (`v0.2.9`) or later without the
 review required by [upstream-boundary.md](./upstream-boundary.md).
+
+The boundary checker can reject undeclared exception markers and invalid
+policy records, but it cannot identify arbitrary copied code from text alone.
+Review every upstream-looking diff against the cutoff before merging it.
 
 New, original changes made in this fork remain under the existing project
 license unless the relevant copyright holder gives a different instruction.

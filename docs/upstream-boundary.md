@@ -1,9 +1,10 @@
 # Upstream license boundary
 
 This policy preserves the decision to keep this fork on its MIT-era Kun
-`v0.2.8` base. It prevents accidental reuse of upstream material whose
-licensing changed in `v0.2.9`. It is an engineering control and provenance
-record, not legal advice.
+`v0.2.8` base. It guards declared upstream imports whose licensing changed in
+`v0.2.9`; it cannot infer the provenance of arbitrary copied code, so every
+future upstream-looking diff still requires a human provenance review. It is
+an engineering control and provenance record, not legal advice.
 
 ## Machine-readable cutoff
 
@@ -33,7 +34,10 @@ been made.
    dependency or vendored-code obligations with the import review.
 
 The checked-in MIT `LICENSE` remains authoritative for the source already in
-this fork. It does not grant permission to import later upstream code.
+this fork. It does not grant permission to import later upstream code. The
+checker validates the cutoff, license fingerprint, audit record, and declared
+exception records; it is not a substitute for reviewing a diff for copied
+upstream material.
 
 ## Exception guard
 
@@ -43,10 +47,10 @@ unless this document contains a matching approval record. A record may be
 added only after an explicit license decision and must use this exact format:
 
 ```text
-APPROVED_UPSTREAM_IMPORT: <repository-relative-path> | decision=<decision-record-id> | reviewed=<YYYY-MM-DD>
+APPROVED_UPSTREAM_IMPORT: <repository-relative-path> | decision=docs/license-decisions/<decision-record-id>.md | reviewed=<YYYY-MM-DD>
 ```
 
 The path names the file containing the marker. The decision identifier must
-refer to the documented license decision, and the review date records when the
-approval was made. Removing an approval record does not authorize an import;
+refer to a tracked, non-empty decision record under `docs/license-decisions/`,
+and the review date records when the approval was made. Removing an approval record does not authorize an import;
 it causes the checker to reject the marker again.
