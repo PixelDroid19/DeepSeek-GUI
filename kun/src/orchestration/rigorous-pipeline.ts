@@ -153,9 +153,16 @@ export class RigorousPipeline {
       if (!thread || !turn) throw new Error('rigorous pipeline missing thread or turn')
       const workspace = thread.workspace ?? ''
       const request = turn.prompt
-      const pinnedHarnessModel = turn.harnessTask
-        ? turn.model?.trim() || thread.model
-        : undefined
+      const pinnedHarnessModel = turn.harnessTask ? turn.model?.trim() : undefined
+      if (turn.harnessTask && !pinnedHarnessModel) {
+        await this.deps.turns.finishTurn({
+          threadId,
+          turnId,
+          status: 'failed',
+          error: 'rigorous harness task requires an explicit model pin'
+        })
+        return 'failed'
+      }
       const roleModel = pinnedHarnessModel ?? thread.model
       let adaptiveBudget: AdaptiveTrialBudgetTracker | undefined
       if (turn.harnessTask?.executionPolicy === 'adaptive') {

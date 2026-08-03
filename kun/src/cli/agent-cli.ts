@@ -45,6 +45,7 @@ Common options:
   --data-dir <path>          Root directory for Kun data
   --workspace <path>         Workspace root for run/chat/exec
   --model <model>            Model id
+  --harness-model <model>    Explicit model pin for a rigorous harness trial
   --approval-policy <p>      on-request | untrusted | never | auto | suggest
   --rigorous                 Run one-shot through planner/executor/verifier/reviewer
   --allow-risky-actions      Headless: auto-allow L3 actions; L4 remains denied
@@ -69,6 +70,7 @@ const VALUE_FLAGS = new Set([
   'base-url',
   'baseUrl',
   'model',
+  'harness-model',
   'approval-policy',
   'sandbox-mode',
   'workspace',
@@ -368,7 +370,18 @@ type SharedOptionsResult =
   | { ok: false; exitCode: number; message: string; issues?: unknown }
 
 function parseSharedOptions(argv: readonly string[], io: CliIo): SharedOptionsResult {
-  const parsed = parseServeOptionsSafe(argv, io.env ?? {})
+  const harnessModel = harnessModelFlag(argv)
+  if (harnessModel === null) {
+    return {
+      ok: false,
+      exitCode: ServeExitCode.config,
+      message: '--harness-model requires a non-empty model id'
+    }
+  }
+  const parsed = parseServeOptionsSafe(
+    harnessModel === undefined ? argv : [...argv, `--model=${harnessModel}`],
+    io.env ?? {}
+  )
   if (!parsed.ok) return parsed
   return {
     ok: true,
@@ -509,6 +522,20 @@ function stringFlag(argv: readonly string[], names: readonly string[]): string |
     } else if (token.startsWith('-') && nameSet.has(token.slice(1))) {
       return argv[index + 1]
     }
+  }
+  return undefined
+}
+
+function harnessModelFlag(argv: readonly string[]): string | null | undefined {
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index]
+    if (!token.startsWith('--')) continue
+    const eq = token.indexOf('=')
+    const key = eq >= 0 ? token.slice(2, eq) : token.slice(2)
+    if (key !== 'harness-model') continue
+    const value = eq >= 0 ? token.slice(eq + 1) : argv[index + 1]
+    if (!value || value.startsWith('--') || !value.trim()) return null
+    return value.trim()
   }
   return undefined
 }

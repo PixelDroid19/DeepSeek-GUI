@@ -5,6 +5,7 @@ import { estimateDeepseekCacheSavings, estimateDeepseekCost } from './deepseek-p
 import { isToolResultBridgeItem, repairModelHistoryItems } from '../../domain/model-history-repair.js'
 import { repairToolArguments } from './tool-argument-repair.js'
 import { isDeepSeekHost, probeDeepSeekReachable } from './model-error-probe.js'
+import { redactSecretText } from '../../config/secret-redaction.js'
 import {
   DEFAULT_MODEL_ENDPOINT_FORMAT,
   modelEndpointPath,
@@ -95,6 +96,7 @@ type ChatCompletionResponse = {
 
 type ResponsesApiResponse = {
   id?: string
+  model?: string
   status?: string
   output_text?: string
   output?: Array<Record<string, unknown>>
@@ -105,6 +107,7 @@ type ResponsesApiResponse = {
 
 type AnthropicMessageResponse = {
   id?: string
+  model?: string
   type?: string
   role?: string
   content?: Array<Record<string, unknown>>
@@ -126,6 +129,7 @@ type StreamReadResult =
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 45_000
 const DEFAULT_MESSAGES_MAX_TOKENS = 4096
+const MAX_PROVIDER_DIAGNOSTIC_CHARS = 512
 
 /**
  * DeepSeek-compatible model client.
@@ -162,6 +166,7 @@ export class DeepseekCompatModelClient implements ModelClient {
     const endpointFormat = this.endpointFormat()
     const url = buildModelEndpointUrl(this.config.baseUrl, endpointFormat)
     const stream = request.stream ?? !this.config.nonStreaming
+    const requestModel = effectiveRequestModel(request, this.config.model)
     const body = this.buildRequestBody(request, stream)
     const headers = this.buildHeaders(stream, endpointFormat)
     const result = await this.postChatCompletion(url, headers, body, request.abortSignal)
@@ -183,14 +188,14 @@ export class DeepseekCompatModelClient implements ModelClient {
         if (response.ok) {
           if (this.config.nonStreaming || response.headers.get('content-type')?.includes('application/json')) {
             const json = (await response.json()) as ChatCompletionResponse
-            yield* this.materializeNonStreaming(json, endpointFormat)
+            yield* this.materializeNonStreaming(json, endpointFormat, requestModel)
             return
           }
           if (!response.body) {
             yield { kind: 'error', message: 'model response had no body' }
             return
           }
-          yield* this.streamSse(response.body, request.abortSignal, endpointFormat)
+          yield* this.streamSse(response.body, request.abortSignal, endpointFormat, requestModel)
           return
         }
         const retryText = await response.text()
@@ -212,14 +217,14 @@ export class DeepseekCompatModelClient implements ModelClient {
     }
     if (this.config.nonStreaming || response.headers.get('content-type')?.includes('application/json')) {
       const json = (await response.json()) as ChatCompletionResponse
-      yield* this.materializeNonStreaming(json, endpointFormat)
+      yield* this.materializeNonStreaming(json, endpointFormat, requestModel)
       return
     }
     if (!response.body) {
       yield { kind: 'error', message: 'model response had no body' }
       return
     }
-    yield* this.streamSse(response.body, request.abortSignal, endpointFormat)
+    yield* this.streamSse(response.body, request.abortSignal, endpointFormat, requestModel)
   }
 
   private endpointFormat(): ModelEndpointFormat {
@@ -242,7 +247,7 @@ export class DeepseekCompatModelClient implements ModelClient {
       return { kind: 'response', response }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      return { kind: 'error', message: `model request failed: ${message}` }
+      return { kind: 'error', message: `model request failed: ${providerDiagnostic(message)}` }
     }
   }
 
@@ -264,7 +269,7 @@ export class DeepseekCompatModelClient implements ModelClient {
   }
 
   private async classifyHttpError(status: number, text: string): Promise<{ message: string; code: string }> {
-    const body = text.slice(0, 500)
+    const body = providerDiagnostic(text)
     if (status === 429) {
       return {
         message: `model request was rate limited (HTTP 429): ${body}`,
@@ -277,7 +282,7 @@ export class DeepseekCompatModelClient implements ModelClient {
         fetchImpl: this.fetchImpl
       })
       return {
-        message: `model request failed with DeepSeek HTTP ${status}: ${body} ${probe.message}`,
+        message: `model request failed with DeepSeek HTTP ${status}: ${body} ${providerDiagnostic(probe.message)}`,
         code: probe.reachable ? `deepseek_http_${status}` : 'deepseek_unreachable'
       }
     }
@@ -611,7 +616,8 @@ export class DeepseekCompatModelClient implements ModelClient {
   private async *streamSse(
     body: ReadableStream<Uint8Array>,
     signal: AbortSignal,
-    endpointFormat: ModelEndpointFormat
+    endpointFormat: ModelEndpointFormat,
+    requestModel: string
   ): AsyncIterable<ModelStreamChunk> {
     const decoder = new TextDecoder('utf-8')
     const reader = body.getReader()
@@ -673,7 +679,8 @@ export class DeepseekCompatModelClient implements ModelClient {
             completedToolCalls,
             textAccumulator,
             reasoningAccumulator,
-            endpointFormat
+            endpointFormat,
+            requestModel
           )
           textAccumulator = result.text
           reasoningAccumulator = result.reasoning
@@ -717,7 +724,8 @@ export class DeepseekCompatModelClient implements ModelClient {
     completedToolCalls: Set<string>,
     textAccumulator: string,
     reasoningAccumulator: string,
-    endpointFormat: ModelEndpointFormat
+    endpointFormat: ModelEndpointFormat,
+    requestModel: string
   ): {
     chunks: ModelStreamChunk[]
     text: string
@@ -732,7 +740,8 @@ export class DeepseekCompatModelClient implements ModelClient {
         pendingByIndex,
         completedToolCalls,
         textAccumulator,
-        reasoningAccumulator
+        reasoningAccumulator,
+        requestModel
       )
     }
     if (endpointFormat === 'messages') {
@@ -742,7 +751,8 @@ export class DeepseekCompatModelClient implements ModelClient {
         pendingByIndex,
         completedToolCalls,
         textAccumulator,
-        reasoningAccumulator
+        reasoningAccumulator,
+        requestModel
       )
     }
     const chunks: ModelStreamChunk[] = []
@@ -797,7 +807,7 @@ export class DeepseekCompatModelClient implements ModelClient {
     }
     const usagePayload = payload.usage as Record<string, unknown> | undefined
     if (usagePayload) {
-      usage = this.mapUsage(usagePayload)
+      usage = this.mapUsage(usagePayload, responseModelOrFallback(payload, requestModel))
     }
     if (finishReason === 'tool_calls' && pendingArguments.size > 0) {
       for (const [callId, value] of pendingArguments) {
@@ -821,7 +831,8 @@ export class DeepseekCompatModelClient implements ModelClient {
     pendingByIndex: Map<number, string>,
     completedToolCalls: Set<string>,
     textAccumulator: string,
-    reasoningAccumulator: string
+    reasoningAccumulator: string,
+    requestModel: string
   ): {
     chunks: ModelStreamChunk[]
     text: string
@@ -911,7 +922,7 @@ export class DeepseekCompatModelClient implements ModelClient {
       }
     } else if (type === 'response.completed') {
       const response = recordValue(payload, 'response') as ResponsesApiResponse | null
-      const materialized = this.materializeResponsesOutput(response ?? (payload as ResponsesApiResponse), {
+      const materialized = this.materializeResponsesOutput(response ?? (payload as ResponsesApiResponse), requestModel, {
         skipText: Boolean(text),
         pendingArguments,
         completedToolCalls
@@ -933,7 +944,8 @@ export class DeepseekCompatModelClient implements ModelClient {
     pendingByIndex: Map<number, string>,
     completedToolCalls: Set<string>,
     textAccumulator: string,
-    reasoningAccumulator: string
+    reasoningAccumulator: string,
+    requestModel: string
   ): {
     chunks: ModelStreamChunk[]
     text: string
@@ -952,7 +964,7 @@ export class DeepseekCompatModelClient implements ModelClient {
     if (type === 'message_start') {
       const message = recordValue(payload, 'message')
       const usagePayload = message ? recordValue(message, 'usage') : null
-      if (usagePayload) usage = this.mapUsage(usagePayload)
+      if (usagePayload) usage = this.mapUsage(usagePayload, responseModelOrFallback(message, requestModel))
     } else if (type === 'content_block_start') {
       const block = recordValue(payload, 'content_block')
       if (block && recordString(block, 'type') === 'tool_use') {
@@ -1022,7 +1034,7 @@ export class DeepseekCompatModelClient implements ModelClient {
       const mappedStopReason = anthropicStopReason(stopReason)
       if (mappedStopReason) finishReason = mappedStopReason
       const usagePayload = recordValue(payload, 'usage')
-      if (usagePayload) usage = this.mapUsage(usagePayload)
+      if (usagePayload) usage = this.mapUsage(usagePayload, responseModelOrFallback(payload, requestModel))
     } else if (type === 'message_stop') {
       finishReason = finishReason ?? 'stop'
     } else if (type === 'error') {
@@ -1034,14 +1046,15 @@ export class DeepseekCompatModelClient implements ModelClient {
 
   private *materializeNonStreaming(
     payload: ChatCompletionResponse,
-    endpointFormat: ModelEndpointFormat
+    endpointFormat: ModelEndpointFormat,
+    requestModel: string
   ): Generator<ModelStreamChunk> {
     if (endpointFormat === 'responses') {
-      yield* this.materializeResponsesNonStreaming(payload as unknown as ResponsesApiResponse)
+      yield* this.materializeResponsesNonStreaming(payload as unknown as ResponsesApiResponse, requestModel)
       return
     }
     if (endpointFormat === 'messages') {
-      yield* this.materializeAnthropicMessagesNonStreaming(payload as unknown as AnthropicMessageResponse)
+      yield* this.materializeAnthropicMessagesNonStreaming(payload as unknown as AnthropicMessageResponse, requestModel)
       return
     }
     const choice = payload.choices?.[0]
@@ -1069,7 +1082,7 @@ export class DeepseekCompatModelClient implements ModelClient {
       }
     }
     if (payload.usage) {
-      yield { kind: 'usage', usage: this.mapUsage(payload.usage) }
+      yield { kind: 'usage', usage: this.mapUsage(payload.usage, responseModelOrFallback(payload, requestModel)) }
     }
     let stopReason: 'stop' | 'tool_calls' | 'length' | 'error' = 'stop'
     if (choice.finish_reason === 'tool_calls') stopReason = 'tool_calls'
@@ -1079,13 +1092,14 @@ export class DeepseekCompatModelClient implements ModelClient {
   }
 
   private *materializeResponsesNonStreaming(
-    payload: ResponsesApiResponse
+    payload: ResponsesApiResponse,
+    requestModel: string
   ): Generator<ModelStreamChunk> {
     if (payload.error?.message) {
-      yield { kind: 'error', message: payload.error.message, code: payload.error.type }
+      yield { kind: 'error', message: providerDiagnostic(payload.error.message), code: payload.error.type }
       return
     }
-    const materialized = this.materializeResponsesOutput(payload)
+    const materialized = this.materializeResponsesOutput(payload, requestModel)
     yield* materialized.chunks
     if (materialized.usage) {
       yield { kind: 'usage', usage: materialized.usage }
@@ -1095,6 +1109,7 @@ export class DeepseekCompatModelClient implements ModelClient {
 
   private materializeResponsesOutput(
     payload: ResponsesApiResponse,
+    requestModel: string,
     options: {
       skipText?: boolean
       pendingArguments?: Map<string, PendingToolCall>
@@ -1134,7 +1149,9 @@ export class DeepseekCompatModelClient implements ModelClient {
         arguments: this.parseToolArguments(argsRaw)
       })
     }
-    const usage = payload.usage ? this.mapUsage(payload.usage) : null
+    const usage = payload.usage
+      ? this.mapUsage(payload.usage, responseModelOrFallback(payload, requestModel))
+      : null
     let finishReason: ModelStopReason = sawToolCall ? 'tool_calls' : 'stop'
     if (payload.status === 'incomplete') {
       finishReason = payload.incomplete_details?.reason === 'max_output_tokens' ? 'length' : 'error'
@@ -1145,7 +1162,8 @@ export class DeepseekCompatModelClient implements ModelClient {
   }
 
   private *materializeAnthropicMessagesNonStreaming(
-    payload: AnthropicMessageResponse
+    payload: AnthropicMessageResponse,
+    requestModel: string
   ): Generator<ModelStreamChunk> {
     let sawToolCall = false
     for (const block of payload.content ?? []) {
@@ -1172,12 +1190,12 @@ export class DeepseekCompatModelClient implements ModelClient {
       }
     }
     if (payload.usage) {
-      yield { kind: 'usage', usage: this.mapUsage(payload.usage) }
+      yield { kind: 'usage', usage: this.mapUsage(payload.usage, responseModelOrFallback(payload, requestModel)) }
     }
     yield { kind: 'completed', stopReason: anthropicStopReason(payload.stop_reason) ?? (sawToolCall ? 'tool_calls' : 'stop') }
   }
 
-  private mapUsage(usage: Record<string, unknown>): UsageSnapshot {
+  private mapUsage(usage: Record<string, unknown>, model: string): UsageSnapshot {
     const promptTokens = Number(usage.prompt_tokens ?? usage.prompt_eval_count ?? usage.input_tokens ?? 0) || 0
     const completionTokens = Number(usage.completion_tokens ?? usage.eval_count ?? usage.output_tokens ?? 0) || 0
     const totalTokens = Number(usage.total_tokens ?? promptTokens + completionTokens) || 0
@@ -1186,7 +1204,8 @@ export class DeepseekCompatModelClient implements ModelClient {
       | undefined
     const nativeHit = Number(usage.prompt_cache_hit_tokens ?? 0) || 0
     const nativeMiss = Number(usage.prompt_cache_miss_tokens ?? 0) || 0
-    const hasNativeCache = nativeHit > 0 || nativeMiss > 0
+    const hasNativeCache = Object.prototype.hasOwnProperty.call(usage, 'prompt_cache_hit_tokens') ||
+      Object.prototype.hasOwnProperty.call(usage, 'prompt_cache_miss_tokens')
     const cachedTokens = Number(promptDetails?.cached_tokens ?? 0) || 0
     const cacheRead = Number(usage.cache_read_input_tokens ?? 0) || 0
     const cacheCreation = Number(usage.cache_creation_input_tokens ?? 0) || 0
@@ -1195,14 +1214,14 @@ export class DeepseekCompatModelClient implements ModelClient {
     const cacheTotal = cacheHit + cacheMiss
     const cacheHitRate = cacheTotal === 0 ? null : cacheHit / cacheTotal
     const estimatedCost = estimateDeepseekCost({
-      model: this.config.model,
+      model,
       providerHost: this.config.baseUrl,
       cacheHitTokens: cacheHit,
       cacheMissTokens: cacheMiss,
       outputTokens: completionTokens
     })
     const estimatedSavings = estimateDeepseekCacheSavings({
-      model: this.config.model,
+      model,
       providerHost: this.config.baseUrl,
       cacheHitTokens: cacheHit
     })
@@ -1228,6 +1247,27 @@ export class DeepseekCompatModelClient implements ModelClient {
   private parseToolArguments(raw: string): Record<string, unknown> {
     return repairToolArguments(raw).arguments
   }
+}
+
+function effectiveRequestModel(request: ModelRequest, configuredModel: string): string {
+  return request.model.trim() || configuredModel
+}
+
+function responseModelOrFallback(payload: unknown, fallback: string): string {
+  if (!payload || typeof payload !== 'object') return fallback
+  const record = payload as Record<string, unknown>
+  const model = typeof record.model === 'string' ? record.model.trim() : ''
+  if (model) return model
+  const response = record.response
+  if (!response || typeof response !== 'object') return fallback
+  const responseModel = (response as Record<string, unknown>).model
+  return typeof responseModel === 'string' && responseModel.trim()
+    ? responseModel.trim()
+    : fallback
+}
+
+function providerDiagnostic(value: string): string {
+  return redactSecretText(value.slice(0, MAX_PROVIDER_DIAGNOSTIC_CHARS))
 }
 
 function normalizeToolSpecs(tools: ModelToolSpec[]): ModelToolSpec[] {
@@ -1481,7 +1521,7 @@ function indexFallbackCallId(index: number | undefined, pendingArguments: Map<st
 function responseErrorMessage(payload: Record<string, unknown>): string {
   const error = recordValue(payload, 'error') ?? recordValue(recordValue(payload, 'response'), 'error')
   const message = error ? recordString(error, 'message') : ''
-  return message || recordString(payload, 'message') || 'model stream reported an error'
+  return providerDiagnostic(message || recordString(payload, 'message') || 'model stream reported an error')
 }
 
 function anthropicStopReason(value: unknown): ModelStopReason | undefined {
@@ -1712,7 +1752,7 @@ async function readStreamChunk(
     .catch((error): StreamReadResult => {
       if (signal.aborted) return { kind: 'aborted' }
       const message = error instanceof Error ? error.message : String(error)
-      return { kind: 'error', message: `model stream read failed: ${message}` }
+      return { kind: 'error', message: `model stream read failed: ${providerDiagnostic(message)}` }
     })
   const abortPromise = new Promise<StreamReadResult>((resolve) => {
     const onAbort = (): void => resolve({ kind: 'aborted' })

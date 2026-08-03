@@ -357,6 +357,68 @@ describe('rigorous pipeline', () => {
     await rm(workspace, { recursive: true, force: true })
   })
 
+  it('pins every rigorous harness stage to the explicit Flash model', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-flash-pin-'))
+    const models: Array<string | undefined> = []
+    const child: ChildRunExecutor = async (input) => {
+      models.push(input.model)
+      if (input.artifactKind === 'plan') {
+        return { summary: 'plan', artifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] } }
+      }
+      if (input.artifactKind === 'execution') {
+        return { summary: 'execution', artifact: { summary: 's', filesChanged: [], deviationsFromPlan: [] } }
+      }
+      if (input.artifactKind === 'verification') {
+        return {
+          summary: 'verification',
+          artifact: { findings: [], criteriaResults: [{ criterion: 'acceptance', pass: true }], commandsRun: [] }
+        }
+      }
+      return { summary: 'verdict', artifact: { verdict: 'ship', reasons: ['ok'] } }
+    }
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({
+      title: 'Flash harness', workspace, model: 'deepseek-v4-pro', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work',
+        model: 'deepseek-v4-flash',
+        mode: 'rigorous',
+        harnessTask: REQUIRED_HARNESS_TASK
+      }
+    })
+
+    await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(models.length).toBeGreaterThanOrEqual(4)
+    expect(models.every((model) => model === 'deepseek-v4-flash')).toBe(true)
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('fails closed before role dispatch when a rigorous harness turn lacks a model pin', async () => {
+    let dispatched = false
+    const runtime = makeRuntime(async () => {
+      dispatched = true
+      return { summary: 'unexpected dispatch' }
+    })
+    const thread = await runtime.threads.create({
+      title: 'Unpinned harness', workspace: '/tmp/ws', model: 'deepseek-v4-pro', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: { prompt: 'do work', mode: 'rigorous', harnessTask: REQUIRED_HARNESS_TASK }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+    const persisted = await runtime.turns.getTurn(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect(dispatched).toBe(false)
+    expect(persisted?.error).toContain('explicit model pin')
+  })
+
   it('runs at most one fix round', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-'))
     let reviewerRuns = 0
@@ -596,6 +658,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'recover within budget',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'recover', risks: [], steps: ['fix'], verificationCriteria: [] },
         harnessTask: {
@@ -641,6 +704,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'recover within wall budget',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'recover', risks: [], steps: ['fix'], verificationCriteria: [] },
         harnessTask: {
@@ -687,6 +751,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: REQUIRED_HARNESS_TASK
@@ -747,6 +812,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: REQUIRED_HARNESS_TASK
@@ -802,6 +868,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: REQUIRED_HARNESS_TASK
@@ -860,6 +927,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: {
@@ -940,6 +1008,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: {
@@ -1035,6 +1104,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: {
@@ -1245,6 +1315,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: {
@@ -1306,6 +1377,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: {
@@ -1461,6 +1533,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: {
@@ -1546,6 +1619,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: {
@@ -1604,6 +1678,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'do work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: ['acceptance'] },
         harnessTask: {
@@ -1693,6 +1768,7 @@ describe('rigorous pipeline', () => {
       threadId: thread.id,
       request: {
         prompt: 'resume adaptive work',
+        model: 'harness-test-model',
         mode: 'rigorous',
         planArtifact: { intent: 'i', risks: [], steps: ['s'], verificationCriteria: [] },
         harnessTask: { ...REQUIRED_HARNESS_TASK, executionPolicy: 'adaptive' }

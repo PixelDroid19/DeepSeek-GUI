@@ -93,6 +93,100 @@ describe('DeepseekCompatModelClient', () => {
     expect(sentBodies[0]?.model).toBe('deepseek-v4-pro')
   })
 
+  it('prices a Flash request override instead of the configured Pro model', async () => {
+    const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({
+      id: 'flash-override',
+      choices: [{
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content: 'done' }
+      }],
+      usage: {
+        prompt_tokens: 1000,
+        completion_tokens: 100,
+        total_tokens: 1100,
+        prompt_cache_hit_tokens: 900,
+        prompt_cache_miss_tokens: 100
+      }
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://api.deepseek.com/beta',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-pro',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'deepseek-v4-flash'
+    const chunks: ModelStreamChunk[] = []
+
+    for await (const chunk of client.stream(request)) chunks.push(chunk)
+
+    const usage = chunks.find((chunk) => chunk.kind === 'usage')
+    expect(usage).toMatchObject({
+      kind: 'usage',
+      usage: { cacheHitTokens: 900, cacheMissTokens: 100 }
+    })
+    if (!usage || usage.kind !== 'usage') throw new Error('expected usage chunk')
+    expect(usage.usage.costUsd).toBeCloseTo(0.00004452, 12)
+    expect(usage.usage.costCny).toBeCloseTo(0.000318, 12)
+    expect(usage.usage.cacheSavingsUsd).toBeCloseTo(0.00012348, 12)
+    expect(usage.usage.cacheSavingsCny).toBeCloseTo(0.000882, 12)
+  })
+
+  it('keeps native cache counters while leaving unknown model cache pricing unset', async () => {
+    const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({
+      id: 'unknown-pricing',
+      model: 'provider-experimental-cache-model',
+      choices: [{
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content: 'done' }
+      }],
+      usage: {
+        prompt_tokens: 1000,
+        completion_tokens: 10,
+        total_tokens: 1010,
+        prompt_cache_hit_tokens: 0,
+        prompt_cache_miss_tokens: 0,
+        prompt_tokens_details: { cached_tokens: 777 }
+      }
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://api.deepseek.com',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-pro',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'provider-experimental-cache-model'
+    const chunks: ModelStreamChunk[] = []
+
+    for await (const chunk of client.stream(request)) chunks.push(chunk)
+
+    const usage = chunks.find((chunk) => chunk.kind === 'usage')
+    expect(usage).toMatchObject({
+      kind: 'usage',
+      usage: {
+        cacheHitTokens: 0,
+        cacheMissTokens: 0,
+        cacheHitRate: null
+      }
+    })
+    if (!usage || usage.kind !== 'usage') throw new Error('expected usage chunk')
+    expect(usage.usage.costUsd).toBeUndefined()
+    expect(usage.usage.costCny).toBeUndefined()
+    expect(usage.usage.cacheSavingsUsd).toBeUndefined()
+    expect(usage.usage.cacheSavingsCny).toBeUndefined()
+  })
+
   it('builds chat completions URLs for base URLs with and without version segments', async () => {
     const cases = [
       ['https://zenmux.ai/api', 'https://zenmux.ai/api/v1/chat/completions'],
@@ -131,6 +225,39 @@ describe('DeepseekCompatModelClient', () => {
 
       expect(sentUrls[0]).toBe(expectedUrl)
     }
+  })
+
+  it('uses DeepSeek Chat Completions for a Flash request unless Responses is selected', async () => {
+    const sentUrls: string[] = []
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (url, init) => {
+      sentUrls.push(String(url))
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'flash-chat',
+        model: 'deepseek-v4-flash',
+        choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }]
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://api.deepseek.com/beta',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-pro',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'deepseek-v4-flash'
+
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+
+    expect(sentUrls).toEqual(['https://api.deepseek.com/v1/chat/completions'])
+    expect(sentBodies[0]).toMatchObject({ model: 'deepseek-v4-flash' })
   })
 
   it('uses the Responses API format when selected', async () => {
@@ -1438,6 +1565,33 @@ describe('DeepseekCompatModelClient', () => {
       chunks.push(chunk)
     }
     expect(chunks[0].kind).toBe('error')
+  })
+
+  it('redacts and bounds provider HTTP diagnostics before yielding an error', async () => {
+    const providerSecret = 'provider-secret-value'
+    const tokenSecret = 'token-secret-value'
+    const apiSecret = 'api-secret-value'
+    const fetchImpl: typeof fetch = async () => new Response(
+      `Authorization: Bearer ${providerSecret}; token=${tokenSecret}; {"api_key":"${apiSecret}"} ${'x'.repeat(4000)}`,
+      { status: 401 }
+    )
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash',
+      fetchImpl
+    })
+    const chunks: ModelStreamChunk[] = []
+
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) chunks.push(chunk)
+
+    const error = chunks.find((chunk) => chunk.kind === 'error')
+    if (!error || error.kind !== 'error') throw new Error('expected error chunk')
+    expect(error.message).toContain('<redacted>')
+    expect(error.message).not.toContain(providerSecret)
+    expect(error.message).not.toContain(tokenSecret)
+    expect(error.message).not.toContain(apiSecret)
+    expect(error.message.length).toBeLessThanOrEqual(600)
   })
 
   it('parses streamed SSE events with tool call deltas', async () => {

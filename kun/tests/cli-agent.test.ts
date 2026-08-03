@@ -431,4 +431,62 @@ describe('Kun agent CLI commands', () => {
     expect(code).toBe(ServeExitCode.ok)
     expect(mode).toBe('rigorous')
   })
+
+  it('uses --harness-model as an explicit Flash pin for a rigorous one-shot', async () => {
+    let options: ServeOptions | undefined
+    let request: Parameters<ServerRuntime['turnService']['startTurn']>[0]['request'] | undefined
+    const c = capture({
+      createRuntime: fakeRuntime({
+        onOptions: (next) => {
+          options = next
+        },
+        onStartTurn: (input) => {
+          request = input.request
+        }
+      })
+    })
+
+    const code = await runAgentCommand('run', [
+      '--data-dir',
+      dataDir,
+      '--rigorous',
+      '--harness-model',
+      'deepseek-v4-flash',
+      '--prompt',
+      'hello',
+      '--json'
+    ], c.io)
+
+    expect(code).toBe(ServeExitCode.ok)
+    expect(options).toMatchObject({
+      model: 'deepseek-v4-flash',
+      baseUrl: 'https://api.deepseek.com/beta',
+      endpointFormat: 'chat_completions'
+    })
+    expect(request).toMatchObject({ model: 'deepseek-v4-flash', mode: 'rigorous' })
+  })
+
+  it('rejects an empty rigorous --harness-model before creating a runtime', async () => {
+    let created = false
+    const c = capture({
+      createRuntime: fakeRuntime({
+        onOptions: () => {
+          created = true
+        }
+      })
+    })
+
+    const code = await runAgentCommand('run', [
+      '--data-dir',
+      dataDir,
+      '--rigorous',
+      '--harness-model=',
+      '--prompt',
+      'hello'
+    ], c.io)
+
+    expect(code).toBe(ServeExitCode.config)
+    expect(created).toBe(false)
+    expect(c.stderr).toContain('requires a non-empty model id')
+  })
 })
