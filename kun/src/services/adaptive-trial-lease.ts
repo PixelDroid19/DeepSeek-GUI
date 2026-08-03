@@ -6,8 +6,9 @@ export const DEFAULT_TURN_LEASE_TTL_MS = 5 * 60_000
 /** @deprecated Use DEFAULT_TURN_LEASE_TTL_MS. */
 export const DEFAULT_ADAPTIVE_TRIAL_LEASE_TTL_MS = DEFAULT_TURN_LEASE_TTL_MS
 const RECLAIM_GUARD_TTL_MS = 30_000
+const RECLAIM_GUARD_RETRY_MS = 2
 
-export type TurnLeaseScope = 'thread' | 'turn'
+export type TurnLeaseScope = 'thread' | 'turn' | 'mutation'
 
 export type TurnLease = {
   version: 1
@@ -24,6 +25,8 @@ export interface TurnLeaseStore {
   acquire(input: { threadId: string; turnId: string }): Promise<TurnLease | null>
   /** Acquires a thread-scoped CAS lease used to serialize every turn start. */
   acquireThread(input: { threadId: string; turnId: string }): Promise<TurnLease | null>
+  /** Acquires a thread-scoped CAS lease for one read-mutate-write operation. */
+  acquireMutation(input: { threadId: string }): Promise<TurnLease | null>
   /** Releases a lease held by this runtime's owner/token. */
   release(lease: TurnLease): Promise<void>
   /**
@@ -77,6 +80,10 @@ export class InMemoryTurnLeaseStore implements TurnLeaseStore {
     return this.acquireLease({ ...input, scope: 'thread' })
   }
 
+  async acquireMutation(input: { threadId: string }): Promise<TurnLease | null> {
+    return this.acquireLease({ ...input, scope: 'mutation', turnId: '' })
+  }
+
   async release(lease: TurnLease): Promise<void> {
     const key = leaseKey(lease.scope, lease.threadId, lease.turnId)
     const current = this.leases.get(key)
@@ -128,6 +135,10 @@ export class FileTurnLeaseStore implements TurnLeaseStore {
     return this.acquireLease({ ...input, scope: 'thread' })
   }
 
+  async acquireMutation(input: { threadId: string }): Promise<TurnLease | null> {
+    return this.acquireLease({ ...input, scope: 'mutation', turnId: '' })
+  }
+
   private async acquireLease(input: LeaseInput): Promise<TurnLease | null> {
     await mkdir(this.rootDir, { recursive: true })
     const path = this.leasePath(input)
@@ -155,8 +166,7 @@ export class FileTurnLeaseStore implements TurnLeaseStore {
 
   async release(lease: TurnLease): Promise<void> {
     const path = this.leasePath(lease)
-    const guard = await this.acquireReclaimGuard(path)
-    if (!guard) return
+    const guard = await this.acquireReclaimGuardUntilAvailable(path)
     try {
       const current = await readLease(path)
       if (!matchesLease(current, lease)) return
@@ -170,8 +180,7 @@ export class FileTurnLeaseStore implements TurnLeaseStore {
 
   async releaseThread(input: { threadId: string; turnId: string }): Promise<void> {
     const path = this.leasePath({ scope: 'thread', ...input })
-    const guard = await this.acquireReclaimGuard(path)
-    if (!guard) return
+    const guard = await this.acquireReclaimGuardUntilAvailable(path)
     try {
       const current = await readLease(path)
       if (
@@ -224,6 +233,19 @@ export class FileTurnLeaseStore implements TurnLeaseStore {
     return null
   }
 
+  /**
+   * Owners must not lose a release simply because a competing acquire is
+   * briefly checking expiry under the reclaim guard. Unlike opportunistic
+   * expiry reclamation, release waits for that short critical section.
+   */
+  private async acquireReclaimGuardUntilAvailable(path: string): Promise<Awaited<ReturnType<typeof open>>> {
+    for (;;) {
+      const guard = await this.acquireReclaimGuard(path)
+      if (guard) return guard
+      await new Promise<void>((resolve) => setTimeout(resolve, RECLAIM_GUARD_RETRY_MS))
+    }
+  }
+
   private async releaseReclaimGuard(
     path: string,
     guard: Awaited<ReturnType<typeof open>>
@@ -263,7 +285,7 @@ function leaseKey(scope: TurnLeaseScope, threadId: string, turnId: string): stri
     // Preserve the pre-thread-lease path so a new runtime still observes an
     // in-flight per-turn lease created by the previous version.
     ? `${threadId}\u0000${turnId}`
-    : `\u0000thread\u0000${threadId}`
+    : `\u0000${scope}\u0000${threadId}`
   return createHash('sha256').update(identity).digest('hex')
 }
 
@@ -283,9 +305,11 @@ async function readLease(path: string): Promise<TurnLease | null> {
     const parsed = JSON.parse(await readFile(path, 'utf8')) as Partial<TurnLease>
     const scope: TurnLeaseScope | null = parsed.scope === 'thread'
       ? 'thread'
-      : parsed.scope === undefined || parsed.scope === 'turn'
-        ? 'turn'
-        : null
+      : parsed.scope === 'mutation'
+        ? 'mutation'
+        : parsed.scope === undefined || parsed.scope === 'turn'
+          ? 'turn'
+          : null
     if (
       parsed.version === 1 &&
       scope &&
@@ -294,7 +318,8 @@ async function readLease(path: string): Promise<TurnLease | null> {
       typeof parsed.threadId === 'string' && parsed.threadId.length > 0 &&
       // Empty thread turn IDs were written by the first thread-lease version;
       // retain them fail-closed until expiry during a rolling upgrade.
-      typeof parsed.turnId === 'string' && (scope === 'thread' || parsed.turnId.length > 0) &&
+      typeof parsed.turnId === 'string' &&
+      (scope === 'thread' || scope === 'mutation' || parsed.turnId.length > 0) &&
       typeof parsed.expiresAtMs === 'number' && Number.isFinite(parsed.expiresAtMs)
     ) {
       return { ...parsed, scope } as TurnLease

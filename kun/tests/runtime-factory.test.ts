@@ -98,6 +98,32 @@ function adaptiveMarker(phase: AdaptiveTrialMarker['phase'] = 'ready'): Adaptive
   }
 }
 
+class SnapshotBarrierFileThreadStore extends FileThreadStore {
+  constructor(
+    dataDir: string,
+    private readonly afterSnapshot: (threadId: string) => Promise<void>
+  ) {
+    super({ dataDir })
+  }
+
+  override async get(threadId: string) {
+    const snapshot = await super.get(threadId)
+    await this.afterSnapshot(threadId)
+    return snapshot
+  }
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: (() => void) | undefined
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return {
+    promise,
+    resolve: () => resolve?.()
+  }
+}
+
 function adaptiveTurn(
   id: string,
   items: TurnItem[] = [],
@@ -116,11 +142,17 @@ function adaptiveTurn(
   }
 }
 
-function sharedFileTurnRuntime(dataDir: string, owner: string, turnSuffix?: string): {
+function sharedFileTurnRuntime(
+  dataDir: string,
+  owner: string,
+  turnSuffix?: string,
+  options: { threadStore?: FileThreadStore } = {}
+): {
   threadStore: FileThreadStore
+  sessionStore: FileSessionStore
   turns: TurnService
 } {
-  const threadStore = new FileThreadStore({ dataDir })
+  const threadStore = options.threadStore ?? new FileThreadStore({ dataDir })
   const sessionStore = new FileSessionStore({ dataDir })
   const eventBus = new InMemoryEventBus()
   const nowIso = () => new Date().toISOString()
@@ -151,7 +183,7 @@ function sharedFileTurnRuntime(dataDir: string, owner: string, turnSuffix?: stri
     usage: new UsageService(),
     turnLeases: new FileTurnLeaseStore({ dataDir, owner })
   })
-  return { threadStore, turns }
+  return { threadStore, sessionStore, turns }
 }
 
 describe('runtime factory usage carryover', () => {
@@ -657,6 +689,77 @@ describe('runtime factory usage carryover', () => {
       })).rejects.toThrow('thread turn start is already active')
       await interrupter.turns.finishTurn({ threadId, turnId: successor.turnId, status: 'completed' })
     } finally {
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  it('fences a stale owner item behind a foreign interrupt across file stores', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'kun-foreign-interrupt-fence-'))
+    const threadId = 'thr_foreign_interrupt_fence'
+    const interruptSnapshot = deferred()
+    const ownerSnapshot = deferred()
+    const allowInterruptWrite = deferred()
+    const allowOwnerRead = deferred()
+    let interleave = false
+    try {
+      const ownerStore = new SnapshotBarrierFileThreadStore(dataDir, async (observedThreadId) => {
+        if (!interleave || observedThreadId !== threadId) return
+        ownerSnapshot.resolve()
+        await allowOwnerRead.promise
+      })
+      const interrupterStore = new SnapshotBarrierFileThreadStore(dataDir, async (observedThreadId) => {
+        if (!interleave || observedThreadId !== threadId) return
+        interruptSnapshot.resolve()
+        await allowInterruptWrite.promise
+      })
+      const owner = sharedFileTurnRuntime(dataDir, 'owner-fence-runtime', 'owner_fence', {
+        threadStore: ownerStore
+      })
+      const interrupter = sharedFileTurnRuntime(dataDir, 'interrupter-fence-runtime', 'interrupter_fence', {
+        threadStore: interrupterStore
+      })
+      await owner.threadStore.upsert(createThreadRecord({
+        id: threadId,
+        title: 'Foreign interrupt fence',
+        workspace: '/tmp',
+        model: 'test-model'
+      }))
+      const started = await owner.turns.startTurn({
+        threadId,
+        request: { prompt: 'adaptive owner turn', harnessTask: ADAPTIVE_TASK }
+      })
+
+      interleave = true
+      const interrupted = interrupter.turns.interruptTurn({ threadId, turnId: started.turnId })
+      await interruptSnapshot.promise
+      const staleApply = owner.turns.applyItem(threadId, makeAssistantTextItem({
+        id: 'item_stale_race_owner',
+        threadId,
+        turnId: started.turnId,
+        text: 'late owner output'
+      }))
+      const ownerReadBeforeInterrupt = await Promise.race([
+        ownerSnapshot.promise.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50))
+      ])
+
+      // The mutation lease keeps the owner outside its stale read until the
+      // interrupter has durably written `aborted`.
+      expect(ownerReadBeforeInterrupt).toBe(false)
+      allowInterruptWrite.resolve()
+      await interrupted
+      allowOwnerRead.resolve()
+      await staleApply
+
+      const finalThread = await new FileThreadStore({ dataDir }).get(threadId)
+      const finalTurn = finalThread?.turns.find((turn) => turn.id === started.turnId)
+      expect(finalTurn?.status).toBe('aborted')
+      expect(finalTurn?.items.some((item) => item.id === 'item_stale_race_owner')).toBe(false)
+      expect((await owner.sessionStore.loadItems(threadId))
+        .some((item) => item.id === 'item_stale_race_owner')).toBe(false)
+    } finally {
+      allowInterruptWrite.resolve()
+      allowOwnerRead.resolve()
       await rm(dataDir, { recursive: true, force: true })
     }
   })
