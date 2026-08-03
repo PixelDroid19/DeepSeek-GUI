@@ -137,7 +137,7 @@ describe('DeepseekCompatModelClient', () => {
     expect(usage.usage.cacheSavingsCny).toBeCloseTo(0.000882, 12)
   })
 
-  it('keeps native cache counters while leaving unknown model cache pricing unset', async () => {
+  it('leaves unknown cache pricing and inconsistent native zero telemetry unset', async () => {
     const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({
       id: 'unknown-pricing',
       model: 'provider-experimental-cache-model',
@@ -174,17 +174,103 @@ describe('DeepseekCompatModelClient', () => {
     const usage = chunks.find((chunk) => chunk.kind === 'usage')
     expect(usage).toMatchObject({
       kind: 'usage',
-      usage: {
-        cacheHitTokens: 0,
-        cacheMissTokens: 0,
-        cacheHitRate: null
-      }
+      usage: { cacheHitRate: null }
     })
     if (!usage || usage.kind !== 'usage') throw new Error('expected usage chunk')
+    expect(usage.usage.cachedTokens).toBeUndefined()
+    expect(usage.usage.cacheHitTokens).toBeUndefined()
+    expect(usage.usage.cacheMissTokens).toBeUndefined()
     expect(usage.usage.costUsd).toBeUndefined()
     expect(usage.usage.costCny).toBeUndefined()
     expect(usage.usage.cacheSavingsUsd).toBeUndefined()
     expect(usage.usage.cacheSavingsCny).toBeUndefined()
+  })
+
+  it('omits inconsistent native zero cache telemetry for a nonempty prompt', async () => {
+    const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({
+      id: 'inconsistent-native-cache',
+      model: 'deepseek-v4-flash',
+      choices: [{
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content: 'done' }
+      }],
+      usage: {
+        prompt_tokens: 1000,
+        completion_tokens: 0,
+        total_tokens: 1000,
+        prompt_cache_hit_tokens: 0,
+        prompt_cache_miss_tokens: 0,
+        prompt_tokens_details: { cached_tokens: 777 }
+      }
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://api.deepseek.com',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const chunks: ModelStreamChunk[] = []
+
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) chunks.push(chunk)
+
+    const usage = chunks.find((chunk) => chunk.kind === 'usage')
+    if (!usage || usage.kind !== 'usage') throw new Error('expected usage chunk')
+    expect(usage.usage.cacheHitRate).toBeNull()
+    expect(usage.usage.cachedTokens).toBeUndefined()
+    expect(usage.usage.cacheHitTokens).toBeUndefined()
+    expect(usage.usage.cacheMissTokens).toBeUndefined()
+    expect(usage.usage.costUsd).toBeUndefined()
+    expect(usage.usage.costCny).toBeUndefined()
+    expect(usage.usage.cacheSavingsUsd).toBeUndefined()
+    expect(usage.usage.cacheSavingsCny).toBeUndefined()
+  })
+
+  it('keeps native zero cache counters valid when the prompt has zero tokens', async () => {
+    const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({
+      id: 'zero-prompt-native-cache',
+      model: 'deepseek-v4-flash',
+      choices: [{
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content: 'done' }
+      }],
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 10,
+        total_tokens: 10,
+        prompt_cache_hit_tokens: 0,
+        prompt_cache_miss_tokens: 0
+      }
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://api.deepseek.com',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const chunks: ModelStreamChunk[] = []
+
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) chunks.push(chunk)
+
+    const usage = chunks.find((chunk) => chunk.kind === 'usage')
+    expect(usage).toMatchObject({
+      kind: 'usage',
+      usage: { cacheHitTokens: 0, cacheMissTokens: 0, cacheHitRate: null }
+    })
+    if (!usage || usage.kind !== 'usage') throw new Error('expected usage chunk')
+    expect(usage.usage.costUsd).toBeCloseTo(0.0000028, 12)
+    expect(usage.usage.costCny).toBeCloseTo(0.00002, 12)
+    expect(usage.usage.cacheSavingsUsd).toBe(0)
+    expect(usage.usage.cacheSavingsCny).toBe(0)
   })
 
   it('builds chat completions URLs for base URLs with and without version segments', async () => {
@@ -1591,6 +1677,28 @@ describe('DeepseekCompatModelClient', () => {
     expect(error.message).not.toContain(providerSecret)
     expect(error.message).not.toContain(tokenSecret)
     expect(error.message).not.toContain(apiSecret)
+    expect(error.message.length).toBeLessThanOrEqual(600)
+  })
+
+  it('redacts an access token before truncating a provider diagnostic', async () => {
+    const accessToken = 'boundary-secret-crossing-limit'
+    const body = `${'x'.repeat(483)}{"access_token":"${accessToken}"}`
+    const fetchImpl: typeof fetch = async () => new Response(body, { status: 401 })
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash',
+      fetchImpl
+    })
+    const chunks: ModelStreamChunk[] = []
+
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) chunks.push(chunk)
+
+    const error = chunks.find((chunk) => chunk.kind === 'error')
+    if (!error || error.kind !== 'error') throw new Error('expected error chunk')
+    expect(error.message).toContain('<redacted>')
+    expect(error.message).not.toContain(accessToken)
+    expect(error.message).not.toContain('boundary')
     expect(error.message.length).toBeLessThanOrEqual(600)
   })
 

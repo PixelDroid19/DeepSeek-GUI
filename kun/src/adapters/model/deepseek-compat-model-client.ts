@@ -1,6 +1,6 @@
 import type { ModelClient, ModelRequest, ModelStreamChunk, ModelToolSpec } from '../../ports/model-client.js'
 import type { TurnItem } from '../../contracts/items.js'
-import { emptyUsageSnapshot, type UsageSnapshot } from '../../contracts/usage.js'
+import type { UsageSnapshot } from '../../contracts/usage.js'
 import { estimateDeepseekCacheSavings, estimateDeepseekCost } from './deepseek-pricing.js'
 import { isToolResultBridgeItem, repairModelHistoryItems } from '../../domain/model-history-repair.js'
 import { repairToolArguments } from './tool-argument-repair.js'
@@ -1208,39 +1208,57 @@ export class DeepseekCompatModelClient implements ModelClient {
       Object.prototype.hasOwnProperty.call(usage, 'prompt_cache_miss_tokens')
     const cachedTokens = Number(promptDetails?.cached_tokens ?? 0) || 0
     const cacheRead = Number(usage.cache_read_input_tokens ?? 0) || 0
-    const cacheCreation = Number(usage.cache_creation_input_tokens ?? 0) || 0
+    const hasInconsistentNativeZeroCounts = hasNativeCache && promptTokens > 0 && nativeHit === 0 && nativeMiss === 0
+    const cacheTelemetryReliable = !hasInconsistentNativeZeroCounts
     const cacheHit = hasNativeCache ? nativeHit : (cachedTokens > 0 ? cachedTokens : cacheRead)
     const cacheMiss = hasNativeCache ? nativeMiss : Math.max(promptTokens - cacheHit, 0)
     const cacheTotal = cacheHit + cacheMiss
-    const cacheHitRate = cacheTotal === 0 ? null : cacheHit / cacheTotal
-    const estimatedCost = estimateDeepseekCost({
-      model,
-      providerHost: this.config.baseUrl,
-      cacheHitTokens: cacheHit,
-      cacheMissTokens: cacheMiss,
-      outputTokens: completionTokens
-    })
-    const estimatedSavings = estimateDeepseekCacheSavings({
-      model,
-      providerHost: this.config.baseUrl,
-      cacheHitTokens: cacheHit
-    })
+    const cacheHitRate = cacheTelemetryReliable && cacheTotal > 0 ? cacheHit / cacheTotal : null
+    const estimatedCost = cacheTelemetryReliable
+      ? estimateDeepseekCost({
+          model,
+          providerHost: this.config.baseUrl,
+          cacheHitTokens: cacheHit,
+          cacheMissTokens: cacheMiss,
+          outputTokens: completionTokens
+        })
+      : null
+    const estimatedSavings = cacheTelemetryReliable
+      ? estimateDeepseekCacheSavings({
+          model,
+          providerHost: this.config.baseUrl,
+          cacheHitTokens: cacheHit
+        })
+      : null
     const reportedCostUsd = Number(usage.cost_usd ?? usage.costUsd)
     const reportedCostCny = Number(usage.cost_cny ?? usage.costCny)
+    const cacheTelemetry: Partial<Pick<UsageSnapshot, 'cachedTokens' | 'cacheHitTokens' | 'cacheMissTokens'>> =
+      cacheTelemetryReliable
+        ? {
+            cachedTokens: cacheHit || cachedTokens || cacheRead || 0,
+            cacheHitTokens: cacheHit,
+            cacheMissTokens: cacheMiss
+          }
+        : {}
+    const pricing: Partial<Pick<UsageSnapshot, 'costUsd' | 'costCny' | 'cacheSavingsUsd' | 'cacheSavingsCny'>> = {}
+    if (cacheTelemetryReliable) {
+      if (Number.isFinite(reportedCostUsd)) pricing.costUsd = reportedCostUsd
+      else if (estimatedCost) pricing.costUsd = estimatedCost.costUsd
+      if (Number.isFinite(reportedCostCny)) pricing.costCny = reportedCostCny
+      else if (estimatedCost) pricing.costCny = estimatedCost.costCny
+      if (estimatedSavings) {
+        pricing.cacheSavingsUsd = estimatedSavings.costUsd
+        pricing.cacheSavingsCny = estimatedSavings.costCny
+      }
+    }
     return {
-      ...emptyUsageSnapshot(),
       promptTokens,
       completionTokens,
       totalTokens,
-      cachedTokens: cacheHit || cachedTokens || cacheRead || 0,
-      cacheHitTokens: cacheHit,
-      cacheMissTokens: cacheMiss,
       cacheHitRate,
       turns: 1,
-      costUsd: Number.isFinite(reportedCostUsd) ? reportedCostUsd : estimatedCost?.costUsd,
-      costCny: Number.isFinite(reportedCostCny) ? reportedCostCny : estimatedCost?.costCny,
-      cacheSavingsUsd: estimatedSavings?.costUsd,
-      cacheSavingsCny: estimatedSavings?.costCny
+      ...cacheTelemetry,
+      ...pricing
     }
   }
 
@@ -1267,7 +1285,7 @@ function responseModelOrFallback(payload: unknown, fallback: string): string {
 }
 
 function providerDiagnostic(value: string): string {
-  return redactSecretText(value.slice(0, MAX_PROVIDER_DIAGNOSTIC_CHARS))
+  return redactSecretText(value).slice(0, MAX_PROVIDER_DIAGNOSTIC_CHARS)
 }
 
 function normalizeToolSpecs(tools: ModelToolSpec[]): ModelToolSpec[] {

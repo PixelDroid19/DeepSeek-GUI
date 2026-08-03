@@ -1,9 +1,13 @@
 const SECRET_KEY_PATTERN = /(api[-_]?key|authorization|bearer|client[-_]?secret|password|secret|token)/i
+const SECRET_FIELD_NAME_PATTERN = '(?:authorization|api[-_]?key|client[-_]?secret|password|(?:[a-z0-9]+[-_]?)?(?:token|secret))'
 const SECRET_TEXT_PATTERNS = [
-  /\b(authorization|api[-_]?key|client[-_]?secret|password|token)\s*[:=]\s*((?:Bearer\s+)?[^\s,;]+)/gi,
+  new RegExp(`\\b(${SECRET_FIELD_NAME_PATTERN})\\s*[:=]\\s*((?:Bearer\\s+)?[^\\s,;]+)`, 'gi'),
   /\bbearer\s+([^\s,;]+)/gi
 ]
-const QUOTED_SECRET_FIELD_PATTERN = /(["'](?:authorization|api[-_]?key|client[-_]?secret|password|secret|token)["']\s*:\s*["'])(?:Bearer\s+)?[^"']*(["'])/gi
+const QUOTED_SECRET_FIELD_PATTERN = new RegExp(
+  `(["']${SECRET_FIELD_NAME_PATTERN}["']\\s*:\\s*["'])(?:Bearer\\s+)?[^"']*(["'])`,
+  'gi'
+)
 
 export const REDACTED_SECRET = '<redacted>'
 
