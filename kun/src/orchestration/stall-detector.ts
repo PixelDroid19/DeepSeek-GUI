@@ -62,6 +62,12 @@ export const DEFAULT_STALL_DETECTOR_CONFIG = {
   budgetPressureRatio: 0.9
 } as const
 
+const MAX_NORMALIZED_TEXT_LENGTH = 256
+const MAX_NORMALIZED_KEY_LENGTH = 128
+const MAX_NORMALIZED_COLLECTION_ENTRIES = 4
+const MAX_NORMALIZED_DEPTH = 2
+const MAX_NORMALIZED_SERIALIZED_BYTES = 16_384
+
 type NormalizedObservation = {
   actionKind?: StallActionKind
   actionSignature?: string
@@ -248,9 +254,12 @@ function repeatedReadSuffix(observations: readonly NormalizedObservation[], thre
 function hasNoProgressWindow(observations: readonly NormalizedObservation[], threshold: number): boolean {
   if (observations.length < threshold) return false
   const window = observations.slice(-threshold)
-  const diffFingerprints = window.map((observation) => observation.diffFingerprint)
-  const evidenceFingerprints = window.map((observation) => observation.evidenceFingerprint)
-  return !changedWithinWindow(diffFingerprints) && !changedWithinWindow(evidenceFingerprints)
+  const progressFingerprints = window.map((observation) => {
+    if (!observation.diffFingerprint && !observation.evidenceFingerprint) return undefined
+    return `${observation.diffFingerprint ?? ''}:${observation.evidenceFingerprint ?? ''}`
+  })
+  return progressFingerprints.every((fingerprint) => fingerprint !== undefined) &&
+    !changedWithinWindow(progressFingerprints)
 }
 
 function changedWithinWindow(values: readonly (string | undefined)[]): boolean {
@@ -272,24 +281,50 @@ function makeSignal(
 }
 
 function stableJson(value: unknown): string {
-  return JSON.stringify(normalizeValue(value, new WeakSet<object>()))
+  return JSON.stringify(normalizeValue(value, new WeakSet<object>())).slice(0, MAX_NORMALIZED_SERIALIZED_BYTES)
 }
 
-function normalizeValue(value: unknown, seen: WeakSet<object>, key = ''): unknown {
+function normalizeValue(value: unknown, seen: WeakSet<object>, key = '', depth = 0): unknown {
   if (value === null || value === undefined) return null
   if (typeof value === 'string') return isSecretKey(key) ? '<redacted>' : normalizeText(value)
   if (typeof value === 'boolean') return value
   if (typeof value === 'number') return Number.isFinite(value) ? value : '<non-finite>'
   if (typeof value !== 'object') return `<${typeof value}>`
+  if (depth >= MAX_NORMALIZED_DEPTH) return '<depth-limit>'
   if (seen.has(value)) return '<cycle>'
   seen.add(value)
-  if (Array.isArray(value)) return value.map((entry) => normalizeValue(entry, seen))
+  if (Array.isArray(value)) {
+    const entries = value
+      .slice(0, MAX_NORMALIZED_COLLECTION_ENTRIES)
+      .map((entry) => normalizeValue(entry, seen, '', depth + 1))
+    if (value.length > MAX_NORMALIZED_COLLECTION_ENTRIES) entries.push('<truncated>')
+    return entries
+  }
   const record = value as Record<string, unknown>
-  return Object.fromEntries(
-    Object.keys(record)
-      .sort()
-      .map((entry) => [entry, isVolatileKey(entry) ? '<volatile>' : normalizeValue(record[entry], seen, entry)])
-  )
+  const entries: Array<{ original: string; normalized: string; volatile: boolean }> = []
+  for (const original in record) {
+    if (!Object.prototype.hasOwnProperty.call(record, original)) continue
+    const index = entries.length
+    const isLongKey = original.length > MAX_NORMALIZED_KEY_LENGTH
+    entries.push({
+      original,
+      normalized: isLongKey ? `<long-key-${index}>` : original,
+      // Do not inspect a long key further: redact its value rather than
+      // spending unbounded work classifying an attacker-controlled name.
+      volatile: isLongKey || isVolatileKey(original)
+    })
+    if (entries.length > MAX_NORMALIZED_COLLECTION_ENTRIES) break
+  }
+  const truncated = entries.length > MAX_NORMALIZED_COLLECTION_ENTRIES
+  if (truncated) entries.pop()
+  const normalized: Record<string, unknown> = {}
+  for (const entry of entries.sort((left, right) => left.normalized.localeCompare(right.normalized))) {
+    normalized[entry.normalized] = entry.volatile
+      ? '<volatile>'
+      : normalizeValue(record[entry.original], seen, entry.original, depth + 1)
+  }
+  if (truncated) normalized['<truncated>'] = true
+  return normalized
 }
 
 function isSecretKey(key: string): boolean {
@@ -315,13 +350,14 @@ function isVolatileKey(key: string): boolean {
 
 function normalizeText(value: string): string {
   return value
+    .slice(0, MAX_NORMALIZED_TEXT_LENGTH)
     .trim()
     .replace(/\b(?:bearer)\s+[^\s,;]+/gi, 'bearer <redacted>')
     .replace(/\b(api[_-]?key|authorization|cookie|password|secret|token)\s*[:=]\s*[^\s,;]+/gi, '$1=<redacted>')
     .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<uuid>')
     .replace(/\/tmp\/[^\s:]+/g, '/tmp/<path>')
     .replace(/\b\d{2,}\b/g, '<number>')
-    .slice(0, 4_000)
+    .slice(0, MAX_NORMALIZED_TEXT_LENGTH)
 }
 
 function digest(value: string): string {

@@ -13,6 +13,7 @@ import { touchThread } from '../domain/thread.js'
 import type { RuntimeEventRecorder } from './runtime-event-recorder.js'
 import type { RolesConfig } from '../config/kun-config.js'
 import { PlannerArtifactSchema } from '../contracts/roles.js'
+import type { HarnessTaskSpec } from '../contracts/harness.js'
 import { HarnessTaskSpecSchema } from '../contracts/harness.js'
 
 export type TurnServiceDeps = {
@@ -56,6 +57,12 @@ export class TurnService {
         throw new Error('rigorous mode is disabled by roles.enabled=false')
       }
     }
+    const harnessTask = input.request.harnessTask
+      ? HarnessTaskSpecSchema.parse(input.request.harnessTask)
+      : undefined
+    if (harnessTask?.executionPolicy === 'adaptive' && (input.request.mode === 'plan' || thread.mode === 'plan')) {
+      throw new Error('adaptive harness trials are unavailable in plan mode')
+    }
     const turnId = this.deps.ids.next('turn')
     const turn = createTurnRecord({
       id: turnId,
@@ -68,9 +75,7 @@ export class TurnService {
       planArtifact: input.request.planArtifact
         ? PlannerArtifactSchema.parse(input.request.planArtifact)
         : undefined,
-      harnessTask: input.request.harnessTask
-        ? HarnessTaskSpecSchema.parse(input.request.harnessTask)
-        : undefined,
+      harnessTask,
       mode: input.request.mode
     })
     const userItem = makeUserItem({
@@ -82,11 +87,14 @@ export class TurnService {
       attachmentIds: input.request.attachmentIds ?? []
     })
     const controller = new AbortController()
-    await this.upsertThread(input.threadId, (current) => ({
-      ...touchThread(current, this.deps.nowIso()),
-      status: 'running',
-      turns: [...current.turns, startTurnRecord(appendTurnItem(turn, userItem))]
-    }))
+    await this.upsertThread(input.threadId, (current) => {
+      this.assertAdaptiveTurnCanStart(current, harnessTask)
+      return {
+        ...touchThread(current, this.deps.nowIso()),
+        status: 'running',
+        turns: [...current.turns, startTurnRecord(appendTurnItem(turn, userItem))]
+      }
+    })
     await this.deps.sessionStore.appendItem(input.threadId, userItem)
     await this.deps.events.record({
       kind: 'turn_started',
@@ -361,6 +369,21 @@ export class TurnService {
       if (this.threadMutationQueues.get(threadId) === guard) {
         this.threadMutationQueues.delete(threadId)
       }
+    }
+  }
+
+  /**
+   * This check runs inside the per-thread mutation queue. Checking before
+   * enqueueing would allow two simultaneous starts to observe the same idle
+   * thread and share adaptive usage accounting.
+   */
+  private assertAdaptiveTurnCanStart(thread: ThreadRecord, harnessTask: HarnessTaskSpec | undefined): void {
+    const runningTurns = thread.turns.filter((turn) => turn.status === 'running')
+    const adaptiveTurnRunning = runningTurns.some(
+      (turn) => turn.harnessTask?.executionPolicy === 'adaptive'
+    )
+    if (adaptiveTurnRunning || (harnessTask?.executionPolicy === 'adaptive' && runningTurns.length > 0)) {
+      throw new Error('adaptive harness trial requires exclusive thread execution')
     }
   }
 

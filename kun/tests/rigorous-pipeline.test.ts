@@ -1653,6 +1653,60 @@ describe('rigorous pipeline', () => {
     await rm(workspace, { recursive: true, force: true })
   })
 
+  it('fails closed instead of falling back when an adaptive planner artifact is missing', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-adaptive-fallback-'))
+    const child: ChildRunExecutor = async () => ({ summary: 'planner prose without json' })
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({
+      title: 'Adaptive rigorous', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'do work',
+        model: 'thread-model',
+        mode: 'rigorous',
+        harnessTask: { ...REQUIRED_HARNESS_TASK, executionPolicy: 'adaptive' }
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect((await runtime.turns.getTurn(thread.id, turn.turnId))?.error).toContain('adaptive rigorous pipeline')
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('atomically refuses concurrent starts when one turn is adaptive', async () => {
+    const runtime = makeRuntime(async () => ({ summary: 'unused' }))
+    const thread = await runtime.threads.create({
+      title: 'Adaptive serial', workspace: '/tmp', model: 'thread-model', mode: 'agent'
+    })
+    const starts = await Promise.allSettled([
+      runtime.turns.startTurn({
+        threadId: thread.id,
+        request: {
+          prompt: 'adaptive work',
+          harnessTask: { ...REQUIRED_HARNESS_TASK, executionPolicy: 'adaptive' }
+        }
+      }),
+      runtime.turns.startTurn({
+        threadId: thread.id,
+        request: { prompt: 'concurrent normal work' }
+      })
+    ])
+    const accepted = starts.find((start) => start.status === 'fulfilled')
+    const rejected = starts.find((start) => start.status === 'rejected')
+
+    expect(accepted?.status).toBe('fulfilled')
+    expect(rejected?.status).toBe('rejected')
+    if (!accepted || accepted.status !== 'fulfilled') throw new Error('expected one accepted start')
+    if (!rejected || rejected.status !== 'rejected') throw new Error('expected one rejected start')
+    expect(String(rejected.reason)).toContain('adaptive harness trial')
+
+    await runtime.turns.interruptTurn({ threadId: thread.id, turnId: accepted.value.turnId })
+  })
+
   it('marks the parent turn failed with role context when a stage fails', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-'))
     const child: ChildRunExecutor = async (input) => {

@@ -78,6 +78,64 @@ describe('AgentLoop', () => {
     )
   })
 
+  it('vetoes a final no-tool model response through the model-step observer', async () => {
+    const h = makeHarness({
+      provider: 'adaptive-final-budget',
+      model: 'adaptive-final-budget',
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        yield {
+          kind: 'usage',
+          usage: {
+            promptTokens: 7,
+            completionTokens: 3,
+            totalTokens: 10,
+            cacheHitRate: null,
+            turns: 1
+          }
+        }
+        yield { kind: 'assistant_text_delta', text: 'final answer' }
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    })
+    await bootstrapThread(h)
+
+    const phases: string[] = []
+    const status = await h.loop.runTurn(h.threadId, h.turnId, {
+      onModelStep: async ({ phase, toolCallCount }) => {
+        phases.push(`${phase}:${toolCallCount ?? 0}`)
+        return phase === 'after_model' ? 'escalate' as const : 'continue' as const
+      }
+    })
+
+    expect(status).toBe('escalated')
+    expect(phases).toEqual(['before_model:0', 'after_model:0'])
+    expect((await h.turns.getTurn(h.threadId, h.turnId))?.status).toBe('running')
+    expect((await h.sessionStore.loadItems(h.threadId))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'assistant_text', text: 'final answer' })
+    ]))
+  })
+
+  it('vetoes before a model request when the adaptive budget is already exhausted', async () => {
+    let streamCalls = 0
+    const h = makeHarness({
+      provider: 'adaptive-preflight-budget',
+      model: 'adaptive-preflight-budget',
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        streamCalls += 1
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    })
+    await bootstrapThread(h)
+
+    const status = await h.loop.runTurn(h.threadId, h.turnId, {
+      onModelStep: ({ phase }) => phase === 'before_model' ? 'escalate' : 'continue'
+    })
+
+    expect(status).toBe('escalated')
+    expect(streamCalls).toBe(0)
+    expect((await h.turns.getTurn(h.threadId, h.turnId))?.status).toBe('running')
+  })
+
   it('injects the current shell runtime when bash is available', async () => {
     let observedRequest: ModelRequest | null = null
     const h = makeHarness({

@@ -185,6 +185,15 @@ export class RigorousPipeline {
         }
         if (!planned.artifact) {
           await this.recordWarning(threadId, turnId, 'Planner did not return a parseable plan artifact; falling back to normal loop.')
+          if (turn.harnessTask?.executionPolicy === 'adaptive') {
+            await this.deps.turns.finishTurn({
+              threadId,
+              turnId,
+              status: 'failed',
+              error: 'adaptive rigorous pipeline cannot fall back to the normal loop'
+            })
+            return 'failed'
+          }
           return 'fallback'
         }
         plan = PlannerArtifactSchema.parse(planned.artifact)

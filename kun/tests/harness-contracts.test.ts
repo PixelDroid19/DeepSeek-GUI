@@ -167,6 +167,11 @@ describe('harness contracts', () => {
     const harness = makeHarness(makeSilentModel())
     await bootstrapThread(harness)
     const normalTurn = await harness.turns.getTurn(harness.threadId, harness.turnId)
+    await harness.turns.finishTurn({
+      threadId: harness.threadId,
+      turnId: harness.turnId,
+      status: 'completed'
+    })
     const started = await harness.turns.startTurn({
       threadId: harness.threadId,
       request: {
@@ -182,5 +187,19 @@ describe('harness contracts', () => {
       executionPolicy: 'adaptive',
       benchmark: { family: 'harbor', version: '2026.08' }
     })
+  })
+
+  it('rejects adaptive harness tasks in plan mode before starting a turn', async () => {
+    const harness = makeHarness(makeSilentModel())
+    await bootstrapThread(harness)
+
+    await expect(harness.turns.startTurn({
+      threadId: harness.threadId,
+      request: {
+        prompt: 'Plan the benchmark task.',
+        mode: 'plan',
+        harnessTask: validTask
+      }
+    })).rejects.toThrow('adaptive harness trials are unavailable in plan mode')
   })
 })

@@ -62,6 +62,7 @@ import { SteeringQueue } from '../loop/steering-queue.js'
 import { RandomIdGenerator } from '../ports/id-generator.js'
 import type { SessionStore } from '../ports/session-store.js'
 import type { ThreadStore } from '../ports/thread-store.js'
+import type { ToolCallLike, ToolHostResult } from '../ports/tool-host.js'
 import { KUN_SYSTEM_PROMPT } from '../prompt/kun-system-prompt.js'
 import { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
 import { ThreadService } from '../services/thread-service.js'
@@ -79,6 +80,7 @@ import { DelegationRuntime, FileDelegationStore } from '../delegation/delegation
 import { createChildAgentExecutor } from '../delegation/child-agent-executor.js'
 import { RigorousPipeline } from '../orchestration/rigorous-pipeline.js'
 import {
+  adaptivePolicyForTask,
   adaptiveTrialUsageSince,
   decideAdaptiveEscalation,
   type AdaptiveTrialState,
@@ -88,6 +90,7 @@ import type { StallActionKind, StallObservation } from '../orchestration/stall-d
 import type { TurnItem } from '../contracts/items.js'
 import type { HarnessTaskSpec } from '../contracts/harness.js'
 import type { UsageSnapshot } from '../contracts/usage.js'
+import type { Turn } from '../contracts/turns.js'
 import { EvalSuiteStore } from '../evals/eval-suite-store.js'
 import { buildEvalToolProviders } from '../evals/eval-tool-provider.js'
 
@@ -122,6 +125,78 @@ export type KunServeRuntimeOptions = {
 
 export type KunServeHandle = NodeHttpServerHandle & {
   runtime: ServerRuntime
+}
+
+const ADAPTIVE_OBSERVATION_SCAN_MULTIPLIER = 4
+const MIN_ADAPTIVE_OBSERVATION_SCAN = 16
+const MAX_ADAPTIVE_REENTRY_SCAN = MIN_ADAPTIVE_OBSERVATION_SCAN
+const MAX_ADAPTIVE_OBSERVATION_TEXT = 4_096
+const MAX_ADAPTIVE_ARGUMENT_TEXT = 256
+const MAX_ADAPTIVE_OBSERVATION_KEY = 128
+const MAX_ADAPTIVE_OBSERVATION_COLLECTION = 4
+const MAX_ADAPTIVE_OBSERVATION_DEPTH = 2
+
+export type AdaptiveTrialRuntimeState = {
+  trial: AdaptiveTrialState
+  observations: StallObservation[]
+  maxObservations: number
+}
+
+export type AdaptiveTrialClaim =
+  | { kind: 'acquired'; state: AdaptiveTrialRuntimeState }
+  | { kind: 'concurrent'; activeTurnId: string }
+  | { kind: 'reentry_state_unavailable' }
+
+/**
+ * Keeps opt-in adaptive state turn-local and refuses ambiguous recovery after
+ * a process/runtime re-entry. Durable review items provide the re-entry marker;
+ * live state is never silently recreated after recovery already started.
+ */
+export class AdaptiveTrialCoordinator {
+  private readonly activeTurnByThread = new Map<string, string>()
+
+  claim(input: {
+    threadId: string
+    turn: Turn
+    usage: UsageSnapshot
+    nowIso: string
+  }): AdaptiveTrialClaim {
+    const activeTurnId = this.activeTurnByThread.get(input.threadId)
+    if (activeTurnId) return { kind: 'concurrent', activeTurnId }
+    const task = input.turn.harnessTask
+    if (!task || task.executionPolicy !== 'adaptive') {
+      throw new Error('adaptive trial coordinator requires an adaptive harness task')
+    }
+    if (adaptiveReentryStateUnavailable(input.turn.items)) {
+      return { kind: 'reentry_state_unavailable' }
+    }
+    const maxObservations = boundedObservationCapacity(adaptivePolicyForTask(task).maxObservations)
+    const state: AdaptiveTrialRuntimeState = {
+      trial: newAdaptiveTrialState(input.nowIso, input.usage),
+      observations: adaptiveObservationsForTurn(input.turn.items, input.turn.id, maxObservations),
+      maxObservations
+    }
+    this.activeTurnByThread.set(input.threadId, input.turn.id)
+    return { kind: 'acquired', state }
+  }
+
+  release(threadId: string, turnId: string): void {
+    if (this.activeTurnByThread.get(threadId) === turnId) {
+      this.activeTurnByThread.delete(threadId)
+    }
+  }
+
+  recordToolResult(
+    state: AdaptiveTrialRuntimeState,
+    call: ToolCallLike,
+    result: ToolHostResult
+  ): void {
+    appendAdaptiveObservation(
+      state.observations,
+      adaptiveObservationFromToolResult(call, result),
+      state.maxObservations
+    )
+  }
 }
 
 /**
@@ -402,6 +477,7 @@ export async function createKunServeRuntime(
       approvalPolicy: options.approvalPolicy
     }
   })
+  const adaptiveTrials = new AdaptiveTrialCoordinator()
   const startedAt = options.startedAt ?? nowIso()
   return {
     threadService,
@@ -422,68 +498,122 @@ export async function createKunServeRuntime(
       const thread = turn?.harnessTask?.executionPolicy === 'adaptive'
         ? await threadStore.get(threadId)
         : undefined
-      if (turn?.harnessTask?.executionPolicy === 'adaptive' && turn.mode !== 'plan' && thread?.mode !== 'plan') {
-        const adaptiveTask = turn.harnessTask
-        const trial = newAdaptiveTrialState(nowIso(), usageService.forThread(threadId))
-        const decideForCurrentTurn = async () => {
-          const items = await sessionStore.loadItems(threadId)
-          return decideAdaptiveEscalation({
-            task: adaptiveTask,
-            history: adaptiveObservationsForTurn(items, turnId),
-            budget: adaptiveRecoveryBudget(
-              adaptiveTask,
-              trial,
-              usageService.forThread(threadId),
-              nowIso()
-            )
-          })
-        }
-        const decision = await decideForCurrentTurn()
-        if (decision.kind === 'fail') {
+      if (turn?.harnessTask?.executionPolicy === 'adaptive') {
+        if (turn.mode === 'plan' || thread?.mode === 'plan') {
           await turnService.finishTurn({
             threadId,
             turnId,
             status: 'failed',
-            error: `adaptive recovery stopped: ${decision.action.failure ?? 'invalid_stage'}`
+            error: 'adaptive harness trials are unavailable in plan mode'
           })
           return 'failed'
         }
-        if (decision.kind === 'rigorous') {
-          const status = await rigorousPipeline.run(threadId, turnId, decision.signal, trial)
-          return status === 'fallback' ? loop.runTurn(threadId, turnId) : status
-        }
-        if (turn.mode === 'rigorous') {
-          const status = await rigorousPipeline.run(threadId, turnId, undefined, trial)
-          return status === 'fallback' ? loop.runTurn(threadId, turnId) : status
-        }
-        let observedDecision: Awaited<ReturnType<typeof decideForCurrentTurn>> | undefined
-        const loopStatus = await loop.runTurn(threadId, turnId, {
-          onToolResult: async () => {
-            observedDecision = await decideForCurrentTurn()
-            return observedDecision.kind === 'loop' ? 'continue' : 'escalate'
-          }
+        const claim = adaptiveTrials.claim({
+          threadId,
+          turn,
+          usage: usageService.forThread(threadId),
+          nowIso: nowIso()
         })
-        if (loopStatus !== 'escalated') return loopStatus
-        if (!observedDecision || observedDecision.kind === 'loop') {
+        if (claim.kind === 'concurrent') {
+          if (claim.activeTurnId === turnId) return 'failed'
           await turnService.finishTurn({
             threadId,
             turnId,
             status: 'failed',
-            error: 'adaptive observer escalated without a bounded decision'
+            error: `adaptive harness trial is already active for turn ${claim.activeTurnId}`
           })
           return 'failed'
         }
-        if (observedDecision.kind === 'fail') {
+        if (claim.kind === 'reentry_state_unavailable') {
           await turnService.finishTurn({
             threadId,
             turnId,
             status: 'failed',
-            error: `adaptive recovery stopped: ${observedDecision.action.failure ?? 'invalid_stage'}`
+            error: 'adaptive recovery state is unavailable for re-entry'
           })
           return 'failed'
         }
-        const status = await rigorousPipeline.run(threadId, turnId, observedDecision.signal, trial)
-        return status === 'fallback' ? loop.runTurn(threadId, turnId) : status
+        const adaptiveRuntime = claim.state
+        const adaptiveTask = turn.harnessTask
+        const decideForCurrentTurn = () => decideAdaptiveEscalation({
+          task: adaptiveTask,
+          history: adaptiveRuntime.observations,
+          budget: adaptiveRecoveryBudget(
+            adaptiveTask,
+            adaptiveRuntime.trial,
+            usageService.forThread(threadId),
+            nowIso()
+          )
+        })
+        const failAdaptiveFallback = async () => {
+          await turnService.finishTurn({
+            threadId,
+            turnId,
+            status: 'failed',
+            error: 'adaptive rigorous pipeline fallback is disallowed'
+          })
+          return 'failed' as const
+        }
+        try {
+          const decision = decideForCurrentTurn()
+          if (decision.kind === 'fail') {
+            await turnService.finishTurn({
+              threadId,
+              turnId,
+              status: 'failed',
+              error: `adaptive recovery stopped: ${decision.action.failure ?? 'invalid_stage'}`
+            })
+            return 'failed'
+          }
+          if (decision.kind === 'rigorous') {
+            const status = await rigorousPipeline.run(threadId, turnId, decision.signal, adaptiveRuntime.trial)
+            return status === 'fallback' ? failAdaptiveFallback() : status
+          }
+          if (turn.mode === 'rigorous') {
+            const status = await rigorousPipeline.run(threadId, turnId, undefined, adaptiveRuntime.trial)
+            return status === 'fallback' ? failAdaptiveFallback() : status
+          }
+          let observedDecision: ReturnType<typeof decideForCurrentTurn> | undefined
+          const observeAdaptiveDecision = () => {
+            observedDecision = decideForCurrentTurn()
+            return observedDecision.kind === 'loop' ? 'continue' as const : 'escalate' as const
+          }
+          const loopStatus = await loop.runTurn(threadId, turnId, {
+            onModelStep: async () => observeAdaptiveDecision(),
+            onToolResult: async ({ call, result }) => {
+              adaptiveTrials.recordToolResult(adaptiveRuntime, call, result)
+              return observeAdaptiveDecision()
+            }
+          })
+          if (loopStatus !== 'escalated') return loopStatus
+          if (!observedDecision || observedDecision.kind === 'loop') {
+            await turnService.finishTurn({
+              threadId,
+              turnId,
+              status: 'failed',
+              error: 'adaptive observer escalated without a bounded decision'
+            })
+            return 'failed'
+          }
+          if (observedDecision.kind === 'fail') {
+            await turnService.finishTurn({
+              threadId,
+              turnId,
+              status: 'failed',
+              error: `adaptive recovery stopped: ${observedDecision.action.failure ?? 'invalid_stage'}`
+            })
+            return 'failed'
+          }
+          const status = await rigorousPipeline.run(
+            threadId,
+            turnId,
+            observedDecision.signal,
+            adaptiveRuntime.trial
+          )
+          return status === 'fallback' ? failAdaptiveFallback() : status
+        } finally {
+          adaptiveTrials.release(threadId, turnId)
+        }
       }
       if (turn?.mode === 'rigorous') {
         const status = await rigorousPipeline.run(threadId, turnId)
@@ -539,27 +669,79 @@ export async function createKunServeRuntime(
 
 export function adaptiveObservationsForTurn(
   items: readonly TurnItem[],
-  turnId: string
+  turnId: string,
+  maxObservations = 32
 ): StallObservation[] {
-  const currentTurnItems = items.filter((item) => item.turnId === turnId)
+  const capacity = boundedObservationCapacity(maxObservations)
+  const scanLimit = Math.max(MIN_ADAPTIVE_OBSERVATION_SCAN, capacity * ADAPTIVE_OBSERVATION_SCAN_MULTIPLIER)
   const resultsByCallId = new Map<string, Extract<TurnItem, { kind: 'tool_result' }>>()
-  for (const item of currentTurnItems) {
-    if (item.kind === 'tool_result') resultsByCallId.set(item.callId, item)
+  const observations: StallObservation[] = []
+  let scanned = 0
+  for (let index = items.length - 1; index >= 0 && scanned < scanLimit && observations.length < capacity; index -= 1) {
+    const item = items[index]
+    scanned += 1
+    if (!item || item.turnId !== turnId) continue
+    if (item.kind === 'tool_result') {
+      if (resultsByCallId.size < capacity * 2) resultsByCallId.set(item.callId, item)
+      continue
+    }
+    if (item.kind !== 'tool_call') continue
+    observations.push(adaptiveObservationFromToolItem(item, resultsByCallId.get(item.callId)))
   }
-  return currentTurnItems.flatMap((item): StallObservation[] => {
-    if (item.kind !== 'tool_call') return []
-    const result = resultsByCallId.get(item.callId)
-    return [{
-      action: {
-        kind: adaptiveActionKind(item),
-        name: item.toolName,
-        arguments: item.arguments
-      },
-      ...(result?.isError
-        ? { command: { exitCode: 1, error: boundedToolObservation(result.output) } }
-        : result ? { evidenceFingerprint: boundedToolObservation(result.output) } : {})
-    }]
+  return observations.reverse()
+}
+
+function appendAdaptiveObservation(
+  observations: StallObservation[],
+  observation: StallObservation,
+  maxObservations: number
+): void {
+  observations.push(observation)
+  const excess = observations.length - boundedObservationCapacity(maxObservations)
+  if (excess > 0) observations.splice(0, excess)
+}
+
+function adaptiveObservationFromToolResult(
+  call: ToolCallLike,
+  result: ToolHostResult
+): StallObservation {
+  const item = result.item.kind === 'tool_result' ? result.item : undefined
+  return adaptiveObservation({
+    toolName: call.toolName,
+    toolKind: call.toolKind,
+    arguments: call.arguments,
+    ...(item ? { result: item } : {})
   })
+}
+
+function adaptiveObservationFromToolItem(
+  item: Extract<TurnItem, { kind: 'tool_call' }>,
+  result: Extract<TurnItem, { kind: 'tool_result' }> | undefined
+): StallObservation {
+  return adaptiveObservation({
+    toolName: item.toolName,
+    toolKind: item.toolKind,
+    arguments: item.arguments,
+    ...(result ? { result } : {})
+  })
+}
+
+function adaptiveObservation(input: {
+  toolName: string
+  toolKind?: ToolCallLike['toolKind']
+  arguments: Record<string, unknown>
+  result?: Extract<TurnItem, { kind: 'tool_result' }>
+}): StallObservation {
+  return {
+    action: {
+      kind: adaptiveActionKind(input.toolName, input.toolKind),
+      name: input.toolName.slice(0, 256),
+      arguments: boundedObservationArguments(input.arguments)
+    },
+    ...(input.result?.isError
+      ? { command: { exitCode: 1, error: boundedToolObservation(input.result.output) } }
+      : input.result ? { evidenceFingerprint: boundedToolObservation(input.result.output) } : {})
+  }
 }
 
 function newAdaptiveTrialState(now: string, usage: UsageSnapshot): AdaptiveTrialState {
@@ -602,19 +784,104 @@ function adaptiveRecoveryBudget(
   }
 }
 
-function adaptiveActionKind(item: Extract<TurnItem, { kind: 'tool_call' }>): StallActionKind {
-  if (item.toolKind === 'file_change') return 'write'
-  if (item.toolKind === 'command_execution') return 'command'
-  return ['read', 'grep', 'find', 'ls'].includes(item.toolName) ? 'read' : 'tool'
+function adaptiveActionKind(
+  toolName: string,
+  toolKind?: ToolCallLike['toolKind']
+): StallActionKind {
+  if (toolKind === 'file_change') return 'write'
+  if (toolKind === 'command_execution') return 'command'
+  return ['read', 'grep', 'find', 'ls'].includes(toolName) ? 'read' : 'tool'
 }
 
 function boundedToolObservation(output: unknown): string {
-  if (typeof output === 'string') return output.slice(0, 4_000)
   try {
-    return JSON.stringify(output).slice(0, 4_000)
+    return JSON.stringify(boundedObservationValue(output)).slice(0, MAX_ADAPTIVE_OBSERVATION_TEXT)
   } catch {
     return 'unserializable tool error'
   }
+}
+
+function boundedObservationArguments(value: Record<string, unknown>): Record<string, unknown> {
+  const bounded = boundedObservationValue(value)
+  return bounded && typeof bounded === 'object' && !Array.isArray(bounded)
+    ? bounded as Record<string, unknown>
+    : {}
+}
+
+function boundedObservationValue(
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+  key = ''
+): unknown {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string') {
+    return isSensitiveObservationKey(key) ? '<redacted>' : value.slice(0, MAX_ADAPTIVE_ARGUMENT_TEXT)
+  }
+  if (typeof value === 'boolean' || typeof value === 'number') return value
+  if (typeof value !== 'object') return `<${typeof value}>`
+  if (depth >= MAX_ADAPTIVE_OBSERVATION_DEPTH) return '<depth-limit>'
+  if (seen.has(value)) return '<cycle>'
+  seen.add(value)
+  if (Array.isArray(value)) {
+    const entries = value
+      .slice(0, MAX_ADAPTIVE_OBSERVATION_COLLECTION)
+      .map((entry) => boundedObservationValue(entry, depth + 1, seen))
+    if (value.length > MAX_ADAPTIVE_OBSERVATION_COLLECTION) entries.push('<truncated>')
+    return entries
+  }
+  const record = value as Record<string, unknown>
+  const entries: Array<{ original: string; normalized: string; sensitive: boolean }> = []
+  for (const original in record) {
+    if (!Object.prototype.hasOwnProperty.call(record, original)) continue
+    const index = entries.length
+    const isLongKey = original.length > MAX_ADAPTIVE_OBSERVATION_KEY
+    entries.push({
+      original,
+      normalized: isLongKey ? `<long-key-${index}>` : original,
+      sensitive: isLongKey || isSensitiveObservationKey(original)
+    })
+    if (entries.length > MAX_ADAPTIVE_OBSERVATION_COLLECTION) break
+  }
+  const truncated = entries.length > MAX_ADAPTIVE_OBSERVATION_COLLECTION
+  if (truncated) entries.pop()
+  const bounded: Record<string, unknown> = {}
+  for (const entry of entries.sort((left, right) => left.normalized.localeCompare(right.normalized))) {
+    bounded[entry.normalized] = entry.sensitive
+      ? '<redacted>'
+      : boundedObservationValue(record[entry.original], depth + 1, seen, entry.original)
+  }
+  if (truncated) bounded['<truncated>'] = true
+  return bounded
+}
+
+function boundedObservationCapacity(value: number): number {
+  return Number.isSafeInteger(value) ? Math.min(1_024, Math.max(1, value)) : 32
+}
+
+/**
+ * A live coordinator can only safely resume a completely fresh turn. Once a
+ * turn has emitted any non-user item, its prior trial baseline and recovery
+ * signatures would be ambiguous after a runtime restart. Inspect a bounded
+ * suffix and fail closed if older state cannot be ruled out.
+ */
+function adaptiveReentryStateUnavailable(items: readonly TurnItem[]): boolean {
+  let scanned = 0
+  let userMessageCount = 0
+  for (let index = items.length - 1; index >= 0 && scanned < MAX_ADAPTIVE_REENTRY_SCAN; index -= 1) {
+    const item = items[index]
+    scanned += 1
+    if (!item) continue
+    if (item.kind === 'review' && item.title.startsWith('Adaptive recovery ')) return true
+    if (item.kind !== 'user_message') return true
+    userMessageCount += 1
+    if (userMessageCount > 1) return true
+  }
+  return items.length > scanned
+}
+
+function isSensitiveObservationKey(key: string): boolean {
+  return /(?:api[_-]?key|authorization|cookie|password|secret|token)/i.test(key)
 }
 
 function elapsedAdaptiveTrialMs(startedAtMs: number, nowIso: string): number {

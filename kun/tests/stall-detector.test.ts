@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { detectStall, type StallObservation } from '../src/orchestration/stall-detector.js'
+import { detectStall, normalizeActionSignature, type StallObservation } from '../src/orchestration/stall-detector.js'
 
 function observation(
   name: string,
@@ -52,6 +52,37 @@ describe('stall detector', () => {
     ], { noProgressWindow: 3, repeatedActionThreshold: 4 })
 
     expect(signal).toMatchObject({ reason: 'no_progress', retainedObservationCount: 3 })
+  })
+
+  it('does not infer no progress when the window has no durable fingerprints', () => {
+    const signal = detectStall([
+      observation('read', { path: 'src/a.ts' }),
+      observation('grep', { pattern: 'TODO' }),
+      observation('find', { path: 'src' })
+    ], { noProgressWindow: 3, repeatedActionThreshold: 4 })
+
+    expect(signal).toBeNull()
+  })
+
+  it('bounds normalization to retained observations and bounded argument text', () => {
+    const history = new Array<StallObservation>(64)
+    Object.defineProperty(history, 0, {
+      get: () => {
+        throw new Error('stale observation should not be inspected')
+      }
+    })
+    history[62] = observation('read', { path: 'src/a.ts', payload: 'x'.repeat(100_000) })
+    history[63] = observation('grep', { pattern: 'TODO', payload: 'x'.repeat(100_000) })
+
+    expect(detectStall(history, { maxObservations: 2, repeatedActionThreshold: 3 })).toBeNull()
+    expect(normalizeActionSignature({
+      kind: 'tool',
+      name: 'large',
+      arguments: {
+        payload: 'x'.repeat(1_000_000),
+        ['oversized_key_'.repeat(10_000)]: 'must not expand the normalized payload'
+      }
+    })).toMatch(/^sha256:/)
   })
 
   it('detects read rediscovery separately from general tool repetition', () => {

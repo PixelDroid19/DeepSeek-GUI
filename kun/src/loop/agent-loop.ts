@@ -223,6 +223,14 @@ type ModelStepResult = 'continue' | 'stop' | 'failed' | 'aborted' | 'escalated'
  * to a bounded controller without finalizing the turn in the normal loop.
  */
 export type AgentLoopRunOptions = {
+  onModelStep?: (input: {
+    threadId: string
+    turnId: string
+    stepIndex: number
+    phase: 'before_model' | 'after_model'
+    stopReason?: StreamedModelStep['stopReason']
+    toolCallCount?: number
+  }) => Promise<'continue' | 'escalate'> | 'continue' | 'escalate'
   onToolResult?: (input: {
     threadId: string
     turnId: string
@@ -438,6 +446,13 @@ export class AgentLoop {
     stepIndex = 0,
     options: AgentLoopRunOptions = {}
   ): Promise<ModelStepResult> {
+    if (await this.shouldEscalateAfterModelStep({
+      threadId,
+      turnId,
+      stepIndex,
+      phase: 'before_model',
+      onModelStep: options.onModelStep
+    })) return 'escalated'
     const prepared = await this.prepareModelStep(threadId, turnId, signal, stepIndex)
     if (prepared.kind !== 'ready') return prepared.kind
 
@@ -456,6 +471,19 @@ export class AgentLoop {
       nextItemId: (kind) => this.opts.ids.next(kind)
     })) {
       await this.opts.turns.applyItem(threadId, completed.item)
+    }
+
+    if (await this.shouldEscalateAfterModelStep({
+      threadId,
+      turnId,
+      stepIndex,
+      phase: 'after_model',
+      stopReason,
+      toolCallCount: completedToolCalls.length,
+      onModelStep: options.onModelStep
+    })) {
+      await this.persistEscalatedToolCalls(threadId, turnId, completedToolCalls)
+      return 'escalated'
     }
 
     const dispatchBase = {
@@ -1081,6 +1109,53 @@ export class AgentLoop {
       call,
       result
     })) === 'escalate'
+  }
+
+  private async shouldEscalateAfterModelStep(
+    input: {
+      threadId: string
+      turnId: string
+      stepIndex: number
+      phase: 'before_model' | 'after_model'
+      stopReason?: StreamedModelStep['stopReason']
+      toolCallCount?: number
+      onModelStep?: AgentLoopRunOptions['onModelStep']
+    }
+  ): Promise<boolean> {
+    return (await input.onModelStep?.({
+      threadId: input.threadId,
+      turnId: input.turnId,
+      stepIndex: input.stepIndex,
+      phase: input.phase,
+      ...(input.stopReason ? { stopReason: input.stopReason } : {}),
+      ...(input.toolCallCount !== undefined ? { toolCallCount: input.toolCallCount } : {})
+    })) === 'escalate'
+  }
+
+  private async persistEscalatedToolCalls(
+    threadId: string,
+    turnId: string,
+    calls: readonly ToolCallLike[]
+  ): Promise<void> {
+    for (const call of calls) {
+      await this.opts.turns.updateItem(threadId, `item_tool_${turnId}_${call.callId}`, {
+        status: 'failed',
+        finishedAt: this.opts.nowIso()
+      } as Partial<TurnItem>)
+      await this.opts.turns.applyItem(threadId, makeToolResultItem({
+        id: `item_${call.callId}_adaptive_escalated`,
+        threadId,
+        turnId,
+        callId: call.callId,
+        toolName: call.toolName,
+        toolKind: call.toolKind ?? 'tool_call',
+        output: {
+          code: 'adaptive_escalated',
+          error: 'Adaptive trial escalated before tool dispatch.'
+        },
+        isError: true
+      }))
+    }
   }
 
   private createToolContext(input: {
