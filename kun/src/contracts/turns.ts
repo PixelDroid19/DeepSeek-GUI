@@ -3,6 +3,7 @@ import { TurnItem } from './items.js'
 import { isGuiPlanRelativePath } from '../shared/gui-plan.js'
 import { ApprovalPolicySchema } from './policy.js'
 import { PlannerArtifactSchema } from './roles.js'
+import { HarnessTaskSpecSchema } from './harness.js'
 
 /**
  * Mode enum, inlined here (instead of importing `ThreadMode` from
@@ -74,6 +75,8 @@ export const TurnSchema = z.object({
   toolCatalogDrift: z.boolean().optional(),
   guiPlan: GuiPlanContextSchema.optional(),
   planArtifact: PlannerArtifactSchema.optional(),
+  /** Optional opt-in harness task; absent on normal interactive turns. */
+  harnessTask: HarnessTaskSpecSchema.optional(),
   /**
    * Optional per-turn mode override. When set, it takes precedence over
    * the thread mode for this turn (e.g. a Plan-mode turn inside an
@@ -113,7 +116,9 @@ export const StartTurnRequest = z.object({
    * path advertised in the context.
    */
   guiPlan: GuiPlanContextSchema.optional(),
-  planArtifact: PlannerArtifactSchema.optional()
+  planArtifact: PlannerArtifactSchema.optional(),
+  /** Optional opt-in harness task; normal request parsing remains unchanged. */
+  harnessTask: HarnessTaskSpecSchema.optional()
 })
 export type StartTurnRequest = z.input<typeof StartTurnRequest>
 
