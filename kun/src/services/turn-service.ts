@@ -13,6 +13,7 @@ import { touchThread } from '../domain/thread.js'
 import type { RuntimeEventRecorder } from './runtime-event-recorder.js'
 import type { RolesConfig } from '../config/kun-config.js'
 import { PlannerArtifactSchema } from '../contracts/roles.js'
+import { HarnessTaskSpecSchema } from '../contracts/harness.js'
 
 export type TurnServiceDeps = {
   threadStore: ThreadStore
@@ -66,6 +67,9 @@ export class TurnService {
       guiPlan: input.request.guiPlan,
       planArtifact: input.request.planArtifact
         ? PlannerArtifactSchema.parse(input.request.planArtifact)
+        : undefined,
+      harnessTask: input.request.harnessTask
+        ? HarnessTaskSpecSchema.parse(input.request.harnessTask)
         : undefined,
       mode: input.request.mode
     })

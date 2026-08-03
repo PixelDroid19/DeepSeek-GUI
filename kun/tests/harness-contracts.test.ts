@@ -8,6 +8,8 @@ import {
   StartTurnRequest,
   TurnSchema
 } from '../src/contracts/index.js'
+import type { HarnessTaskSpec } from '../src/contracts/harness.js'
+import { bootstrapThread, makeHarness, makeSilentModel } from './loop-test-harness.js'
 
 const validTask = {
   version: 1,
@@ -55,7 +57,7 @@ const validTask = {
     version: '2026.08',
     taskId: 'harbor-42'
   }
-}
+} satisfies HarnessTaskSpec
 
 const validManifest = {
   task: validTask,
@@ -86,6 +88,17 @@ describe('harness contracts', () => {
       ...validTask,
       budgets: { ...validTask.budgets, maxCostUsd: 10_001 }
     })).toThrow()
+  })
+
+  it('rejects duplicate criterion and verification IDs', () => {
+    expect(HarnessTaskSpecSchema.safeParse({
+      ...validTask,
+      acceptanceCriteria: [...validTask.acceptanceCriteria, { ...validTask.acceptanceCriteria[0] }]
+    }).success).toBe(false)
+    expect(HarnessTaskSpecSchema.safeParse({
+      ...validTask,
+      verification: [...validTask.verification, { ...validTask.verification[0] }]
+    }).success).toBe(false)
   })
 
   it('parses a reproducible trial manifest with protocol and remote revision metadata', () => {
@@ -148,5 +161,26 @@ describe('harness contracts', () => {
     expect(normalRequest.harnessTask).toBeUndefined()
     expect(normalTurn.harnessTask).toBeUndefined()
     expect(harnessRequest.harnessTask?.id).toBe('harbor-42')
+  })
+
+  it('persists a harness task through TurnService while normal turns remain unchanged', async () => {
+    const harness = makeHarness(makeSilentModel())
+    await bootstrapThread(harness)
+    const normalTurn = await harness.turns.getTurn(harness.threadId, harness.turnId)
+    const started = await harness.turns.startTurn({
+      threadId: harness.threadId,
+      request: {
+        prompt: 'Run the benchmark task.',
+        harnessTask: validTask
+      }
+    })
+    const persisted = await harness.turns.getTurn(harness.threadId, started.turnId)
+
+    expect(normalTurn?.harnessTask).toBeUndefined()
+    expect(persisted?.harnessTask).toMatchObject({
+      id: 'harbor-42',
+      executionPolicy: 'adaptive',
+      benchmark: { family: 'harbor', version: '2026.08' }
+    })
   })
 })

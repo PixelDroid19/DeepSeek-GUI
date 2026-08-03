@@ -1,6 +1,7 @@
 import type { GuiPlanContextJson, Turn, TurnReasoningEffort, TurnStatus } from '../contracts/turns.js'
 import type { PlannerArtifact } from '../contracts/roles.js'
 import type { TurnItem } from '../contracts/items.js'
+import type { HarnessTaskSpec } from '../contracts/harness.js'
 
 export type TurnEntity = Turn
 
@@ -13,6 +14,7 @@ export function createTurnRecord(input: {
   attachmentIds?: string[]
   guiPlan?: GuiPlanContextJson
   planArtifact?: PlannerArtifact
+  harnessTask?: HarnessTaskSpec
   mode?: Turn['mode']
   createdAt?: string
   status?: TurnStatus
@@ -33,6 +35,7 @@ export function createTurnRecord(input: {
     ...(reasoningEffort ? { reasoningEffort } : {}),
     ...(input.guiPlan ? { guiPlan: input.guiPlan } : {}),
     ...(input.planArtifact ? { planArtifact: input.planArtifact } : {}),
+    ...(input.harnessTask ? { harnessTask: input.harnessTask } : {}),
     ...(input.mode ? { mode: input.mode } : {}),
     createdAt: input.createdAt ?? new Date().toISOString()
   }

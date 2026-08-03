@@ -92,6 +92,31 @@ export const HarnessTaskSpecSchema = z
     benchmark: HarnessBenchmarkMetadataSchema.optional()
   })
   .strict()
+  .superRefine((task, ctx) => {
+    const criterionIds = new Set<string>()
+    task.acceptanceCriteria.forEach((criterion, index) => {
+      if (criterionIds.has(criterion.id)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['acceptanceCriteria', index, 'id'],
+          message: 'acceptance criterion IDs must be unique'
+        })
+      }
+      criterionIds.add(criterion.id)
+    })
+
+    const verificationIds = new Set<string>()
+    task.verification.forEach((check, index) => {
+      if (verificationIds.has(check.id)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['verification', index, 'id'],
+          message: 'verification check IDs must be unique'
+        })
+      }
+      verificationIds.add(check.id)
+    })
+  })
 export type HarnessTaskSpec = z.infer<typeof HarnessTaskSpecSchema>
 
 /**
