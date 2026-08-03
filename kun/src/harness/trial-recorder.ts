@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { redactSecrets } from '../config/secret-redaction.js'
+import { redactSecrets, redactSecretText } from '../config/secret-redaction.js'
 import { RuntimeEvent, type RuntimeEvent as RuntimeEventType } from '../contracts/events.js'
 import {
   HarnessEvidenceSchema,
@@ -27,6 +27,7 @@ export const OfficialTrialOutcomeSchema = z.enum(['pass', 'fail', 'inconclusive'
 export type OfficialTrialOutcome = z.infer<typeof OfficialTrialOutcomeSchema>
 
 const DigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/)
+const SECRET_EVIDENCE_TEXT_PATTERN = /(?:api[-_]?key|authorization|bearer|client[-_]?secret|password|secret|(?:access|refresh|auth)?[_-]?token|cookie)\b|\bsk-[a-z0-9_-]{8,}\b/i
 
 export const TrialGateSchema = z.object({
   verdict: HarnessGateVerdictSchema
@@ -66,7 +67,7 @@ export const TrialEvidenceTraceRecordSchema = z.object({
   kind: z.literal('evidence'),
   evidenceId: z.string().min(1),
   evidenceKind: z.enum(['command', 'diff', 'artifact', 'static-report']),
-  digest: z.string().min(1)
+  digest: DigestSchema
 }).strict()
 
 export const TrialOutcomeTraceRecordSchema = z.object({
@@ -333,7 +334,7 @@ function artifactRecords(items: readonly TurnItemType[]): TrialTraceRecord[] {
 
 function evidenceRecords(evidence: readonly HarnessEvidence[]): TrialTraceRecord[] {
   return evidence
-    .map((entry) => HarnessEvidenceSchema.parse(entry))
+    .map(normalizeEvidence)
     .map((entry) => ({
       kind: 'evidence' as const,
       evidenceId: entry.id,
@@ -341,6 +342,44 @@ function evidenceRecords(evidence: readonly HarnessEvidence[]): TrialTraceRecord
       digest: entry.digest
     }))
     .sort(compareTraceRecords)
+}
+
+function normalizeEvidence(entry: HarnessEvidence): HarnessEvidence {
+  const parsed = HarnessEvidenceSchema.parse(entry)
+  const redactedSummary = redactEvidenceText(parsed.summary)
+  return HarnessEvidenceSchema.parse({
+    id: normalizeEvidenceIdentifier(parsed.id),
+    kind: parsed.kind,
+    summary: redactedSummary,
+    digest: normalizeEvidenceDigest(parsed.digest)
+  })
+}
+
+function normalizeEvidenceIdentifier(value: string): string {
+  const redacted = redactEvidenceText(value)
+  if (redacted === value && !SECRET_EVIDENCE_TEXT_PATTERN.test(value)) return value
+  return `redacted-evidence:${sha256(redacted).slice('sha256:'.length)}`
+}
+
+function normalizeEvidenceDigest(value: string): string {
+  const redacted = redactEvidenceText(value)
+  if (redacted !== value || SECRET_EVIDENCE_TEXT_PATTERN.test(value)) {
+    throw new Error('trial evidence digest must be a SHA-256 digest')
+  }
+  if (/^[a-f0-9]{64}$/.test(value)) return `sha256:${value}`
+  if (/^sha256:[a-f0-9]{64}$/.test(value)) return value
+  throw new Error('trial evidence digest must be a SHA-256 digest')
+}
+
+function redactEvidenceText(value: string): string {
+  const direct = redactSecretText(value)
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (parsed && typeof parsed === 'object') return canonicalJsonFor(redactSecrets(parsed))
+  } catch {
+    // Non-JSON evidence text is still covered by the normal text redactor.
+  }
+  return direct
 }
 
 function compareTraceRecords(left: TrialTraceRecord, right: TrialTraceRecord): number {

@@ -46,6 +46,7 @@ export const BenchmarkManifestIdentitySchema = z.object({
   datasetVersion: z.string().min(1),
   taskId: z.string().min(1),
   budgets: HarnessTrialBudgetsSchema,
+  seed: z.number().int().nonnegative().max(2_147_483_647).optional(),
   remoteModelRevision: z.string().min(1).optional()
 }).strict()
 export type BenchmarkManifestIdentity = z.infer<typeof BenchmarkManifestIdentitySchema>
@@ -82,6 +83,7 @@ export function parseBenchmarkManifest(input: unknown): LoadedBenchmarkManifest 
     datasetVersion: manifest.task.benchmark?.version ?? 'unversioned',
     taskId: manifest.task.id,
     budgets: manifest.task.budgets,
+    ...(manifest.seed === undefined ? {} : { seed: manifest.seed }),
     ...(manifest.remoteModelRevision ? { remoteModelRevision: manifest.remoteModelRevision } : {})
   })
 

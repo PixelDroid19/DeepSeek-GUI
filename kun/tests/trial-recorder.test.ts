@@ -175,7 +175,8 @@ describe('benchmark manifests and trial traces', () => {
       environmentDigest: 'sha256:fixture-environment',
       dataset: 'kun-fixtures',
       datasetVersion: '2026.08',
-      taskId: 'parser-fix'
+      taskId: 'parser-fix',
+      seed: 7
     })
     expect(() => parseBenchmarkManifest({ ...manifest, apiKey: 'do-not-store' })).toThrow(/credential/i)
     expect(() => parseBenchmarkManifest({ ...manifest, unknownAdapterValue: true })).toThrow()
@@ -236,5 +237,45 @@ describe('benchmark manifests and trial traces', () => {
     expect(failed.falseCompletion).toBe(true)
     expect(inconclusive.officialOutcome).toBe('inconclusive')
     expect(inconclusive.records.at(-1)).toMatchObject({ kind: 'outcome', gateVerdict: 'inconclusive' })
+  })
+
+  it('normalizes evidence references without persisting secret-shaped identifiers or summaries', () => {
+    const recorder = new TrialRecorder(parseBenchmarkManifest(manifest))
+    const result = recorder.record({
+      runtimeStatus: 'completed',
+      gate: { verdict: 'ship' },
+      usage,
+      wallTimeMs: 10,
+      items: [],
+      events: [],
+      evidence: [{
+        id: JSON.stringify({ access_token: 'evidence-secret-value' }),
+        kind: 'artifact',
+        summary: JSON.stringify({ secret: 'summary-secret-value' }),
+        digest: 'a'.repeat(64)
+      }]
+    })
+    const jsonl = trialResultToJsonl(result)
+
+    expect(jsonl).not.toContain('access_token')
+    expect(jsonl).not.toContain('evidence-secret-value')
+    expect(jsonl).not.toContain('summary-secret-value')
+    expect(result.records.find((record) => record.kind === 'evidence')).toMatchObject({
+      digest: `sha256:${'a'.repeat(64)}`
+    })
+    expect(() => recorder.record({
+      runtimeStatus: 'completed',
+      gate: { verdict: 'ship' },
+      usage,
+      wallTimeMs: 10,
+      items: [],
+      events: [],
+      evidence: [{
+        id: 'artifact:valid',
+        kind: 'artifact',
+        summary: 'valid summary',
+        digest: 'access_token=invalid-secret-digest'
+      }]
+    })).toThrow(/SHA-256/i)
   })
 })

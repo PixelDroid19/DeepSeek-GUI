@@ -156,9 +156,11 @@ function assertComparableTrialIdentity(taskId: string, baseline: TrialResult, ha
     'model',
     'endpointFormat',
     'environmentDigest',
+    'workspaceDigest',
     'dataset',
     'datasetVersion',
     'family',
+    'seed',
     'remoteModelRevision'
   ]
   for (const field of fields) {

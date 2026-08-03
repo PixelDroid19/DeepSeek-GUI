@@ -17,7 +17,11 @@ const usage: UsageSnapshot = {
   costUsd: 0.2
 }
 
-function manifestFor(taskId: string, family = 'core'): HarnessTrialManifest {
+function manifestFor(
+  taskId: string,
+  family = 'core',
+  overrides: Pick<Partial<HarnessTrialManifest>, 'workspaceRoot' | 'seed'> = {}
+): HarnessTrialManifest {
   return {
     task: {
       version: 1,
@@ -47,11 +51,12 @@ function manifestFor(taskId: string, family = 'core'): HarnessTrialManifest {
         taskId
       }
     },
-    workspaceRoot: '/tmp/compare-workspace',
+    workspaceRoot: overrides.workspaceRoot ?? '/tmp/compare-workspace',
     model: 'deepseek-v4-flash',
     endpointFormat: 'chat_completions',
     harnessCommit: '0123456789abcdef',
-    environmentDigest: 'sha256:comparison-environment'
+    environmentDigest: 'sha256:comparison-environment',
+    ...(overrides.seed === undefined ? {} : { seed: overrides.seed })
   }
 }
 
@@ -61,9 +66,14 @@ function trial(input: {
   family?: string
   costUsd?: number
   model?: string
+  workspaceRoot?: string
+  seed?: number
 }): TrialResult {
   const parsed = parseBenchmarkManifest({
-    ...manifestFor(input.taskId, input.family),
+    ...manifestFor(input.taskId, input.family, {
+      workspaceRoot: input.workspaceRoot,
+      seed: input.seed
+    }),
     ...(input.model ? { model: input.model } : {})
   })
   return new TrialRecorder(parsed).record({
@@ -122,5 +132,17 @@ describe('compareTrials', () => {
       baseline,
       [trial({ taskId: 'different-task', verdict: 'ship' })]
     )).toThrow(/task/i)
+    expect(() => compareTrials(
+      baseline,
+      [trial({ taskId: 'single-file', verdict: 'ship', workspaceRoot: '/tmp/other-workspace' })]
+    )).toThrow(/workspaceDigest/i)
+    expect(() => compareTrials(
+      [trial({ taskId: 'seeded', verdict: 'ship', seed: 7 })],
+      [trial({ taskId: 'seeded', verdict: 'ship', seed: 8 })]
+    )).toThrow(/seed/i)
+    expect(() => compareTrials(
+      [trial({ taskId: 'same-seed', verdict: 'ship', seed: 7 })],
+      [trial({ taskId: 'same-seed', verdict: 'ship', seed: 7 })]
+    )).not.toThrow()
   })
 })
