@@ -52,7 +52,8 @@ const execFileAsync = promisify(execFile)
 
 function makeRuntime(
   childExecutor: ChildRunExecutor,
-  evals?: ConstructorParameters<typeof RigorousPipeline>[0]['evals']
+  evals?: ConstructorParameters<typeof RigorousPipeline>[0]['evals'],
+  nowMs?: () => number
 ) {
   const eventBus = new InMemoryEventBus()
   const sessionStore = new InMemorySessionStore()
@@ -100,8 +101,10 @@ function makeRuntime(
     roles: { enabled: true },
     defaultModel: 'thread-model',
     nowIso,
+    ...(nowMs ? { nowMs } : {}),
     ...(evals ? { evals } : {})
   })
+
   return { eventBus, sessionStore, threadStore, threads, turns, approvalGate, usage, pipeline }
 }
 
@@ -552,6 +555,104 @@ describe('rigorous pipeline', () => {
       expect.objectContaining({ kind: 'review', title: 'Adaptive recovery checkpoint' }),
       expect.objectContaining({ kind: 'review', title: 'Adaptive recovery hypothesis accepted' })
     ]))
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it.each([
+    ['input token', 'input_tokens_exhausted', { maxInputTokens: 5 }],
+    ['output token', 'output_tokens_exhausted', { maxOutputTokens: 1 }],
+    ['cost', 'cost_exhausted', { maxCostUsd: 0.01 }],
+    ['model step', 'model_steps_exhausted', { maxModelSteps: 1 }]
+  ] as const)('fails closed before the verifier when an adaptive executor exhausts its %s budget', async (
+    _dimension,
+    failure,
+    limit
+  ) => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-adaptive-budget-'))
+    const roles: string[] = []
+    const child: ChildRunExecutor = async (input) => {
+      roles.push(input.label ?? '')
+      return {
+        summary: 'execution',
+        artifact: { summary: 'changed', filesChanged: [], deviationsFromPlan: [] },
+        usage: {
+          promptTokens: 5,
+          completionTokens: 1,
+          totalTokens: 6,
+          cacheHitRate: null,
+          turns: 1,
+          costUsd: 0.01
+        }
+      }
+    }
+    const runtime = makeRuntime(child)
+    const thread = await runtime.threads.create({
+      title: 'Adaptive budget', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'recover within budget',
+        mode: 'rigorous',
+        planArtifact: { intent: 'recover', risks: [], steps: ['fix'], verificationCriteria: [] },
+        harnessTask: {
+          ...REQUIRED_HARNESS_TASK,
+          executionPolicy: 'adaptive',
+          budgets: { ...REQUIRED_HARNESS_TASK.budgets, ...limit }
+        }
+      }
+    })
+    const stall: StallSignal = {
+      reason: 'repeated_action',
+      signature: 'stall:budget',
+      observationCount: 3,
+      retainedObservationCount: 3,
+      actionSignature: 'action:budget'
+    }
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId, stall)
+
+    expect(status).toBe('failed')
+    expect(roles).toEqual(['rigorous:executor'])
+    expect((await runtime.turns.getTurn(thread.id, turn.turnId))?.error).toContain(failure)
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  it('fails closed before the verifier when an adaptive executor exhausts wall time', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-rigorous-adaptive-wall-budget-'))
+    let clockMs = Date.parse('2026-06-11T00:00:00.000Z')
+    const roles: string[] = []
+    const child: ChildRunExecutor = async (input) => {
+      roles.push(input.label ?? '')
+      clockMs += 2
+      return {
+        summary: 'execution',
+        artifact: { summary: 'changed', filesChanged: [], deviationsFromPlan: [] }
+      }
+    }
+    const runtime = makeRuntime(child, undefined, () => clockMs)
+    const thread = await runtime.threads.create({
+      title: 'Adaptive wall budget', workspace, model: 'thread-model', mode: 'agent'
+    })
+    const turn = await runtime.turns.startTurn({
+      threadId: thread.id,
+      request: {
+        prompt: 'recover within wall budget',
+        mode: 'rigorous',
+        planArtifact: { intent: 'recover', risks: [], steps: ['fix'], verificationCriteria: [] },
+        harnessTask: {
+          ...REQUIRED_HARNESS_TASK,
+          executionPolicy: 'adaptive',
+          budgets: { ...REQUIRED_HARNESS_TASK.budgets, wallTimeMs: 1 }
+        }
+      }
+    })
+
+    const status = await runtime.pipeline.run(thread.id, turn.turnId)
+
+    expect(status).toBe('failed')
+    expect(roles).toEqual(['rigorous:executor'])
+    expect((await runtime.turns.getTurn(thread.id, turn.turnId))?.error).toContain('wall_time_exhausted')
     await rm(workspace, { recursive: true, force: true })
   })
 

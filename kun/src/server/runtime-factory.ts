@@ -78,9 +78,16 @@ import { FileMemoryStore } from '../memory/memory-store.js'
 import { DelegationRuntime, FileDelegationStore } from '../delegation/delegation-runtime.js'
 import { createChildAgentExecutor } from '../delegation/child-agent-executor.js'
 import { RigorousPipeline } from '../orchestration/rigorous-pipeline.js'
-import { decideAdaptiveEscalation } from '../orchestration/adaptive-policy.js'
+import {
+  adaptiveTrialUsageSince,
+  decideAdaptiveEscalation,
+  type AdaptiveTrialState,
+  type RecoveryBudget
+} from '../orchestration/adaptive-policy.js'
 import type { StallActionKind, StallObservation } from '../orchestration/stall-detector.js'
 import type { TurnItem } from '../contracts/items.js'
+import type { HarnessTaskSpec } from '../contracts/harness.js'
+import type { UsageSnapshot } from '../contracts/usage.js'
 import { EvalSuiteStore } from '../evals/eval-suite-store.js'
 import { buildEvalToolProviders } from '../evals/eval-tool-provider.js'
 
@@ -387,6 +394,7 @@ export async function createKunServeRuntime(
     roles: rolesConfig,
     defaultModel: options.model,
     nowIso,
+    nowMs: () => Date.now(),
     evals: {
       enabled: evalsConfig.enabled,
       store: evalSuiteStore,
@@ -415,21 +423,22 @@ export async function createKunServeRuntime(
         ? await threadStore.get(threadId)
         : undefined
       if (turn?.harnessTask?.executionPolicy === 'adaptive' && turn.mode !== 'plan' && thread?.mode !== 'plan') {
-        const items = await sessionStore.loadItems(threadId)
-        const usage = usageService.forThread(threadId)
-        const decision = decideAdaptiveEscalation({
-          task: turn.harnessTask,
-          history: adaptiveObservations(items),
-          budget: {
-            limits: turn.harnessTask.budgets,
-            elapsedWallTimeMs: elapsedTurnMs(turn.startedAt ?? turn.createdAt, nowIso()),
-            modelSteps: usage.turns,
-            costUsd: usage.costUsd ?? 0,
-            recoveryRounds: 0,
-            stage: 'initial',
-            attemptedActionSignatures: []
-          }
-        })
+        const adaptiveTask = turn.harnessTask
+        const trial = newAdaptiveTrialState(nowIso(), usageService.forThread(threadId))
+        const decideForCurrentTurn = async () => {
+          const items = await sessionStore.loadItems(threadId)
+          return decideAdaptiveEscalation({
+            task: adaptiveTask,
+            history: adaptiveObservationsForTurn(items, turnId),
+            budget: adaptiveRecoveryBudget(
+              adaptiveTask,
+              trial,
+              usageService.forThread(threadId),
+              nowIso()
+            )
+          })
+        }
+        const decision = await decideForCurrentTurn()
         if (decision.kind === 'fail') {
           await turnService.finishTurn({
             threadId,
@@ -440,9 +449,41 @@ export async function createKunServeRuntime(
           return 'failed'
         }
         if (decision.kind === 'rigorous') {
-          const status = await rigorousPipeline.run(threadId, turnId, decision.signal)
+          const status = await rigorousPipeline.run(threadId, turnId, decision.signal, trial)
           return status === 'fallback' ? loop.runTurn(threadId, turnId) : status
         }
+        if (turn.mode === 'rigorous') {
+          const status = await rigorousPipeline.run(threadId, turnId, undefined, trial)
+          return status === 'fallback' ? loop.runTurn(threadId, turnId) : status
+        }
+        let observedDecision: Awaited<ReturnType<typeof decideForCurrentTurn>> | undefined
+        const loopStatus = await loop.runTurn(threadId, turnId, {
+          onToolResult: async () => {
+            observedDecision = await decideForCurrentTurn()
+            return observedDecision.kind === 'loop' ? 'continue' : 'escalate'
+          }
+        })
+        if (loopStatus !== 'escalated') return loopStatus
+        if (!observedDecision || observedDecision.kind === 'loop') {
+          await turnService.finishTurn({
+            threadId,
+            turnId,
+            status: 'failed',
+            error: 'adaptive observer escalated without a bounded decision'
+          })
+          return 'failed'
+        }
+        if (observedDecision.kind === 'fail') {
+          await turnService.finishTurn({
+            threadId,
+            turnId,
+            status: 'failed',
+            error: `adaptive recovery stopped: ${observedDecision.action.failure ?? 'invalid_stage'}`
+          })
+          return 'failed'
+        }
+        const status = await rigorousPipeline.run(threadId, turnId, observedDecision.signal, trial)
+        return status === 'fallback' ? loop.runTurn(threadId, turnId) : status
       }
       if (turn?.mode === 'rigorous') {
         const status = await rigorousPipeline.run(threadId, turnId)
@@ -496,12 +537,16 @@ export async function createKunServeRuntime(
   }
 }
 
-function adaptiveObservations(items: readonly TurnItem[]): StallObservation[] {
+export function adaptiveObservationsForTurn(
+  items: readonly TurnItem[],
+  turnId: string
+): StallObservation[] {
+  const currentTurnItems = items.filter((item) => item.turnId === turnId)
   const resultsByCallId = new Map<string, Extract<TurnItem, { kind: 'tool_result' }>>()
-  for (const item of items) {
+  for (const item of currentTurnItems) {
     if (item.kind === 'tool_result') resultsByCallId.set(item.callId, item)
   }
-  return items.flatMap((item): StallObservation[] => {
+  return currentTurnItems.flatMap((item): StallObservation[] => {
     if (item.kind !== 'tool_call') return []
     const result = resultsByCallId.get(item.callId)
     return [{
@@ -515,6 +560,46 @@ function adaptiveObservations(items: readonly TurnItem[]): StallObservation[] {
         : result ? { evidenceFingerprint: boundedToolObservation(result.output) } : {})
     }]
   })
+}
+
+function newAdaptiveTrialState(now: string, usage: UsageSnapshot): AdaptiveTrialState {
+  return {
+    startedAtMs: toEpochMs(now),
+    usageBaseline: {
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      turns: usage.turns,
+      costUsd: usage.costUsd ?? 0
+    },
+    recovery: {
+      recoveryRounds: 0,
+      stage: 'initial',
+      attemptedActionSignatures: []
+    }
+  }
+}
+
+function adaptiveRecoveryBudget(
+  task: HarnessTaskSpec,
+  trial: AdaptiveTrialState,
+  usage: UsageSnapshot,
+  now: string
+): RecoveryBudget {
+  const consumed = adaptiveTrialUsageSince(trial.usageBaseline, {
+    promptTokens: usage.promptTokens,
+    completionTokens: usage.completionTokens,
+    turns: usage.turns,
+    costUsd: usage.costUsd ?? 0
+  })
+  return {
+    limits: task.budgets,
+    elapsedWallTimeMs: elapsedAdaptiveTrialMs(trial.startedAtMs, now),
+    modelSteps: consumed.modelSteps,
+    inputTokens: consumed.inputTokens,
+    outputTokens: consumed.outputTokens,
+    costUsd: consumed.costUsd,
+    ...trial.recovery
+  }
 }
 
 function adaptiveActionKind(item: Extract<TurnItem, { kind: 'tool_call' }>): StallActionKind {
@@ -532,10 +617,16 @@ function boundedToolObservation(output: unknown): string {
   }
 }
 
-function elapsedTurnMs(startedAt: string, nowIso: string): number {
-  const start = Date.parse(startedAt)
-  const now = Date.parse(nowIso)
-  return Number.isFinite(start) && Number.isFinite(now) ? Math.max(0, now - start) : 0
+function elapsedAdaptiveTrialMs(startedAtMs: number, nowIso: string): number {
+  const now = toEpochMs(nowIso)
+  return Number.isFinite(startedAtMs) && Number.isFinite(now)
+    ? Math.max(0, now - startedAtMs)
+    : 0
+}
+
+function toEpochMs(value: string): number {
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : 0
 }
 
 function tokenEconomyConfigForOptions(

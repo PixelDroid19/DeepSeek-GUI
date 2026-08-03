@@ -15,6 +15,8 @@ export type RecoveryFailure =
   | 'invalid_budget'
   | 'wall_time_exhausted'
   | 'model_steps_exhausted'
+  | 'input_tokens_exhausted'
+  | 'output_tokens_exhausted'
   | 'cost_exhausted'
   | 'max_recovery_rounds'
   | 'duplicate_action'
@@ -25,10 +27,42 @@ export type RecoveryBudget = {
   limits: HarnessTrialBudgets
   elapsedWallTimeMs: number
   modelSteps: number
+  inputTokens: number
+  outputTokens: number
   costUsd: number
   recoveryRounds: number
   stage: RecoveryStage
   attemptedActionSignatures: readonly string[]
+}
+
+/** A turn-local cumulative usage snapshot captured before an adaptive trial starts. */
+export type AdaptiveTrialUsageBaseline = {
+  promptTokens: number
+  completionTokens: number
+  turns: number
+  costUsd: number
+}
+
+/** Usage consumed after a trial's baseline; prior thread history is excluded. */
+export type AdaptiveTrialUsage = {
+  inputTokens: number
+  outputTokens: number
+  modelSteps: number
+  costUsd: number
+}
+
+/** Durable, bounded recovery state retained while one adaptive turn re-enters recovery. */
+export type AdaptiveRecoveryState = {
+  recoveryRounds: number
+  stage: RecoveryStage
+  attemptedActionSignatures: readonly string[]
+}
+
+/** Mutable per-turn state shared by the normal loop observer and rigorous pipeline. */
+export type AdaptiveTrialState = {
+  startedAtMs: number
+  usageBaseline: AdaptiveTrialUsageBaseline
+  recovery: AdaptiveRecoveryState
 }
 
 export type RecoveryAction = {
@@ -75,10 +109,8 @@ export function stallDetectorConfigForTask(
  * returns a fail action rather than retrying work.
  */
 export function chooseRecovery(signal: StallSignal, budget: RecoveryBudget): RecoveryAction {
-  const invalid = invalidBudget(budget)
-  if (invalid) return fail(signal, invalid)
-  const exhausted = exhaustedBudget(budget)
-  if (exhausted) return fail(signal, exhausted)
+  const budgetFailure = recoveryBudgetFailure(budget)
+  if (budgetFailure) return fail(signal, budgetFailure)
   if (budget.recoveryRounds >= budget.limits.maxRecoveryRounds) {
     return fail(signal, 'max_recovery_rounds')
   }
@@ -88,6 +120,67 @@ export function chooseRecovery(signal: StallSignal, budget: RecoveryBudget): Rec
   const actionSignature = `recovery:${kind}:${signal.signature}:${budget.recoveryRounds}`
   if (budget.attemptedActionSignatures.includes(actionSignature)) return fail(signal, 'duplicate_action')
   return { kind, actionSignature, reason: signal.reason }
+}
+
+/**
+ * Calculates trial-local usage from cumulative service snapshots. This avoids
+ * inheriting unrelated prior-thread tokens, steps, or cost into a new trial.
+ */
+export function adaptiveTrialUsageSince(
+  baseline: AdaptiveTrialUsageBaseline,
+  current: Partial<AdaptiveTrialUsageBaseline>
+): AdaptiveTrialUsage {
+  return {
+    inputTokens: nonNegativeDelta(current.promptTokens, baseline.promptTokens),
+    outputTokens: nonNegativeDelta(current.completionTokens, baseline.completionTokens),
+    modelSteps: nonNegativeDelta(current.turns, baseline.turns),
+    costUsd: nonNegativeDelta(current.costUsd, baseline.costUsd)
+  }
+}
+
+/**
+ * Persists the finite recovery automaton after an action is accepted. The
+ * action signature is retained so re-entry cannot repeat the same work.
+ */
+export function advanceAdaptiveRecoveryState(
+  state: AdaptiveRecoveryState,
+  action: RecoveryAction
+): AdaptiveRecoveryState {
+  if (action.kind === 'fail') return state
+  const attemptedActionSignatures = state.attemptedActionSignatures.includes(action.actionSignature)
+    ? state.attemptedActionSignatures
+    : [...state.attemptedActionSignatures, action.actionSignature].slice(-512)
+  switch (action.kind) {
+    case 'checkpoint':
+      return { ...state, stage: 'checkpointed', attemptedActionSignatures }
+    case 'critic':
+      // Keep the stage at checkpointed until the isolated critic actually
+      // completes. If execution is interrupted, its retained signature makes
+      // re-entry fail closed instead of silently skipping or duplicating it.
+      return { ...state, attemptedActionSignatures }
+    case 'require_hypothesis':
+      return { ...state, stage: 'hypothesis_confirmed', attemptedActionSignatures }
+    case 'rigorous_fix':
+      return {
+        recoveryRounds: state.recoveryRounds + 1,
+        stage: 'initial',
+        attemptedActionSignatures
+      }
+  }
+}
+
+/** Advances the recovery automaton only after the isolated critic returned. */
+export function completeAdaptiveRecoveryCritic(
+  state: AdaptiveRecoveryState
+): AdaptiveRecoveryState {
+  return state.stage === 'checkpointed'
+    ? { ...state, stage: 'critic_complete' }
+    : state
+}
+
+/** Validates and checks every hard adaptive-trial dimension. */
+export function recoveryBudgetFailure(budget: RecoveryBudget): RecoveryFailure | undefined {
+  return invalidBudget(budget) ?? exhaustedBudget(budget)
 }
 
 /**
@@ -102,6 +195,12 @@ export function decideAdaptiveEscalation(input: {
 }): AdaptiveEscalationDecision {
   if (input.task.executionPolicy !== 'adaptive') return { kind: 'loop' }
 
+  const budgetFailure = recoveryBudgetFailure(input.budget)
+  if (budgetFailure) {
+    const signal = budgetExhaustionSignal(input.task, budgetFailure)
+    return { kind: 'fail', signal, action: chooseRecovery(signal, input.budget) }
+  }
+
   const signal = detectStall(input.history, stallDetectorConfigForTask(input.task, input.budget))
     ?? complexitySignal(input.task)
   if (!signal) return { kind: 'loop' }
@@ -110,6 +209,15 @@ export function decideAdaptiveEscalation(input: {
   return action.kind === 'fail'
     ? { kind: 'fail', signal, action }
     : { kind: 'rigorous', signal, action }
+}
+
+function budgetExhaustionSignal(task: HarnessTaskSpec, failure: RecoveryFailure): StallSignal {
+  return {
+    reason: 'budget_pressure',
+    signature: `adaptive:budget:${task.id.length}:${failure}`,
+    observationCount: 0,
+    retainedObservationCount: 0
+  }
 }
 
 export function taskComplexity(task: HarnessTaskSpec): number {
@@ -142,12 +250,16 @@ function invalidBudget(budget: RecoveryBudget): RecoveryFailure | undefined {
   const positiveLimits = [
     limits.wallTimeMs,
     limits.maxModelSteps,
+    limits.maxInputTokens,
+    limits.maxOutputTokens,
     limits.maxCostUsd,
     limits.maxRecoveryRounds
   ]
   const nonNegativeValues = [
     budget.elapsedWallTimeMs,
     budget.modelSteps,
+    budget.inputTokens,
+    budget.outputTokens,
     budget.costUsd,
     budget.recoveryRounds
   ]
@@ -158,10 +270,22 @@ function invalidBudget(budget: RecoveryBudget): RecoveryFailure | undefined {
 }
 
 function exhaustedBudget(budget: RecoveryBudget): RecoveryFailure | undefined {
-  if (budget.elapsedWallTimeMs >= budget.limits.wallTimeMs) return 'wall_time_exhausted'
-  if (budget.modelSteps >= budget.limits.maxModelSteps) return 'model_steps_exhausted'
-  if (budget.costUsd >= budget.limits.maxCostUsd) return 'cost_exhausted'
+  if (reachesLimit(budget.elapsedWallTimeMs, budget.limits.wallTimeMs)) return 'wall_time_exhausted'
+  if (reachesLimit(budget.modelSteps, budget.limits.maxModelSteps)) return 'model_steps_exhausted'
+  if (reachesLimit(budget.inputTokens, budget.limits.maxInputTokens)) return 'input_tokens_exhausted'
+  if (reachesLimit(budget.outputTokens, budget.limits.maxOutputTokens)) return 'output_tokens_exhausted'
+  if (reachesLimit(budget.costUsd, budget.limits.maxCostUsd)) return 'cost_exhausted'
   return undefined
+}
+
+function reachesLimit(used: number, limit: number): boolean {
+  return used >= limit || Math.abs(used - limit) <= Number.EPSILON * Math.max(1, Math.abs(used), Math.abs(limit)) * 8
+}
+
+function nonNegativeDelta(current: unknown, baseline: unknown): number {
+  const currentValue = typeof current === 'number' && Number.isFinite(current) ? current : 0
+  const baselineValue = typeof baseline === 'number' && Number.isFinite(baseline) ? baseline : 0
+  return Math.max(0, currentValue - baselineValue)
 }
 
 function fail(signal: StallSignal, failure: RecoveryFailure): RecoveryAction {

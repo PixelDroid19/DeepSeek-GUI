@@ -32,6 +32,52 @@ describe('AgentLoop', () => {
     expect(h.inflight.size()).toBe(0)
   })
 
+  it('keeps an adaptive turn open when its tool-result observer escalates', async () => {
+    const echoTool = LocalToolHost.defineTool({
+      name: 'echo',
+      description: 'Echo text',
+      inputSchema: {
+        type: 'object',
+        properties: { text: { type: 'string' } },
+        required: ['text']
+      },
+      policy: 'auto',
+      execute: async (args) => ({ output: args.text })
+    })
+    const h = makeHarness({
+      provider: 'adaptive-observer',
+      model: 'adaptive-observer',
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        yield {
+          kind: 'tool_call_complete',
+          callId: 'call_echo',
+          toolName: 'echo',
+          arguments: { text: 'repeat me' }
+        }
+        yield { kind: 'completed', stopReason: 'tool_calls' }
+      }
+    }, { tools: [echoTool] })
+    await bootstrapThread(h)
+
+    const observed: string[] = []
+    const status = await h.loop.runTurn(h.threadId, h.turnId, {
+      onToolResult: async ({ call, result }) => {
+        observed.push(`${call.toolName}:${result.item.kind}`)
+        return 'escalate' as const
+      }
+    })
+
+    expect(status).toBe('escalated')
+    expect(observed).toEqual(['echo:tool_result'])
+    expect((await h.turns.getTurn(h.threadId, h.turnId))?.status).toBe('running')
+    expect((await h.sessionStore.loadItems(h.threadId)).filter((item) => item.turnId === h.turnId)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'tool_call', callId: 'call_echo' }),
+        expect.objectContaining({ kind: 'tool_result', callId: 'call_echo' })
+      ])
+    )
+  })
+
   it('injects the current shell runtime when bash is available', async () => {
     let observedRequest: ModelRequest | null = null
     const h = makeHarness({

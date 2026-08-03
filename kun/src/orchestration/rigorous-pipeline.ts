@@ -36,7 +36,12 @@ import {
   type TrustedEvidenceRecord
 } from './completion-gate.js'
 import {
+  adaptiveTrialUsageSince,
+  advanceAdaptiveRecoveryState,
   chooseRecovery,
+  completeAdaptiveRecoveryCritic,
+  recoveryBudgetFailure,
+  type AdaptiveTrialState,
   type RecoveryAction,
   type RecoveryBudget,
   type RecoveryFailure
@@ -85,6 +90,19 @@ type AdaptiveRecoveryResult =
   | { status: 'aborted' }
   | { status: 'failed'; failure: RecoveryFailure }
 
+type AdaptiveTrialBudgetTracker = {
+  task: HarnessTaskSpec
+  trial: AdaptiveTrialState
+  startedRoles: number
+}
+
+class AdaptiveTrialBudgetError extends Error {
+  constructor(readonly failure: RecoveryFailure) {
+    super(`adaptive trial budget exhausted: ${failure}`)
+    this.name = 'AdaptiveTrialBudgetError'
+  }
+}
+
 export type RigorousPipelineDeps = {
   threadStore: ThreadStore
   turns: TurnService
@@ -95,6 +113,7 @@ export type RigorousPipelineDeps = {
   roles: RolesConfig
   defaultModel: string
   nowIso: () => string
+  nowMs?: () => number
   /** Optional workspace eval integration: suite store + the tool host used to run checks. */
   evals?: {
     enabled: boolean
@@ -107,7 +126,12 @@ export type RigorousPipelineDeps = {
 export class RigorousPipeline {
   constructor(private readonly deps: RigorousPipelineDeps) {}
 
-  async run(threadId: string, turnId: string, adaptiveSignal?: StallSignal): Promise<PipelineStatus> {
+  async run(
+    threadId: string,
+    turnId: string,
+    adaptiveSignal?: StallSignal,
+    adaptiveTrial?: AdaptiveTrialState
+  ): Promise<PipelineStatus> {
     const signal = this.deps.turns.getAbortController(turnId)
     if (!signal) {
       await this.deps.turns.finishTurn({
@@ -132,8 +156,15 @@ export class RigorousPipeline {
         ? turn.model?.trim() || thread.model
         : undefined
       const roleModel = pinnedHarnessModel ?? thread.model
-      const runStartedAtMs = toEpochMs(this.deps.nowIso())
+      const runStartedAtMs = this.nowMs()
       const runStartingUsage = this.deps.usage.forThread(threadId)
+      const adaptiveBudget = turn.harnessTask?.executionPolicy === 'adaptive'
+        ? {
+            task: turn.harnessTask,
+            trial: adaptiveTrial ?? createAdaptiveTrialState(runStartedAtMs, runStartingUsage),
+            startedRoles: 0
+          }
+        : undefined
       let plan = turn.planArtifact
       if (!plan) {
         const planned = await this.runRole({
@@ -145,7 +176,8 @@ export class RigorousPipeline {
           threadId,
           turnId,
           workspace,
-          signal
+          signal,
+          ...(adaptiveBudget ? { adaptiveBudget } : {})
         })
         if (planned.status === 'aborted') {
           await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
@@ -169,7 +201,8 @@ export class RigorousPipeline {
         ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
         request,
         plan,
-        signal
+        signal,
+        ...(adaptiveBudget ? { adaptiveBudget } : {})
       })
       if (firstExecution.status === 'aborted') {
         await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
@@ -189,7 +222,8 @@ export class RigorousPipeline {
         diff: firstDiff,
         evalSuite: suiteBefore?.suite,
         harnessTask: turn.harnessTask,
-        signal
+        signal,
+        ...(adaptiveBudget ? { adaptiveBudget } : {})
       })
       if (firstVerification.status === 'aborted') {
         await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
@@ -201,7 +235,8 @@ export class RigorousPipeline {
         workspace,
         suiteBefore,
         turn.harnessTask,
-        signal
+        signal,
+        adaptiveBudget
       )
       await this.persistVerification(threadId, turnId, firstVerification.artifact, firstVerification.rawText, 'initial', firstEvalRun)
       let review = await this.runReviewer({
@@ -214,7 +249,8 @@ export class RigorousPipeline {
         verification: firstVerification.artifact,
         verificationRawText: firstVerification.rawText,
         diff: firstDiff,
-        signal
+        signal,
+        ...(adaptiveBudget ? { adaptiveBudget } : {})
       })
       if (review.status === 'aborted') {
         await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
@@ -262,7 +298,6 @@ export class RigorousPipeline {
           threadId,
           turnId,
           workspace,
-          task: turn.harnessTask,
           signal: adaptiveSignal,
           plan,
           verification: firstVerification.artifact,
@@ -270,12 +305,7 @@ export class RigorousPipeline {
           priorReviewerReasons: review.artifact.reasons,
           threadModel: roleModel,
           ...(pinnedHarnessModel ? { pinnedModel: pinnedHarnessModel } : {}),
-          initialModelSteps: (turn.planArtifact ? 0 : 1) + 3,
-          startedAtMs: runStartedAtMs,
-          usageAtStart: {
-            modelTurns: runStartingUsage.turns,
-            costUsd: runStartingUsage.costUsd ?? 0
-          },
+          adaptiveBudget: requireAdaptiveBudget(adaptiveBudget),
           abortSignal: signal
         })
         if (recovered.status === 'aborted') {
@@ -303,7 +333,8 @@ export class RigorousPipeline {
           plan,
           priorFindings: firstVerification.artifact.findings,
           ...(recoveryHypothesis ? { recoveryHypothesis } : {}),
-          signal
+          signal,
+          ...(adaptiveBudget ? { adaptiveBudget } : {})
         })
         if (fixedExecution.status === 'aborted') {
           await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
@@ -323,7 +354,8 @@ export class RigorousPipeline {
           diff: finalDiff,
           evalSuite: suiteBefore?.suite,
           harnessTask: turn.harnessTask,
-          signal
+          signal,
+          ...(adaptiveBudget ? { adaptiveBudget } : {})
         })
         if (finalVerification.status === 'aborted') {
           await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
@@ -335,7 +367,8 @@ export class RigorousPipeline {
           workspace,
           suiteBefore,
           turn.harnessTask,
-          signal
+          signal,
+          adaptiveBudget
         )
         await this.persistVerification(threadId, turnId, finalVerification.artifact, finalVerification.rawText, 'final', finalEvalRun)
         review = await this.runReviewer({
@@ -349,7 +382,8 @@ export class RigorousPipeline {
           verificationRawText: finalVerification.rawText,
           diff: finalDiff,
           signal,
-          finalRound: true
+          finalRound: true,
+          ...(adaptiveBudget ? { adaptiveBudget } : {})
         })
         if (review.status === 'aborted') {
           await this.deps.turns.finishTurn({ threadId, turnId, status: 'aborted' })
@@ -424,7 +458,6 @@ export class RigorousPipeline {
     threadId: string
     turnId: string
     workspace: string
-    task: HarnessTaskSpec
     signal: StallSignal
     plan: PlannerArtifact
     verification: VerificationArtifact
@@ -432,42 +465,32 @@ export class RigorousPipeline {
     priorReviewerReasons: readonly string[]
     threadModel: string
     pinnedModel?: string
-    initialModelSteps: number
-    startedAtMs: number
-    usageAtStart: { modelTurns: number; costUsd: number }
+    adaptiveBudget: AdaptiveTrialBudgetTracker
     abortSignal: AbortSignal
   }): Promise<AdaptiveRecoveryResult> {
-    const attemptedActionSignatures: string[] = []
-    const budgetFor = (stage: RecoveryBudget['stage'], minimumModelSteps: number): RecoveryBudget => {
-      const usage = this.deps.usage.forThread(input.threadId)
-      return {
-        limits: input.task.budgets,
-        elapsedWallTimeMs: elapsedSince(input.startedAtMs, this.deps.nowIso()),
-        modelSteps: Math.max(minimumModelSteps, usage.turns - input.usageAtStart.modelTurns),
-        costUsd: Math.max(0, (usage.costUsd ?? 0) - input.usageAtStart.costUsd),
-        recoveryRounds: 0,
-        stage,
-        attemptedActionSignatures
-      }
+    const takeAction = (): RecoveryAction =>
+      chooseRecovery(input.signal, this.recoveryBudget(input.threadId, input.adaptiveBudget))
+    const acceptAction = async (action: RecoveryAction): Promise<void> => {
+      await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+      input.adaptiveBudget.trial.recovery = advanceAdaptiveRecoveryState(
+        input.adaptiveBudget.trial.recovery,
+        action
+      )
     }
-    const takeAction = (stage: RecoveryBudget['stage'], minimumModelSteps: number): RecoveryAction =>
-      chooseRecovery(input.signal, budgetFor(stage, minimumModelSteps))
 
-    let action = takeAction('initial', input.initialModelSteps)
+    let action = takeAction()
     if (action.kind === 'fail') {
       await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
       return { status: 'failed', failure: action.failure ?? 'invalid_stage' }
     }
-    await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
-    attemptedActionSignatures.push(action.actionSignature)
+    await acceptAction(action)
 
-    action = takeAction('checkpointed', input.initialModelSteps)
+    action = takeAction()
     if (action.kind === 'fail') {
       await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
       return { status: 'failed', failure: action.failure ?? 'invalid_stage' }
     }
-    await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
-    attemptedActionSignatures.push(action.actionSignature)
+    await acceptAction(action)
 
     const critic = await this.runReviewer({
       threadId: input.threadId,
@@ -480,11 +503,15 @@ export class RigorousPipeline {
       verificationRawText: '',
       diff: input.diff,
       signal: input.abortSignal,
-      recoveryCritic: true
+      recoveryCritic: true,
+      adaptiveBudget: input.adaptiveBudget
     })
     if (critic.status === 'aborted') return { status: 'aborted' }
+    input.adaptiveBudget.trial.recovery = completeAdaptiveRecoveryCritic(
+      input.adaptiveBudget.trial.recovery
+    )
 
-    action = takeAction('critic_complete', input.initialModelSteps + 1)
+    action = takeAction()
     if (action.kind === 'fail') {
       await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
       return { status: 'failed', failure: action.failure ?? 'invalid_stage' }
@@ -495,15 +522,14 @@ export class RigorousPipeline {
       await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, failure)
       return { status: 'failed', failure: 'hypothesis_missing' }
     }
-    await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
-    attemptedActionSignatures.push(action.actionSignature)
+    await acceptAction(action)
 
-    action = takeAction('hypothesis_confirmed', input.initialModelSteps + 1)
+    action = takeAction()
     if (action.kind === 'fail') {
       await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
       return { status: 'failed', failure: action.failure ?? 'invalid_stage' }
     }
-    await this.persistAdaptiveRecoveryAction(input.threadId, input.turnId, action)
+    await acceptAction(action)
     return { status: 'completed', hypothesis }
   }
 
@@ -535,6 +561,7 @@ export class RigorousPipeline {
     priorFindings?: VerificationArtifact['findings']
     recoveryHypothesis?: string
     signal: AbortSignal
+    adaptiveBudget?: AdaptiveTrialBudgetTracker
   }): Promise<{ status: 'completed' | 'aborted'; artifact: ExecutionArtifact; rawText: string }> {
     const result = await this.runRole({
       role: 'executor',
@@ -545,7 +572,8 @@ export class RigorousPipeline {
       threadId: input.threadId,
       turnId: input.turnId,
       workspace: input.workspace,
-      signal: input.signal
+      signal: input.signal,
+      ...(input.adaptiveBudget ? { adaptiveBudget: input.adaptiveBudget } : {})
     })
     if (result.status === 'aborted') return { status: 'aborted', artifact: emptyExecution(result.rawText), rawText: result.rawText }
     return {
@@ -568,6 +596,7 @@ export class RigorousPipeline {
     evalSuite?: EvalSuite
     harnessTask?: HarnessTaskSpec
     signal: AbortSignal
+    adaptiveBudget?: AdaptiveTrialBudgetTracker
   }): Promise<{ status: 'completed' | 'aborted'; artifact: VerificationArtifact; artifactPresent: boolean; rawText: string }> {
     const result = await this.runRole({
       role: 'verifier',
@@ -585,7 +614,8 @@ export class RigorousPipeline {
       threadId: input.threadId,
       turnId: input.turnId,
       workspace: input.workspace,
-      signal: input.signal
+      signal: input.signal,
+      ...(input.adaptiveBudget ? { adaptiveBudget: input.adaptiveBudget } : {})
     })
     if (result.status === 'aborted') {
       return { status: 'aborted', artifact: emptyVerification(), artifactPresent: false, rawText: result.rawText }
@@ -611,6 +641,7 @@ export class RigorousPipeline {
     signal: AbortSignal
     finalRound?: boolean
     recoveryCritic?: boolean
+    adaptiveBudget?: AdaptiveTrialBudgetTracker
   }): Promise<{ status: 'completed' | 'aborted'; artifact: VerdictArtifact; rawText: string }> {
     const result = await this.runRole({
       role: 'reviewer',
@@ -623,7 +654,8 @@ export class RigorousPipeline {
       threadId: input.threadId,
       turnId: input.turnId,
       workspace: input.workspace,
-      signal: input.signal
+      signal: input.signal,
+      ...(input.adaptiveBudget ? { adaptiveBudget: input.adaptiveBudget } : {})
     })
     if (result.status === 'aborted') return { status: 'aborted', artifact: { verdict: 'fix', reasons: ['reviewer aborted'] }, rawText: result.rawText }
     if (!result.artifact && result.artifactParseError) {
@@ -652,9 +684,14 @@ export class RigorousPipeline {
     turnId: string
     workspace: string
     signal: AbortSignal
+    adaptiveBudget?: AdaptiveTrialBudgetTracker
   }): Promise<{ status: 'completed' | 'aborted'; artifact?: StageArtifact; artifactParseError?: string; rawText: string }> {
     if (!roleEnabled(input.role, this.deps.roles)) {
       throw new Error(`role ${input.role} is disabled`)
+    }
+    if (input.adaptiveBudget) {
+      this.assertAdaptiveBudget(input.threadId, input.adaptiveBudget)
+      input.adaptiveBudget.startedRoles += 1
     }
     const profile = ROLE_PROFILES[input.role]
     const configuredRoute = resolveRoleModel(input.role, this.deps.roles, input.threadModel || this.deps.defaultModel)
@@ -718,6 +755,9 @@ export class RigorousPipeline {
       ...(stageUsage ? { usage: stageUsage } : {})
     })
     await this.recordUsage(input.threadId, input.turnId, route.model, child.usage)
+    if (!input.signal.aborted && input.adaptiveBudget) {
+      this.assertAdaptiveBudget(input.threadId, input.adaptiveBudget)
+    }
     return {
       status: input.signal.aborted ? 'aborted' : 'completed',
       ...(child.artifact ? { artifact: child.artifact } : {}),
@@ -759,7 +799,7 @@ export class RigorousPipeline {
     model: string,
     usage: Awaited<ReturnType<ChildRunExecutor>>['usage']
   ): Promise<void> {
-    if (!usage || usage.totalTokens <= 0) return
+    if (!usage || !hasRecordableChildUsage(usage)) return
     const snapshot = this.deps.usage.record(threadId, toUsageSnapshot(usage))
     await this.deps.events.record({
       kind: 'usage',
@@ -768,6 +808,40 @@ export class RigorousPipeline {
       model,
       usage: snapshot
     })
+  }
+
+  private recoveryBudget(
+    threadId: string,
+    tracker: AdaptiveTrialBudgetTracker
+  ): RecoveryBudget {
+    const usage = this.deps.usage.forThread(threadId)
+    const consumed = adaptiveTrialUsageSince(tracker.trial.usageBaseline, {
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      turns: usage.turns,
+      costUsd: usage.costUsd ?? 0
+    })
+    return {
+      limits: tracker.task.budgets,
+      elapsedWallTimeMs: Math.max(0, this.nowMs() - tracker.trial.startedAtMs),
+      modelSteps: Math.max(consumed.modelSteps, tracker.startedRoles),
+      inputTokens: consumed.inputTokens,
+      outputTokens: consumed.outputTokens,
+      costUsd: consumed.costUsd,
+      ...tracker.trial.recovery
+    }
+  }
+
+  private assertAdaptiveBudget(threadId: string, tracker: AdaptiveTrialBudgetTracker): void {
+    const failure = recoveryBudgetFailure(this.recoveryBudget(threadId, tracker))
+    if (failure) throw new AdaptiveTrialBudgetError(failure)
+  }
+
+  private nowMs(): number {
+    const supplied = this.deps.nowMs?.()
+    if (typeof supplied === 'number' && Number.isFinite(supplied)) return supplied
+    const fromIso = toEpochMs(this.deps.nowIso())
+    return Number.isFinite(fromIso) ? fromIso : Date.now()
   }
 
   private async loadEvalSuite(
@@ -793,8 +867,10 @@ export class RigorousPipeline {
     workspace: string,
     suiteBefore: EvalSuiteSnapshot | null,
     harnessTask: HarnessTaskSpec | undefined,
-    signal: AbortSignal
+    signal: AbortSignal,
+    adaptiveBudget?: AdaptiveTrialBudgetTracker
   ): Promise<MechanicalEvalRun | null> {
+    if (adaptiveBudget) this.assertAdaptiveBudget(threadId, adaptiveBudget)
     const evals = this.deps.evals
     if (!evals?.enabled || !suiteBefore) return null
     try {
@@ -837,10 +913,13 @@ export class RigorousPipeline {
         suiteChecksAfter: suiteAfter.checks.length
       }
       if (!suiteBefore.suite.checks.length && !harnessResults.length && run.hashBefore === run.hashAfter) {
+        if (adaptiveBudget) this.assertAdaptiveBudget(threadId, adaptiveBudget)
         return null
       }
+      if (adaptiveBudget) this.assertAdaptiveBudget(threadId, adaptiveBudget)
       return run
     } catch (error) {
+      if (error instanceof AdaptiveTrialBudgetError) throw error
       await this.recordWarning(
         threadId,
         turnId,
@@ -1371,11 +1450,38 @@ function toUsageSnapshot(usage: NonNullable<Awaited<ReturnType<ChildRunExecutor>
   }
 }
 
-function elapsedSince(startedAtMs: number, nowIso: string): number {
-  const now = toEpochMs(nowIso)
-  return Number.isFinite(startedAtMs) && Number.isFinite(now)
-    ? Math.max(0, now - startedAtMs)
-    : 0
+function hasRecordableChildUsage(
+  usage: NonNullable<Awaited<ReturnType<ChildRunExecutor>>['usage']>
+): boolean {
+  return usage.promptTokens > 0 ||
+    usage.completionTokens > 0 ||
+    usage.totalTokens > 0 ||
+    (usage.turns ?? 0) > 0 ||
+    (usage.costUsd ?? 0) > 0
+}
+
+function createAdaptiveTrialState(startedAtMs: number, usage: UsageSnapshot): AdaptiveTrialState {
+  return {
+    startedAtMs,
+    usageBaseline: {
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      turns: usage.turns,
+      costUsd: usage.costUsd ?? 0
+    },
+    recovery: {
+      recoveryRounds: 0,
+      stage: 'initial',
+      attemptedActionSignatures: []
+    }
+  }
+}
+
+function requireAdaptiveBudget(
+  tracker: AdaptiveTrialBudgetTracker | undefined
+): AdaptiveTrialBudgetTracker {
+  if (!tracker) throw new Error('adaptive recovery missing trial budget tracker')
+  return tracker
 }
 
 function toEpochMs(value: string): number {
@@ -1418,7 +1524,7 @@ function recoveryActionTitle(action: RecoveryAction): string {
 function renderAdaptiveRecoveryAction(action: RecoveryAction): string {
   return action.kind === 'fail'
     ? `Adaptive recovery stopped: ${action.failure ?? 'invalid_stage'}.`
-    : `Adaptive recovery action: ${action.kind}; signal: ${action.reason}.`
+    : `Adaptive recovery action: ${action.kind}; signal: ${action.reason}; signature: ${action.actionSignature}.`
 }
 
 function plannerPrompt(request: string): string {

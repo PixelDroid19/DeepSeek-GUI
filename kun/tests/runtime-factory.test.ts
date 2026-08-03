@@ -2,8 +2,9 @@ import { describe, expect, it } from 'vitest'
 import { InMemorySessionStore } from '../src/adapters/in-memory-session-store.js'
 import { InMemoryThreadStore } from '../src/adapters/in-memory-thread-store.js'
 import { createThreadRecord } from '../src/domain/thread.js'
+import { makeToolCallItem, makeToolResultItem } from '../src/domain/item.js'
 import { UsageService } from '../src/services/usage-service.js'
-import { seedUsageCarryover } from '../src/server/runtime-factory.js'
+import { adaptiveObservationsForTurn, seedUsageCarryover } from '../src/server/runtime-factory.js'
 import type { UsageSnapshot } from '../src/contracts/usage.js'
 
 function usage(overrides: Partial<UsageSnapshot>): UsageSnapshot {
@@ -66,5 +67,42 @@ describe('runtime factory usage carryover', () => {
       misses: 8,
       hitRate: 0.9
     })
+  })
+
+  it('derives adaptive observations from the active turn only', () => {
+    const items = [
+      makeToolCallItem({
+        id: 'item_old_call',
+        threadId: 'thr_seed',
+        turnId: 'turn_old',
+        callId: 'shared_call',
+        toolName: 'old-tool',
+        arguments: { path: '/old' }
+      }),
+      makeToolResultItem({
+        id: 'item_old_result',
+        threadId: 'thr_seed',
+        turnId: 'turn_old',
+        callId: 'shared_call',
+        toolName: 'old-tool',
+        output: 'old error',
+        isError: true
+      }),
+      makeToolCallItem({
+        id: 'item_current_call',
+        threadId: 'thr_seed',
+        turnId: 'turn_current',
+        callId: 'shared_call',
+        toolName: 'current-tool',
+        arguments: { path: '/current' }
+      })
+    ]
+
+    const observations = adaptiveObservationsForTurn(items, 'turn_current')
+
+    expect(observations).toEqual([
+      expect.objectContaining({ action: expect.objectContaining({ name: 'current-tool' }) })
+    ])
+    expect(observations[0]?.command).toBeUndefined()
   })
 })

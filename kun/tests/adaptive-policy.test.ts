@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { HarnessTaskSpec } from '../src/contracts/harness.js'
 import {
+  adaptiveTrialUsageSince,
+  advanceAdaptiveRecoveryState,
   chooseRecovery,
+  completeAdaptiveRecoveryCritic,
   decideAdaptiveEscalation,
   type RecoveryBudget
 } from '../src/orchestration/adaptive-policy.js'
@@ -26,6 +29,8 @@ const baseBudget: RecoveryBudget = {
   },
   elapsedWallTimeMs: 100,
   modelSteps: 1,
+  inputTokens: 10,
+  outputTokens: 5,
   costUsd: 0.01,
   recoveryRounds: 0,
   stage: 'initial',
@@ -78,7 +83,7 @@ describe('adaptive recovery policy', () => {
     ])
   })
 
-  it('fails before recovery when a wall-time, step, or cost limit is exhausted', () => {
+  it('fails before recovery when any trial budget is exhausted', () => {
     expect(chooseRecovery(signal, {
       ...baseBudget,
       elapsedWallTimeMs: baseBudget.limits.wallTimeMs
@@ -87,6 +92,14 @@ describe('adaptive recovery policy', () => {
       ...baseBudget,
       modelSteps: baseBudget.limits.maxModelSteps
     })).toMatchObject({ kind: 'fail', failure: 'model_steps_exhausted' })
+    expect(chooseRecovery(signal, {
+      ...baseBudget,
+      inputTokens: baseBudget.limits.maxInputTokens
+    })).toMatchObject({ kind: 'fail', failure: 'input_tokens_exhausted' })
+    expect(chooseRecovery(signal, {
+      ...baseBudget,
+      outputTokens: baseBudget.limits.maxOutputTokens
+    })).toMatchObject({ kind: 'fail', failure: 'output_tokens_exhausted' })
     expect(chooseRecovery(signal, {
       ...baseBudget,
       costUsd: baseBudget.limits.maxCostUsd
@@ -105,6 +118,44 @@ describe('adaptive recovery policy', () => {
       stage: 'hypothesis_confirmed',
       recoveryRounds: baseBudget.limits.maxRecoveryRounds
     })).toMatchObject({ kind: 'fail', failure: 'max_recovery_rounds' })
+  })
+
+  it('uses only trial-local usage and advances bounded recovery state', () => {
+    const consumed = adaptiveTrialUsageSince(
+      { promptTokens: 400, completionTokens: 80, turns: 7, costUsd: 0.8 },
+      { promptTokens: 412, completionTokens: 83, turns: 8, costUsd: 0.83 }
+    )
+    expect(consumed).toMatchObject({ inputTokens: 12, outputTokens: 3, modelSteps: 1 })
+    expect(consumed.costUsd).toBeCloseTo(0.03)
+
+    const checkpoint = chooseRecovery(signal, baseBudget)
+    const checkpointed = advanceAdaptiveRecoveryState({
+      recoveryRounds: 0,
+      stage: 'initial',
+      attemptedActionSignatures: []
+    }, checkpoint)
+    const critic = chooseRecovery(signal, { ...baseBudget, ...checkpointed })
+    const criticPending = advanceAdaptiveRecoveryState(checkpointed, critic)
+    expect(chooseRecovery(signal, { ...baseBudget, ...criticPending })).toMatchObject({
+      kind: 'fail',
+      failure: 'duplicate_action'
+    })
+    const criticComplete = completeAdaptiveRecoveryCritic(criticPending)
+    const hypothesis = chooseRecovery(signal, { ...baseBudget, ...criticComplete })
+    const hypothesisConfirmed = advanceAdaptiveRecoveryState(criticComplete, hypothesis)
+    const fix = chooseRecovery(signal, { ...baseBudget, ...hypothesisConfirmed })
+    const nextRound = advanceAdaptiveRecoveryState(hypothesisConfirmed, fix)
+
+    expect(nextRound).toMatchObject({
+      recoveryRounds: 1,
+      stage: 'initial',
+      attemptedActionSignatures: [
+        checkpoint.actionSignature,
+        critic.actionSignature,
+        hypothesis.actionSignature,
+        fix.actionSignature
+      ]
+    })
   })
 
   it('keeps low-complexity adaptive trials on the normal loop', () => {

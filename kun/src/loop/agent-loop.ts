@@ -216,7 +216,20 @@ export type AgentLoopOptions = {
 
 type TurnStatus = 'completed' | 'failed' | 'aborted'
 
-type ModelStepResult = 'continue' | 'stop' | 'failed' | 'aborted'
+type ModelStepResult = 'continue' | 'stop' | 'failed' | 'aborted' | 'escalated'
+
+/**
+ * Per-run observers used by the composition root to hand an in-flight turn
+ * to a bounded controller without finalizing the turn in the normal loop.
+ */
+export type AgentLoopRunOptions = {
+  onToolResult?: (input: {
+    threadId: string
+    turnId: string
+    call: ToolCallLike
+    result: ToolHostResult
+  }) => Promise<'continue' | 'escalate'> | 'continue' | 'escalate'
+}
 
 /** Everything a model step needs after request preparation succeeded. */
 type PreparedModelStep = {
@@ -282,7 +295,17 @@ export class AgentLoop {
    * (completed, failed, or aborted). All errors are caught and
    * surfaced through the `error` runtime event.
    */
-  async runTurn(threadId: string, turnId: string): Promise<TurnStatus> {
+  async runTurn(threadId: string, turnId: string): Promise<TurnStatus>
+  async runTurn(
+    threadId: string,
+    turnId: string,
+    options: AgentLoopRunOptions
+  ): Promise<TurnStatus | 'escalated'>
+  async runTurn(
+    threadId: string,
+    turnId: string,
+    options: AgentLoopRunOptions = {}
+  ): Promise<TurnStatus | 'escalated'> {
     const signal = this.opts.turns.getAbortController(turnId)
     if (!signal) {
       await this.failTurn(threadId, turnId, 'no abort controller for turn')
@@ -302,7 +325,11 @@ export class AgentLoop {
       await this.recordPipelineStage(threadId, turnId, 'pre_start')
       await this.drainSteering(threadId, turnId)
       await this.recordPipelineStage(threadId, turnId, 'post_start')
-      const status = await this.loop(threadId, turnId, signal)
+      const status = await this.loop(threadId, turnId, signal, options)
+      if (status === 'escalated') {
+        await this.finishContextEngineTurn(threadId, turnId, 'adaptive_escalated')
+        return status
+      }
       await this.opts.turns.finishTurn({ threadId, turnId, status })
       await this.finishContextEngineTurn(threadId, turnId, status)
       return status
@@ -390,15 +417,17 @@ export class AgentLoop {
   private async loop(
     threadId: string,
     turnId: string,
-    signal: AbortSignal
-  ): Promise<TurnStatus> {
+    signal: AbortSignal,
+    options: AgentLoopRunOptions
+  ): Promise<TurnStatus | 'escalated'> {
     for (let step = 0; ; step += 1) {
       if (signal.aborted) return 'aborted'
       await this.drainSteering(threadId, turnId)
-      const stepResult = await this.modelStep(threadId, turnId, signal, step)
+      const stepResult = await this.modelStep(threadId, turnId, signal, step, options)
       if (stepResult === 'stop') return 'completed'
       if (stepResult === 'failed') return 'failed'
       if (stepResult === 'aborted') return 'aborted'
+      if (stepResult === 'escalated') return 'escalated'
     }
   }
 
@@ -406,7 +435,8 @@ export class AgentLoop {
     threadId: string,
     turnId: string,
     signal: AbortSignal,
-    stepIndex = 0
+    stepIndex = 0,
+    options: AgentLoopRunOptions = {}
   ): Promise<ModelStepResult> {
     const prepared = await this.prepareModelStep(threadId, turnId, signal, stepIndex)
     if (prepared.kind !== 'ready') return prepared.kind
@@ -439,7 +469,8 @@ export class AgentLoop {
       allowedToolNames: prepared.allowedToolNames,
       toolProviderKinds: prepared.toolProviderKinds,
       approvalPolicy: prepared.approvalPolicy,
-      signal
+      signal,
+      onToolResult: options.onToolResult
     }
     const streamOutcome = resolveModelStepStreamOutcome({
       assistantText: assistantContent.text,
@@ -484,14 +515,14 @@ export class AgentLoop {
         })
         if (!call) return 'failed'
         const dispatched = await this.dispatchToolCalls({ ...dispatchBase, calls: [call] })
-        return dispatched === 'aborted' ? 'aborted' : 'continue'
+        return dispatched === 'aborted' ? 'aborted' : dispatched === 'escalated' ? 'escalated' : 'continue'
       }
       case 'dispatch-tool-calls': {
         const dispatched = await this.dispatchToolCalls({
           ...dispatchBase,
           calls: completedToolCalls
         })
-        return dispatched === 'aborted' ? 'aborted' : 'continue'
+        return dispatched === 'aborted' ? 'aborted' : dispatched === 'escalated' ? 'escalated' : 'continue'
       }
     }
   }
@@ -958,7 +989,8 @@ export class AgentLoop {
     toolProviderKinds: ReadonlyMap<string, ToolProviderKind | undefined>
     approvalPolicy: ToolHostContext['approvalPolicy']
     signal: AbortSignal
-  }): Promise<'continue' | 'aborted'> {
+    onToolResult?: AgentLoopRunOptions['onToolResult']
+  }): Promise<'continue' | 'aborted' | 'escalated'> {
     const context = this.createToolContext(input)
     let index = 0
 
@@ -994,6 +1026,7 @@ export class AgentLoop {
           context
         })
         await this.persistToolCallResult(input.threadId, input.turnId, dispatchPlan.call, result)
+        if (await this.shouldEscalateAfterToolResult(input, dispatchPlan.call, result)) return 'escalated'
         continue
       }
 
@@ -1007,12 +1040,16 @@ export class AgentLoop {
           })
         )
       )
+      let escalationRequested = false
       for (let batchIndex = 0; batchIndex < dispatchPlan.batch.length; batchIndex += 1) {
         const result = settled[batchIndex]
         const batchCall = dispatchPlan.batch[batchIndex]
         if (!result || !batchCall) continue
         if (result.status === 'rejected') throw result.reason
         await this.persistToolCallResult(input.threadId, input.turnId, batchCall, result.value)
+        if (!escalationRequested && await this.shouldEscalateAfterToolResult(input, batchCall, result.value)) {
+          escalationRequested = true
+        }
       }
 
       if (dispatchPlan.suppressedAfterBatch) {
@@ -1023,9 +1060,27 @@ export class AgentLoop {
           reason: dispatchPlan.suppressedAfterBatch.reason
         })
       }
+      if (escalationRequested) return 'escalated'
     }
 
     return 'continue'
+  }
+
+  private async shouldEscalateAfterToolResult(
+    input: {
+      threadId: string
+      turnId: string
+      onToolResult?: AgentLoopRunOptions['onToolResult']
+    },
+    call: ToolCallLike,
+    result: ToolHostResult
+  ): Promise<boolean> {
+    return (await input.onToolResult?.({
+      threadId: input.threadId,
+      turnId: input.turnId,
+      call,
+      result
+    })) === 'escalate'
   }
 
   private createToolContext(input: {
