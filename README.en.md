@@ -437,6 +437,10 @@ We are also grateful to:
 
 [MIT](./LICENSE)
 
+### Fork and license provenance
+
+This fork keeps its checked-in [MIT license](./LICENSE); before reusing newer Kun upstream material, review the [license audit](./docs/license-audit.md) and [upstream boundary policy](./docs/upstream-boundary.md).
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/chart?repos=XingYu-Zhong/DeepSeek-GUI&type=date&legend=top-left)](https://www.star-history.com/?repos=XingYu-Zhong%2FDeepSeek-GUI&type=date&logscale=&legend=top-left)

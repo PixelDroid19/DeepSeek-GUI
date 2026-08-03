@@ -420,6 +420,10 @@ Kun 的设计站在先行项目的肩膀上：
 
 [MIT](./LICENSE)
 
+### Fork 与许可证来源
+
+本 fork 使用仓库中现有的 [MIT 许可证](./LICENSE)；在复用较新的 Kun 上游材料前，请查阅[许可证审计](./docs/license-audit.md)和[上游边界政策](./docs/upstream-boundary.md)。
+
 ## Star 历史
 
 [![Star History Chart](https://api.star-history.com/chart?repos=XingYu-Zhong/DeepSeek-GUI&type=date&legend=top-left)](https://www.star-history.com/?repos=XingYu-Zhong%2FDeepSeek-GUI&type=date&logscale=&legend=top-left)
