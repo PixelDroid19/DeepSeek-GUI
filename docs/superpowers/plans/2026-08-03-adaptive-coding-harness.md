@@ -74,7 +74,7 @@ Create `scripts/check-license-boundary.mjs` that:
 - reads the cutoff commit from `docs/upstream-boundary.md`;
 - checks that `LICENSE` still contains `MIT License`;
 - checks that `README.md` and `README.en.md` link to the audit;
-- fails if an unapproved `UPSTREAM_LICENSE_EXCEPTION` marker is added;
+- fails if an unapproved upstream-license exception marker is added;
 - never prints secret-like values.
 
 - [ ] **Step 5: Document the policy in both READMEs**
@@ -332,7 +332,11 @@ Record manifest hash, environment digest, model/protocol, stage transitions, act
 Implement:
 
 ```ts
-compareTrials(baseline: TrialResult[], harness: TrialResult[]): ComparisonReport
+compareTrials(
+  baseline: TrialResult[],
+  harness: TrialResult[],
+  options: { trustedAttestationKeys: ExternalAttestationTrustStore }
+): ComparisonReport
 ```
 
 Report official pass rate, delta by benchmark family, regressions, recovered failures, false-completion count, cost per pass, wall time, token totals, and cache hit rate.
