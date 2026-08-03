@@ -64,6 +64,7 @@ function fakeRuntime(input: {
   toolHost?: ServerRuntime['toolHost']
   onShutdown?: () => void
   onOptions?: (options: ServeOptions) => void
+  onCreateThread?: (input: Parameters<ServerRuntime['threadService']['create']>[0]) => void
   onStartTurn?: (input: Parameters<ServerRuntime['turnService']['startTurn']>[0]) => void
 } = {}): CliIo['createRuntime'] {
   return async (options) => {
@@ -73,7 +74,9 @@ function fakeRuntime(input: {
     const status = input.status ?? 'completed'
     return {
       threadService: {
-        create: async () => ({
+        create: async (createInput: Parameters<ServerRuntime['threadService']['create']>[0]) => {
+          input.onCreateThread?.(createInput)
+          return {
           id: 'thr_1',
           title: 'CLI',
           workspace: '/tmp/ws',
@@ -86,7 +89,8 @@ function fakeRuntime(input: {
           createdAt: 'now',
           updatedAt: 'now',
           turns: []
-        })
+          }
+        }
       },
       turnService: {
         startTurn: async (startInput: Parameters<ServerRuntime['turnService']['startTurn']>[0]) => {
@@ -104,6 +108,19 @@ function fakeRuntime(input: {
       sessionStore: {
         loadItems: async () => items,
         loadEventsSince: async () => events
+      },
+      usageService: {
+        forThread: () => ({
+          promptTokens: 10,
+          completionTokens: 5,
+          totalTokens: 15,
+          cachedTokens: 0,
+          cacheHitTokens: 0,
+          cacheMissTokens: 10,
+          cacheHitRate: 0,
+          turns: 1,
+          costUsd: 0.01
+        })
       },
       toolHost: input.toolHost,
       runTurn: async () => {
@@ -488,5 +505,102 @@ describe('Kun agent CLI commands', () => {
     expect(code).toBe(ServeExitCode.config)
     expect(created).toBe(false)
     expect(c.stderr).toContain('requires a non-empty model id')
+  })
+
+  it('runs a manifest-pinned harness trial from an environment-only key and emits redacted JSON', async () => {
+    const manifestPath = join(dataDir, 'harness-manifest.json')
+    await writeFile(manifestPath, JSON.stringify({
+      task: {
+        version: 1,
+        id: 'cli-fixture',
+        objective: 'Fix the CLI fixture.',
+        acceptanceCriteria: [{
+          id: 'test',
+          description: 'The fixture test passes.',
+          required: true,
+          acceptedEvidenceKinds: ['command']
+        }],
+        verification: [],
+        constraints: [],
+        budgets: {
+          wallTimeMs: 60_000,
+          maxModelSteps: 10,
+          maxInputTokens: 10_000,
+          maxOutputTokens: 2_000,
+          maxCostUsd: 1,
+          maxRecoveryRounds: 1
+        },
+        executionPolicy: 'rigorous',
+        benchmark: {
+          family: 'cli',
+          dataset: 'fixtures',
+          version: '1',
+          taskId: 'cli-fixture'
+        }
+      },
+      workspaceRoot: '/tmp/pinned-harness-workspace',
+      model: 'deepseek-v4-flash',
+      endpointFormat: 'chat_completions',
+      harnessCommit: '0123456789abcdef',
+      environmentDigest: 'sha256:cli-fixture'
+    }), 'utf8')
+    let options: ServeOptions | undefined
+    let createdWorkspace: string | undefined
+    let request: Parameters<ServerRuntime['turnService']['startTurn']>[0]['request'] | undefined
+    const gate: TurnItem = {
+      id: 'gate',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'assistant',
+      status: 'completed',
+      createdAt: 'now',
+      kind: 'review',
+      target: { kind: 'custom', instructions: 'private verifier details' },
+      title: 'Rigorous completion gate (final)',
+      reviewText: 'Completion gate verdict: ship.\n- private verifier details'
+    }
+    const c = capture({
+      env: { DEEPSEEK_API_KEY: 'test-only-harness-secret' },
+      createRuntime: fakeRuntime({
+        items: [gate],
+        onOptions: (next) => { options = next },
+        onCreateThread: (input) => { createdWorkspace = input.workspace },
+        onStartTurn: (input) => { request = input.request }
+      })
+    })
+
+    const code = await runAgentCommand('harness', [
+      'run',
+      manifestPath,
+      '--data-dir',
+      dataDir,
+      '--harness-json'
+    ], c.io)
+
+    expect(code).toBe(ServeExitCode.ok)
+    expect(options).toMatchObject({ model: 'deepseek-v4-flash', endpointFormat: 'chat_completions' })
+    expect(createdWorkspace).toBe('/tmp/pinned-harness-workspace')
+    expect(request).toMatchObject({
+      model: 'deepseek-v4-flash',
+      mode: 'rigorous',
+      harnessTask: expect.objectContaining({ id: 'cli-fixture' })
+    })
+    expect(JSON.parse(c.stdout)).toMatchObject({ officialOutcome: 'pass' })
+    expect(c.stdout).not.toContain('test-only-harness-secret')
+    expect(c.stdout).not.toContain('private verifier details')
+  })
+
+  it('requires DEEPSEEK_API_KEY before starting a harness trial', async () => {
+    const c = capture()
+
+    const code = await runAgentCommand('harness', [
+      'run',
+      '/missing-manifest.json',
+      '--data-dir',
+      dataDir
+    ], c.io)
+
+    expect(code).toBe(ServeExitCode.config)
+    expect(c.stderr).toContain('DEEPSEEK_API_KEY')
   })
 })

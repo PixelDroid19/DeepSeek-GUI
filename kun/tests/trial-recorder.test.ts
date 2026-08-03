@@ -96,6 +96,7 @@ function trialItems(input: { callId: string; createdAt: string; secret: string }
       toolName: 'bash',
       callId: input.callId,
       toolKind: 'command_execution',
+      isError: false,
       output: {
         stdout: 'PASS parser test',
         authorization: `Bearer ${input.secret}`
