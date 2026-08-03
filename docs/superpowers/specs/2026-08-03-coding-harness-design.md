@@ -1,7 +1,7 @@
 # Diseno del harness de programacion Kun
 
-Fecha: 2026-08-03  
-Estado: pendiente de revision del usuario  
+Fecha: 2026-08-03
+Estado: pendiente de revision del usuario
 Repositorio: `/home/monasterios/Documents/IA/DeepSeek-GUI`
 
 ## 1. Resultado buscado
