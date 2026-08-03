@@ -1208,8 +1208,8 @@ export class DeepseekCompatModelClient implements ModelClient {
       Object.prototype.hasOwnProperty.call(usage, 'prompt_cache_miss_tokens')
     const cachedTokens = Number(promptDetails?.cached_tokens ?? 0) || 0
     const cacheRead = Number(usage.cache_read_input_tokens ?? 0) || 0
-    const hasInconsistentNativeZeroCounts = hasNativeCache && promptTokens > 0 && nativeHit === 0 && nativeMiss === 0
-    const cacheTelemetryReliable = !hasInconsistentNativeZeroCounts
+    const hasInconsistentNativeCacheCounts = hasNativeCache && nativeHit + nativeMiss !== promptTokens
+    const cacheTelemetryReliable = !hasInconsistentNativeCacheCounts
     const cacheHit = hasNativeCache ? nativeHit : (cachedTokens > 0 ? cachedTokens : cacheRead)
     const cacheMiss = hasNativeCache ? nativeMiss : Math.max(promptTokens - cacheHit, 0)
     const cacheTotal = cacheHit + cacheMiss
@@ -1241,11 +1241,11 @@ export class DeepseekCompatModelClient implements ModelClient {
           }
         : {}
     const pricing: Partial<Pick<UsageSnapshot, 'costUsd' | 'costCny' | 'cacheSavingsUsd' | 'cacheSavingsCny'>> = {}
+    if (Number.isFinite(reportedCostUsd)) pricing.costUsd = reportedCostUsd
+    if (Number.isFinite(reportedCostCny)) pricing.costCny = reportedCostCny
     if (cacheTelemetryReliable) {
-      if (Number.isFinite(reportedCostUsd)) pricing.costUsd = reportedCostUsd
-      else if (estimatedCost) pricing.costUsd = estimatedCost.costUsd
-      if (Number.isFinite(reportedCostCny)) pricing.costCny = reportedCostCny
-      else if (estimatedCost) pricing.costCny = estimatedCost.costCny
+      if (!Number.isFinite(reportedCostUsd) && estimatedCost) pricing.costUsd = estimatedCost.costUsd
+      if (!Number.isFinite(reportedCostCny) && estimatedCost) pricing.costCny = estimatedCost.costCny
       if (estimatedSavings) {
         pricing.cacheSavingsUsd = estimatedSavings.costUsd
         pricing.cacheSavingsCny = estimatedSavings.costCny

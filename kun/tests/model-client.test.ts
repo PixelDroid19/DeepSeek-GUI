@@ -230,6 +230,51 @@ describe('DeepseekCompatModelClient', () => {
     expect(usage.usage.cacheSavingsCny).toBeUndefined()
   })
 
+  it('omits mismatched native cache counters while preserving reported provider cost', async () => {
+    const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({
+      id: 'mismatched-native-cache',
+      model: 'deepseek-v4-flash',
+      choices: [{
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content: 'done' }
+      }],
+      usage: {
+        prompt_tokens: 1000,
+        completion_tokens: 10,
+        total_tokens: 1010,
+        prompt_cache_hit_tokens: 900,
+        prompt_cache_miss_tokens: 0,
+        cost_usd: 0.123,
+        cost_cny: 0.885
+      }
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+    const client = new DeepseekCompatModelClient({
+      baseUrl: 'https://api.deepseek.com',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const chunks: ModelStreamChunk[] = []
+
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) chunks.push(chunk)
+
+    const usage = chunks.find((chunk) => chunk.kind === 'usage')
+    if (!usage || usage.kind !== 'usage') throw new Error('expected usage chunk')
+    expect(usage.usage.cacheHitRate).toBeNull()
+    expect(usage.usage.cachedTokens).toBeUndefined()
+    expect(usage.usage.cacheHitTokens).toBeUndefined()
+    expect(usage.usage.cacheMissTokens).toBeUndefined()
+    expect(usage.usage.costUsd).toBe(0.123)
+    expect(usage.usage.costCny).toBe(0.885)
+    expect(usage.usage.cacheSavingsUsd).toBeUndefined()
+    expect(usage.usage.cacheSavingsCny).toBeUndefined()
+  })
+
   it('keeps native zero cache counters valid when the prompt has zero tokens', async () => {
     const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({
       id: 'zero-prompt-native-cache',
