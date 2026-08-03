@@ -735,6 +735,39 @@ describe('runtime factory usage carryover', () => {
     expect(JSON.stringify(observations)).not.toContain('changed-at-129')
   })
 
+  it('includes a mutation in the 129th returned patch artifact in the progress fingerprint', () => {
+    const firstPatch = Array.from({ length: 129 }, (_, index) => ({
+      oldText: `old-${index}`,
+      newText: `new-${index}`
+    }))
+    const secondPatch = firstPatch.map((edit) => ({ ...edit }))
+    secondPatch[128] = { ...secondPatch[128]!, newText: 'changed-artifact-129' }
+    const argumentsValue = { path: 'src/example.ts' }
+    const items = [
+      makeToolCallItem({
+        id: 'item_many_artifacts_first', threadId: 'thr_adaptive', turnId: 'turn_many_artifacts', callId: 'many_artifacts_first',
+        toolName: 'apply_patch', toolKind: 'file_change', arguments: argumentsValue
+      }),
+      makeToolResultItem({
+        id: 'item_many_artifacts_first_result', threadId: 'thr_adaptive', turnId: 'turn_many_artifacts', callId: 'many_artifacts_first',
+        toolName: 'apply_patch', toolKind: 'file_change', output: { patch: firstPatch }
+      }),
+      makeToolCallItem({
+        id: 'item_many_artifacts_second', threadId: 'thr_adaptive', turnId: 'turn_many_artifacts', callId: 'many_artifacts_second',
+        toolName: 'apply_patch', toolKind: 'file_change', arguments: argumentsValue
+      }),
+      makeToolResultItem({
+        id: 'item_many_artifacts_second_result', threadId: 'thr_adaptive', turnId: 'turn_many_artifacts', callId: 'many_artifacts_second',
+        toolName: 'apply_patch', toolKind: 'file_change', output: { patch: secondPatch }
+      })
+    ]
+
+    const observations = adaptiveObservationsForTurn(items, 'turn_many_artifacts', 2)
+
+    expect(observations[0]?.diffFingerprint).not.toBe(observations[1]?.diffFingerprint)
+    expect(JSON.stringify(observations)).not.toContain('changed-artifact-129')
+  })
+
   it('bounds deeply nested and oversized file-change fingerprints without retaining raw content', () => {
     let nested: Record<string, unknown> = { leaf: 'secret' }
     for (let index = 0; index < 20_000; index += 1) nested = { next: nested }

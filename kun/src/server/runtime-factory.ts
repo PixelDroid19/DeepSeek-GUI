@@ -766,9 +766,9 @@ function adaptiveObservation(input: {
 }
 
 /**
- * Combines the full canonical file-change argument digest with a bounded
+ * Combines full canonical digests of the file-change arguments and selected
  * returned diff/hash artifact. Raw file content is never retained in the
- * observation; only the local digest traversal sees every supplied edit.
+ * observation; only the local digest traversal sees every supplied value.
  */
 function fileChangeDiffFingerprint(
   contentDigest: string,
@@ -777,7 +777,9 @@ function fileChangeDiffFingerprint(
   const writer = new BoundedDigestWriter(createHash('sha256'))
   writer.append('content_digest', contentDigest)
   const artifact = fileChangeArtifact(output)
-  if (artifact !== undefined) appendStableDigestValue(writer, 'artifact', artifact)
+  if (artifact !== undefined) {
+    writer.append('artifact_sha256', fullCanonicalDigest('artifact', artifact))
+  }
   writer.finish()
   return `sha256:${writer.digest('hex')}`
 }
@@ -786,6 +788,12 @@ function fileChangeContentDigest(toolName: string, argumentsValue: Record<string
   const hash = createHash('sha256')
   appendCanonicalDigestText(hash, 'tool', toolName)
   appendCanonicalDigestValue(hash, 'arguments', argumentsValue)
+  return `sha256:${hash.digest('hex')}`
+}
+
+function fullCanonicalDigest(label: string, value: unknown): string {
+  const hash = createHash('sha256')
+  appendCanonicalDigestValue(hash, label, value)
   return `sha256:${hash.digest('hex')}`
 }
 
